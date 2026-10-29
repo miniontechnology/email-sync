@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}New migration{% endblock %}
+{% block content %}
+<div class="page-heading compact">
+  <div><p class="eyebrow">NEW MIGRATION</p><h1>Set up a migration</h1><p class="lead">Credentials are encrypted at rest and never shown again.</p></div>
+  <a class="button secondary" href="/">Cancel</a>
+</div>
+{% if errors %}
+<div class="alert error"><strong>Please review these details</strong><ul>{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul></div>
+{% endif %}
+<form action="/jobs" method="post" enctype="multipart/form-data" class="form-stack">
+  <section class="panel">
+    <div class="section-heading"><div><h2>Basics</h2><p>Name this migration so it’s easy to find later.</p></div></div>
+    <label class="field narrow"><span>Migration name</span><input name="name" required value="{{ values.get('name','') }}" placeholder="Gmail to Stalwart"></label>
+  </section>
+
+  <div class="section-heading outside"><div><h2>What to migrate</h2><p>Configure a source and destination for each data type you want to move.</p></div></div>
+  {% for kind in ("mail", "contacts", "calendars") %}
+  <section class="panel kind-panel">
+    <div class="kind-title"><span class="kind-icon">{{ "✉" if kind == "mail" else ("♧" if kind == "contacts" else "▦") }}</span><div><h2>{{ kind|title }}</h2><p>{{ "Messages, folders and labels" if kind == "mail" else ("People and address books" if kind == "contacts" else "Events and calendars") }}</p></div></div>
+    <div class="endpoint-grid">
+      {% for side in ("source", "dest") %}
+      <fieldset class="endpoint-card">
+        {% set selected_type = values.get(kind ~ '_' ~ side ~ '_type', 'none') %}
+        <legend>{{ side|title }}</legend>
+        <label class="field"><span>Connection type</span>
+          <select name="{{ kind }}_{{ side }}_type" data-endpoint-type>
+            <option value="none" {% if selected_type == "none" %}selected{% endif %}>Not configured</option>
+            {% if kind == "mail" %}
+              {% if side == "source" %}<option value="gmail" {% if selected_type == "gmail" %}selected{% endif %}>Gmail (IMAP)</option><option value="imap" {% if selected_type == "imap" %}selected{% endif %}>Generic IMAP</option>{% else %}<option value="jmap" {% if selected_type == "jmap" %}selected{% endif %}>JMAP</option><option value="imap" {% if selected_type == "imap" %}selected{% endif %}>Generic IMAP</option>{% endif %}
+            {% elif kind == "contacts" %}
+              {% if side == "source" %}<option value="carddav" {% if selected_type == "carddav" %}selected{% endif %}>CardDAV</option><option value="file" {% if selected_type == "file" %}selected{% endif %}>Takeout file (.vcf / .zip)</option>{% else %}<option value="carddav" {% if selected_type == "carddav" %}selected{% endif %}>CardDAV</option>{% endif %}
+            {% else %}
+              {% if side == "source" %}<option value="caldav" {% if selected_type == "caldav" %}selected{% endif %}>CalDAV</option><option value="file" {% if selected_type == "file" %}selected{% endif %}>Takeout file (.ics / .zip)</option>{% else %}<option value="caldav" {% if selected_type == "caldav" %}selected{% endif %}>CalDAV</option>{% endif %}
+            {% endif %}
+          </select>
+        </label>
+        <div class="preset-row">
+          {% if kind == "mail" and side == "source" %}<button type="button" class="text-button" data-preset="gmail" data-target="{{ kind }}_{{ side }}">Use Gmail settings</button>{% endif %}
+          {% if kind == "mail" and side == "dest" %}<button type="button" class="text-button" data-preset="jmap" data-target="{{ kind }}_{{ side }}">Use Stalwart JMAP</button>{% endif %}
+          {% if kind != "mail" %}<button type="button" class="text-button" data-preset="dav" data-target="{{ kind }}_{{ side }}">Use Stalwart DAV</button>{% endif %}
+          <button type="button" class="text-button test-endpoint" data-kind="{{ kind }}" data-side="{{ side }}">Test connection</button>
+        </div>
+        <div class="endpoint-fields" data-endpoint-fields="{{ kind }}_{{ side }}">
+          <div class="imap-fields">
+            <div class="field-row">
+              <label class="field"><span>Host</span><input name="{{ kind }}_{{ side }}_host" value="{{ values.get(kind ~ '_' ~ side ~ '_host','') }}" placeholder="imap.example.com"></label>
+              <label class="field port-field"><span>Port</span><input type="number" name="{{ kind }}_{{ side }}_port" value="{{ values.get(kind ~ '_' ~ side ~ '_port','') }}" placeholder="993"></label>
+            </div>
+            {% set selected_security = values.get(kind ~ '_' ~ side ~ '_security', 'ssl') %}
+            <label class="field"><span>Security</span><select name="{{ kind }}_{{ side }}_security"><option value="ssl" {% if selected_security == "ssl" %}selected{% endif %}>SSL / TLS</option><option value="starttls" {% if selected_security == "starttls" %}selected{% endif %}>STARTTLS</option><option value="none" {% if selected_security == "none" %}selected{% endif %}>None</option></select></label>
+          </div>
+          <div class="url-fields">
+            <label class="field"><span>Server URL</span><input name="{{ kind }}_{{ side }}_url" value="{{ values.get(kind ~ '_' ~ side ~ '_url','') }}" placeholder="https://mail.example.com"></label>
+          </div>
+          <div class="credential-fields">
+            <label class="field"><span>Username</span><input name="{{ kind }}_{{ side }}_username" value="{{ values.get(kind ~ '_' ~ side ~ '_username','') }}" autocomplete="username"></label>
+            <label class="field"><span>Password</span><input type="password" name="{{ kind }}_{{ side }}_password" autocomplete="new-password" placeholder="Stored securely"></label>
+            {% if kind == "mail" and side == "dest" %}<label class="field"><span>JMAP token (optional)</span><input type="password" name="{{ kind }}_{{ side }}_token" autocomplete="new-password"></label>{% endif %}
+          </div>
+          <div class="file-fields"><label class="field"><span>Choose files</span><input type="file" name="{{ kind }}_{{ side }}_files" multiple accept=".vcf,.ics,.zip"><small>Google Takeout exports are supported.</small></label></div>
+          <label class="check-field"><input type="checkbox" name="{{ kind }}_{{ side }}_insecure_tls"><span>Allow self-signed TLS certificates</span></label>
+        </div>
+        <div class="test-result" aria-live="polite"></div>
+      </fieldset>
+      {% endfor %}
+    </div>
+  </section>
+  {% endfor %}
+
+  <section class="panel">
+    <div class="section-heading"><div><h2>Migration options</h2><p>Defaults favor safety: nothing is deleted, and existing copies in the destination are skipped.</p></div></div>
+    <div class="options-grid">
+      <label class="field"><span>Workers</span><input type="number" name="workers" min="1" max="16" value="{{ values.get('workers','4') }}"></label>
+      <label class="field"><span>Deduplication scope</span><select name="dedup_scope"><option value="folder" {% if values.get('dedup_scope','folder') == 'folder' %}selected{% endif %}>Per folder</option><option value="account" {% if values.get('dedup_scope') == 'account' %}selected{% endif %}>Whole account</option></select></label>
+      <label class="field"><span>Archive target</span><input name="archive_target" value="{{ values.get('archive_target','@archive') }}"></label>
+      <label class="field"><span>Only messages since</span><input type="date" name="since" value="{{ values.get('since','') }}"></label>
+      <label class="field"><span>Sync interval (minutes)</span><input type="number" name="sync_interval_minutes" min="0" value="{{ values.get('sync_interval_minutes','0') }}"></label>
+      <label class="field full"><span>Folder mapping (one source =&gt; destination per line)</span><textarea name="folder_map" rows="4" placeholder="[Gmail]/Work => Work">{{ values.get('folder_map','') }}</textarea></label>
+      <label class="field full"><span>Exclude source folders (one per line)</span><textarea name="exclude_folders" rows="3">{{ values.get('exclude_folders','') }}</textarea></label>
+    </div>
+    <div class="checks-row">
+      <label class="check-field"><input type="checkbox" name="include_spam" {% if values.get('include_spam') %}checked{% endif %}><span>Include spam</span></label>
+      <label class="check-field"><input type="checkbox" name="include_trash" {% if values.get('include_trash') %}checked{% endif %}><span>Include trash</span></label>
+      <label class="check-field"><input type="checkbox" name="skip_deleted" {% if not values or values.get('skip_deleted') %}checked{% endif %}><span>Skip deleted mail</span></label>
+      <label class="check-field"><input type="checkbox" name="dry_run" {% if values.get('dry_run') %}checked{% endif %}><span>Dry run</span></label>
+      <label class="check-field"><input type="checkbox" name="verify" {% if not values or values.get('verify') %}checked{% endif %}><span>Verify copied mail</span></label>
+    </div>
+  </section>
+  <div class="form-actions"><a class="button secondary" href="/">Cancel</a><button class="button primary" type="submit">Create migration</button></div>
+</form>
+{% endblock %}

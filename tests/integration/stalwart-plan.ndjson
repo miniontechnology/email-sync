@@ -1,0 +1,2 @@
+{"@type":"upsert","object":"Domain","matchOn":["name"],"value":{"dom-a":{"name":"example.org"}}}
+{"@type":"upsert","object":"Account","matchOn":["name"],"value":{"alice":{"@type":"User","name":"alice","domainId":"#dom-a","credentials":{"0":{"@type":"Password","secret":"Vx7-quartz-Falcon-river"}}}}}

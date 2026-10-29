@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}{{ job.name }}{% endblock %}
+{% block content %}
+<div class="page-heading compact">
+  <div><a class="back-link" href="/">← All migrations</a><div class="detail-title"><h1>{{ job.name }}</h1><span class="badge badge-{{ job.status }}">{{ job.status|replace('_',' ') }}</span></div><p class="lead">{{ job.summary }}</p></div>
+  <div class="actions">
+    {% if job.status == "running" %}<form method="post" action="/jobs/{{ job.id }}/pause"><button class="button secondary">Pause</button></form><form method="post" action="/jobs/{{ job.id }}/cancel"><button class="button danger">Cancel</button></form>
+    {% else %}<form method="post" action="/jobs/{{ job.id }}/resume"><button class="button primary">Resume{% if job.status == "completed_with_errors" or job.status == "failed" %} / retry failed{% endif %}</button></form>{% endif %}
+    <form method="post" action="/jobs/{{ job.id }}/clone"><button class="button secondary">Clone</button></form>
+    <form method="post" action="/jobs/{{ job.id }}/forget" data-confirm="Forget all migration progress?"><button class="button secondary">Forget progress</button></form>
+    <form method="post" action="/jobs/{{ job.id }}/delete" data-confirm="Delete this migration and its uploaded files?"><button class="button danger">Delete</button></form>
+  </div>
+</div>
+<div id="job-content" data-poll-url="/jobs/{{ job.id }}/fragment">{% include "job_content.html" %}</div>
+{% endblock %}

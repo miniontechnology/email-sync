@@ -1,0 +1,31 @@
+<div class="job-list">
+{% if jobs %}
+  {% for job in jobs %}
+  <a class="job-card" href="/jobs/{{ job.id }}">
+    <div class="job-card-main">
+      <div class="job-title-row"><h2>{{ job.name }}</h2><span class="badge badge-{{ job.status }}">{{ job.status|replace('_',' ') }}</span></div>
+      <p class="muted">{{ job.summary }}</p>
+      {% if job.last_error %}<p class="error-text">{{ job.last_error }}</p>{% endif %}
+      {% if job.tasks %}
+      <div class="task-progress-list">
+        {% for task in job.tasks %}
+        <div class="task-progress">
+          <div class="task-progress-head"><span>{{ task.kind|title }}</span><span>{{ task.already + task.copied + task.skipped + task.failed }} / {{ task.total }}</span></div>
+          <div class="progress"><span style="width: {{ task.progress }}%"></span></div>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+    <div class="job-card-side"><span class="arrow">→</span><span class="muted">{{ job.message or 'Open details' }}</span></div>
+  </a>
+  {% endfor %}
+{% else %}
+  <div class="empty-state">
+    <div class="empty-icon">✉</div>
+    <h2>Your migration workspace is ready</h2>
+    <p>Create a job to move mail, contacts, or calendars between accounts.</p>
+    <a class="button primary" href="/jobs/new">Create your first job</a>
+  </div>
+{% endif %}
+</div>
