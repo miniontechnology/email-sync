@@ -7,7 +7,8 @@ Roughly in priority order; open an issue/PR to reprioritise.
 - **Google OAuth 2.0** sign-in (for Gmail IMAP without app passwords, and for Google CardDAV/CalDAV so
   contacts/calendars can be read live instead of from a Takeout export). Requires a user-supplied
   Google Cloud OAuth client.
-- **JMAP Contacts / Calendars** (RFC 9610 / draft-ietf-jmap-calendars) as an alternative to CardDAV/CalDAV.
+- **JMAP Contacts / Calendars as destinations** (RFC 9610 / draft-ietf-jmap-calendars) — done.
+- **JMAP Contacts / Calendars as sources** (needs JSContact/JSCalendar → vCard/ICS).
 - Gmail mbox import from Google Takeout (for accounts where IMAP is disabled or throttled).
 - Microsoft 365 / Exchange (Graph or EWS) and Outlook.com OAuth.
 - Sieve filters / Gmail filters export, signatures, vacation responder, other account settings.

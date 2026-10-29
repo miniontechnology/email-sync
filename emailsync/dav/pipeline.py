@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from emailsync import db
 from emailsync.connectors.dav import DavClient
+from emailsync.dav.jmap_dest import JmapDavDestination
 from emailsync.dav.source import DavSource
 from emailsync.errors import AuthError, FatalError, wrap
 from emailsync.jobs.control import TaskResult
@@ -19,6 +20,8 @@ def _make_source(endpoint, kind):
 
 
 def _make_dest(endpoint, kind):
+    if endpoint.type == "jmap":
+        return JmapDavDestination(endpoint, kind)
     return DavDestination(endpoint, kind)
 
 

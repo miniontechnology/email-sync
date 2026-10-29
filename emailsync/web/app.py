@@ -14,6 +14,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from emailsync.config import Settings, load_settings
 from emailsync.connectors.dav import DavClient
 from emailsync.crypto import SecretBox
+from emailsync.dav.jmap_dest import JmapDavDestination
 from emailsync.dav.source import DavSource
 from emailsync.db import Store
 from emailsync.jobs.manager import JobManager
@@ -70,9 +71,15 @@ def _endpoint_from_form(form, kind, side, uploads_dir, mail_endpoint=None, uploa
         files.append(str(path))
     username = str(form.get(prefix + "username") or "").strip()
     password = str(form.get(prefix + "password") or "")
-    if endpoint_type in ("carddav", "caldav") and (not username or not password):
+    if endpoint_type in ("carddav", "caldav", "jmap") and (not username or not password):
         username = username or (mail_endpoint.username if mail_endpoint else "")
         password = password or (mail_endpoint.password if mail_endpoint else "")
+    token = str(form.get(prefix + "token") or "")
+    url = str(form.get(prefix + "url") or "").strip()
+    if endpoint_type == "jmap" and mail_endpoint and mail_endpoint.type == "jmap":
+        url = url or mail_endpoint.url
+        if not password:
+            token = token or mail_endpoint.token
     return Endpoint(
         type=endpoint_type,
         host=str(form.get(prefix + "host") or "").strip(),
@@ -80,8 +87,8 @@ def _endpoint_from_form(form, kind, side, uploads_dir, mail_endpoint=None, uploa
         security=str(form.get(prefix + "security") or "ssl"),
         username=username,
         password=password,
-        token=str(form.get(prefix + "token") or ""),
-        url=str(form.get(prefix + "url") or "").strip(),
+        token=token,
+        url=url,
         insecure_tls=bool(form.get(prefix + "insecure_tls")),
         files=files,
     )
@@ -271,6 +278,15 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
                     folders = [{"source": scope.name, "target": scope.target or "labels"} for scope in scopes]
                 finally:
                     source.close()
+            elif endpoint.type == "jmap" and side == "dest" and kind in ("contacts", "calendars"):
+                dest = JmapDavDestination(endpoint, kind)
+                try:
+                    dest.connect()
+                    folders = [
+                        {"source": item["displayname"], "target": item["id"]} for item in dest.collections
+                    ]
+                finally:
+                    dest.close()
             elif endpoint.type in ("imap", "jmap"):
                 dest = make_dest(endpoint, options)
                 try:

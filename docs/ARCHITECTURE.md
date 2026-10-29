@@ -31,6 +31,8 @@ tools (which may re-encode) still match.
    A crash between upload and ledger commit leaves the row in `uploading`; next run the index finds
    the copy and the row becomes `skipped` — nothing is uploaded twice.
 3. **DAV**: UID match, then optional fingerprint (FN+emails / SUMMARY+DTSTART), then `If-None-Match: *` on PUT.
+   JMAP contacts/calendars can be destinations when the server has the corresponding parse capability.
+   JMAP calendars match by UID only and do not use event fingerprints.
 
 ## Mail flow
 - Coordinator (one source + one dest connection): per scope (folder, or Gmail "All Mail"):
