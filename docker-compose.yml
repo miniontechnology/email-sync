@@ -1,5 +1,6 @@
 services:
   email-sync:
+    image: ghcr.io/miniontechnology/email-sync:latest
     build: .
     container_name: email-sync
     restart: unless-stopped
