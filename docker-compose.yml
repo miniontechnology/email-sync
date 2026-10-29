@@ -1,0 +1,17 @@
+services:
+  email-sync:
+    build: .
+    container_name: email-sync
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - email-sync-data:/data
+    environment:
+      # Set a stable random value before creating jobs, or persisted credentials cannot be decrypted.
+      EMAIL_SYNC_SECRET_KEY: ${EMAIL_SYNC_SECRET_KEY:-}
+      EMAIL_SYNC_MAX_CONCURRENT_JOBS: ${EMAIL_SYNC_MAX_CONCURRENT_JOBS:-4}
+      EMAIL_SYNC_AUTO_RESUME: ${EMAIL_SYNC_AUTO_RESUME:-true}
+
+volumes:
+  email-sync-data:
