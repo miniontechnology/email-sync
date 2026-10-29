@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<div class="page-heading">
+  <div><p class="eyebrow">OVERVIEW</p><h1>Migrations</h1><p class="lead">Move your data safely, with progress you can pick up later.</p></div>
+  <a class="button primary" href="/jobs/new"><span>＋</span> New migration</a>
+</div>
+<section id="job-list" aria-live="polite">{% include "job_cards.html" %}</section>
+{% endblock %}

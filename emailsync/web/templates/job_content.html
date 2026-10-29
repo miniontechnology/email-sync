@@ -1,0 +1,34 @@
+{% if job.last_error %}<div class="alert error"><strong>Last error</strong><p>{{ job.last_error }}</p></div>{% endif %}
+<div class="task-grid">
+  {% for task in tasks %}
+  <section class="panel task-card">
+    <div class="task-card-head"><div><p class="eyebrow">{{ task.kind|upper }}</p><h2>{{ task.message or task.status|title }}</h2></div><span class="badge badge-{{ task.status }}">{{ task.status|replace('_',' ') }}</span></div>
+    <div class="progress large"><span style="width: {{ task.progress }}%"></span></div>
+    <div class="stats">
+      <div><strong>{{ task.total }}</strong><span>Total</span></div><div><strong>{{ task.already }}</strong><span>Already</span></div>
+      <div><strong>{{ task.copied }}</strong><span>Copied</span></div><div><strong>{{ task.skipped }}</strong><span>Skipped</span></div>
+      <div><strong>{{ task.failed }}</strong><span>Failed</span></div>{% if task.bytes %}<div><strong>{{ task.rate }} KB/s</strong><span>Average rate</span></div>{% endif %}
+    </div>
+  </section>
+  {% endfor %}
+</div>
+{% if scopes %}
+<section class="panel table-panel">
+  <div class="section-heading"><div><h2>Folders and collections</h2><p>Progress by source scope.</p></div></div>
+  <div class="table-wrap"><table><thead><tr><th>Scope</th><th>Status</th><th>Total</th><th>Already</th><th>Copied</th><th>Skipped</th><th>Failed</th></tr></thead><tbody>
+  {% for scope in scopes %}<tr><td class="scope-name">{{ scope.name }}</td><td><span class="badge badge-{{ scope.status }}">{{ scope.status }}</span></td><td>{{ scope.total }}</td><td>{{ scope.already }}</td><td>{{ scope.copied }}</td><td>{{ scope.skipped }}</td><td>{{ scope.failed }}</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+{% endif %}
+{% if failed %}
+<section class="panel table-panel">
+  <div class="section-heading"><div><h2>Failed items</h2><p>These items will be retried when the job resumes.</p></div></div>
+  <div class="table-wrap"><table><thead><tr><th>Source item</th><th>Error</th><th>Updated</th></tr></thead><tbody>
+  {% for row in failed %}<tr><td class="scope-name">{{ row.source_key }}</td><td class="error-text">{{ row.error }}</td><td>{{ row.updated_at|int }}</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+{% endif %}
+<section class="panel event-panel">
+  <div class="section-heading"><div><h2>Activity</h2><p>Latest migration events.</p></div></div>
+  {% if events %}<ul class="events">{% for event in events %}<li><time>{{ event.ts|int }}</time><span class="event-level level-{{ event.level }}">{{ event.level }}</span><span>{{ event.message }}</span></li>{% endfor %}</ul>{% else %}<p class="muted">No activity yet.</p>{% endif %}
+</section>
