@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 
 from emailsync import db
-from emailsync.errors import AuthError, FatalError, wrap
+from emailsync.errors import AuthError, FatalError, ReauthRequired, wrap
 from emailsync.jobs.control import RunControl, TaskResult
 from emailsync.jobs.retry import retry_call
 from emailsync.mail.dest import make_dest
@@ -451,7 +451,7 @@ class MailMigration:
                     thread.join()
             if self.control.aborted:
                 error = str(self.control.error or "Task aborted")
-                status = "failed"
+                status = "paused" if isinstance(self.control.error, ReauthRequired) else "failed"
             elif self.control.stopped:
                 error = None
                 status = "paused" if self.control.reason == "pause" else "cancelled"
@@ -478,10 +478,9 @@ class MailMigration:
             for thread in workers:
                 thread.join(timeout=1)
             self.progress.flush(force=True)
-            self.store.update_task(
-                self.job_id, "mail", status="failed", message=error, finished_at=time.time()
-            )
-            return TaskResult("failed", error)
+            status = "paused" if isinstance(exc, ReauthRequired) else "failed"
+            self.store.update_task(self.job_id, "mail", status=status, message=error, finished_at=time.time())
+            return TaskResult(status, error)
         except BaseException as exc:
             error = str(wrap(exc))
             self._say(error, "error")

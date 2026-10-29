@@ -50,8 +50,7 @@ Changing `EMAIL_SYNC_SECRET_KEY` after creating jobs makes their saved credentia
 2. For mail, configure Stalwart as the JMAP destination. Use the account's JMAP base URL, for
    example `https://mail.example.com`, and the full account name and password (or a JMAP token).
    Allow self-signed TLS only for a trusted test server.
-3. For contacts and calendars, Google CardDAV/CalDAV requires OAuth, which this application does
-   not implement. Export contacts as vCard and calendars as iCalendar using Google Takeout, then
+3. For contacts and calendars, export Google data as vCard/iCalendar using Google Takeout, then
    upload the `.vcf`, `.ics`, or enclosing `.zip` files as file sources. Configure Stalwart's
    CardDAV, CalDAV, or JMAP endpoints as the destinations. JMAP imports require the server's vCard
    and iCalendar parse capabilities. DAV/JMAP credentials may be left blank to reuse credentials
@@ -61,6 +60,26 @@ Changing `EMAIL_SYNC_SECRET_KEY` after creating jobs makes their saved credentia
 
 Gmail's IMAP bandwidth limits can temporarily throttle large migrations. Email Sync honors
 server throttling, waits, and continues without counting a throttle wait as a failed item.
+
+## Saved accounts and sign-in (OAuth)
+
+Create a saved account from **Accounts** and select it in any compatible job endpoint. Passwords,
+static tokens, OAuth client secrets, and access/refresh tokens are encrypted in the data directory;
+the UI never displays their values. OAuth uses authorization code with PKCE and refreshes tokens
+automatically while jobs run. If access is revoked or refresh expires, the job pauses and links to
+the account; sign in again, then resume the job.
+
+For Stalwart, distinguish a local Stalwart account from an external identity provider. OAuth sign-in
+uses the issuer's authorization server, not the Stalwart mailbox password: Stalwart accepts tokens
+from an identity provider it is configured to trust. If Stalwart delegates authentication to
+Authentik, Keycloak, or another IdP, enter that provider's **issuer URL** in the saved account's
+OAuth settings (not the Stalwart URL). Leave issuer blank only when OAuth metadata is served from
+the account's server URL. An administrator must configure the IdP trust and scopes on Stalwart.
+
+After approving access, the browser may show a page that cannot be reached at `127.0.0.1`. Copy the
+complete address from the browser and paste it into the saved account page to finish sign-in. The
+Google-specific OAuth preset and device authorization flow are not included yet; Google Takeout
+files remain a straightforward source for contacts and calendars.
 
 ## Resume and duplicate handling
 
@@ -81,6 +100,7 @@ fingerprints.
 | `EMAIL_SYNC_MAX_CONCURRENT_JOBS` | `4` | Maximum number of jobs running at once |
 | `EMAIL_SYNC_AUTO_RESUME` | `true` | Resume queued/running jobs after a process restart |
 | `EMAIL_SYNC_LOG_LEVEL` | `INFO` | Application log level |
+| `EMAIL_SYNC_OAUTH_REDIRECT_URI` | `http://127.0.0.1:8080/oauth/callback` | Loopback callback URI registered with OAuth servers |
 
 ## Development and tests
 

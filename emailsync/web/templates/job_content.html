@@ -1,4 +1,5 @@
-{% if job.last_error %}<div class="alert error"><strong>Last error</strong><p>{{ job.last_error }}</p></div>{% endif %}
+{% if job.last_error %}<div class="alert error"><strong>Last error</strong><p>{{ job.last_error }}</p>
+{% if reauth_account_id %}<a href="/accounts/{{ reauth_account_id }}">Open the saved account to sign in again</a>{% endif %}</div>{% endif %}
 <div class="task-grid">
   {% for task in tasks %}
   <section class="panel task-card">

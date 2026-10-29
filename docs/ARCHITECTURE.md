@@ -3,6 +3,8 @@
 ```
 Browser ── polling ──> FastAPI (emailsync.web.app)
                           │
+                          ├── saved accounts + OAuth (encrypted secrets / token refresh)
+                          │
                           ▼
                    JobManager (emailsync.jobs.manager)  ── one thread per running job
                           │
@@ -55,3 +57,11 @@ States: `queued, running, paused, cancelled, completed, completed_with_errors, f
 Pause/cancel stop the job gracefully; resume simply runs it again (the ledger makes that cheap).
 On startup, jobs left `running`/`queued` are resumed (`EMAIL_SYNC_AUTO_RESUME=true`, default).
 Sync jobs (`sync_interval_minutes > 0`) are re-run by the scheduler after they finish.
+
+## Saved accounts and OAuth
+The `accounts` table stores reusable server connection settings separately from job definitions.
+Account passwords, tokens, client secrets, and OAuth tokens are encrypted with the same `SecretBox`
+as job credentials. Jobs retain only an `account_id`; the manager resolves current account settings
+when each run starts, so re-signing-in repairs all jobs that use the account. A process-wide token
+manager serializes refreshes per account. If refresh is revoked, the affected task pauses and must
+be resumed after the user signs in again.

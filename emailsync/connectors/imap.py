@@ -8,9 +8,10 @@ from imapclient import IMAPClient
 from imapclient.imap_utf7 import decode as utf7_decode
 from imapclient.util import to_unicode
 
-from emailsync.errors import AuthError, wrap
+from emailsync.errors import AuthError, ReauthRequired, TransientError, wrap
 from emailsync.mail.fingerprint import HEADER_FIELDS
 from emailsync.mail.folders import Folder
+from emailsync.oauth import refresh_after_rejection
 from emailsync.options import Endpoint
 
 HEADER_ITEM = ("BODY.PEEK[HEADER.FIELDS (" + " ".join(HEADER_FIELDS) + ")]").encode()
@@ -64,17 +65,53 @@ class ImapConnection:
         except Exception as exc:
             raise wrap(exc) from exc
         try:
-            client.login(ep.username, ep.password)
+            capabilities = {_str(c).upper() for c in client.capabilities()}
+            if ep.token_provider is not None:
+                if "AUTH=OAUTHBEARER" in capabilities:
+                    mechanism = "OAUTHBEARER"
+                elif "AUTH=XOAUTH2" in capabilities:
+                    mechanism = "XOAUTH2"
+                else:
+                    raise AuthError("server doesn't support OAuth login")
+                token = ep.token_provider.token()
+                try:
+                    self._oauth_login(client, ep.username, token, mechanism)
+                except ReauthRequired:
+                    raise
+                except Exception:
+                    token = refresh_after_rejection(ep.token_provider, token)
+                    self._oauth_login(client, ep.username, token, mechanism)
+            else:
+                client.login(ep.username, ep.password)
+        except ReauthRequired:
+            try:
+                client.shutdown()
+            except Exception:
+                pass
+            raise
         except Exception as exc:
             try:
                 client.shutdown()
             except Exception:
                 pass
-            raise AuthError(f"Login failed for {ep.username}@{ep.host}: {exc}") from exc
+            if isinstance(exc, (ReauthRequired, TransientError, AuthError)):
+                raise
+            message = (
+                f"IMAP OAuth login failed for {ep.username}@{ep.host}"
+                if ep.token_provider is not None
+                else f"Login failed for {ep.username}@{ep.host}: {exc}"
+            )
+            raise AuthError(message) from exc
         self.client = client
         self.capabilities = {_str(c).upper() for c in client.capabilities()}
         self.selected = None
         return self
+
+    @staticmethod
+    def _oauth_login(client, username, access_token, mechanism):
+        if mechanism == "OAUTHBEARER":
+            return client.oauthbearer_login(username, access_token)
+        return client.oauth2_login(username, access_token, mech="XOAUTH2")
 
     def close(self) -> None:
         if self.client is None:

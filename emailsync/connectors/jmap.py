@@ -5,6 +5,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from emailsync.errors import AuthError, PermanentError, SyncError, TransientError, wrap
+from emailsync.oauth import OAuthBearerAuth
 from emailsync.options import Endpoint
 
 CORE = "urn:ietf:params:jmap:core"
@@ -60,7 +61,9 @@ class JmapClient:
         self.base = base
         auth = None
         headers = {"Accept": "application/json"}
-        if endpoint.token:
+        if endpoint.token_provider is not None:
+            auth = OAuthBearerAuth(endpoint.token_provider)
+        elif endpoint.token:
             headers["Authorization"] = f"Bearer {endpoint.token}"
         else:
             auth = (endpoint.username, endpoint.password)

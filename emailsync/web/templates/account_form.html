@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}{{ account.name if account else "Add account" }}{% endblock %}
+{% block content %}
+<div class="page-heading compact">
+  <div><a class="back-link" href="/accounts">← Saved accounts</a><h1>{{ account.name if account else "Add an account" }}</h1><p class="lead">Saved credentials are encrypted and never rendered back into this page.</p></div>
+</div>
+{% if error %}<div class="alert error"><strong>Action needed</strong><p>{{ error }}</p></div>{% endif %}
+{% if message %}<div class="alert success"><p>{{ message }}</p></div>{% endif %}
+{% set config = account.config if account else {} %}
+<form method="post" action="{{ '/accounts/' ~ account.id if account else '/accounts' }}" class="form-stack">
+  <section class="panel">
+    <div class="options-grid">
+      <label class="field"><span>Account name</span><input name="name" required value="{{ account.name if account else '' }}"></label>
+      <label class="field"><span>Connection type</span><select name="type">
+        {% for value, label in [('jmap','JMAP'),('imap','IMAP'),('carddav','CardDAV'),('caldav','CalDAV')] %}
+        <option value="{{ value }}" {% if config.get('type','jmap') == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select></label>
+      <label class="field"><span>Server URL</span><input name="url" value="{{ config.get('url','') }}" placeholder="https://mail.example.com"></label>
+      <label class="field"><span>Host</span><input name="host" value="{{ config.get('host','') }}" placeholder="imap.example.com"></label>
+      <label class="field"><span>Port</span><input name="port" type="number" value="{{ config.get('port','') }}"></label>
+      <label class="field"><span>Security</span><select name="security">
+        {% for value in ['ssl','starttls','none'] %}<option value="{{ value }}" {% if config.get('security','ssl') == value %}selected{% endif %}>{{ value|upper }}</option>{% endfor %}
+      </select></label>
+      <label class="field"><span>Username</span><input name="username" autocomplete="username" value="{{ config.get('username','') }}"></label>
+      <label class="field"><span>Authentication</span><select name="auth_method">
+        {% for value, label in [('password','Password'),('token','Static token'),('oauth','OAuth 2.0')] %}
+        <option value="{{ value }}" {% if config.get('auth_method','password') == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select></label>
+      <label class="field"><span>New password</span><input type="password" name="password" autocomplete="new-password" placeholder="{{ 'Password saved; leave blank to keep it' if account and account.has_password else 'Leave blank if not used' }}"></label>
+      <label class="field"><span>New static token</span><input type="password" name="token" autocomplete="new-password" placeholder="{{ 'Token saved; leave blank to keep it' if account and account.has_token else 'Leave blank if not used' }}"></label>
+      <label class="field"><span>OAuth issuer URL (optional)</span><input name="issuer_url" value="{{ config.get('issuer_url','') }}" placeholder="Leave blank to discover from the server URL"></label>
+      <label class="field"><span>OAuth client ID (optional)</span><input name="client_id" value="{{ config.get('client_id','') }}"></label>
+      <label class="field"><span>New OAuth client secret</span><input type="password" name="client_secret" autocomplete="new-password" placeholder="{{ 'Secret saved; leave blank to keep it' if account and account.has_client_secret else 'Leave blank for public clients' }}"></label>
+      <label class="field full"><span>OAuth scopes (space separated; blank uses supported migration scopes)</span><input name="scopes" value="{{ config.get('scopes','') }}"></label>
+    </div>
+    <label class="check-field"><input type="checkbox" name="insecure_tls" {% if config.get('insecure_tls') %}checked{% endif %}><span>Allow self-signed TLS certificates</span></label>
+    <div class="form-actions"><a class="button secondary" href="/accounts">Cancel</a><button class="button primary" type="submit">Save account</button></div>
+  </section>
+</form>
+{% if account %}
+  {% if config.get('auth_method') == 'oauth' %}
+  <section class="panel">
+    <div class="section-heading"><div><h2>Sign in</h2><p>{% if account.signed_in %}Signed in as {{ config.get('username') or 'user' }}; the token refreshes automatically.{% else %}Not signed in. Register the app with the identity provider, then approve access.{% endif %}</p></div></div>
+    <a class="button primary" href="/accounts/{{ account.id }}/signin">Sign in with OAuth</a>
+    <p class="muted">After approving, your browser may show a page that can’t be reached at <code>127.0.0.1</code> — copy that whole address and paste it here.</p>
+    <form method="post" action="/oauth/complete" class="inline-form"><label class="field full"><span>Complete callback URL</span><input name="callback" required placeholder="http://127.0.0.1:8080/oauth/callback?code=…&amp;state=…"></label><button class="button secondary">Complete sign-in</button></form>
+  </section>
+  {% endif %}
+  <section class="panel"><form method="post" action="/accounts/{{ account.id }}/delete" data-confirm="Delete this saved account?">
+    <button class="button danger">Delete account</button>
+  </form></section>
+{% endif %}
+{% endblock %}

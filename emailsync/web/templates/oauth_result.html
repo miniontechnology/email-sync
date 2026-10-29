@@ -1,0 +1,10 @@
+{% extends "base.html" %}
+{% block title %}OAuth sign-in{% endblock %}
+{% block content %}
+<section class="panel">
+  <p class="eyebrow">OAUTH SIGN-IN</p><h1>Sign-in could not be completed</h1>
+  <div class="alert error"><p>{{ error }}</p></div>
+  <p>Return to the saved account page, start sign-in again if needed, and paste the full callback URL.</p>
+  <a class="button secondary" href="/accounts">Saved accounts</a>
+</section>
+{% endblock %}

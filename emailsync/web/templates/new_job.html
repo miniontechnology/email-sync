@@ -35,6 +35,14 @@
             {% endif %}
           </select>
         </label>
+        <label class="field"><span>Saved account</span>
+          <select name="{{ kind }}_{{ side }}_account_id" data-saved-account>
+            <option value="">Manual connection details</option>
+            {% for account in accounts %}
+            <option value="{{ account.id }}" {% if values.get(kind ~ '_' ~ side ~ '_account_id')|string == account.id|string %}selected{% endif %}>{{ account.name }}</option>
+            {% endfor %}
+          </select>
+        </label>
         <div class="preset-row">
           {% if kind == "mail" and side == "source" %}<button type="button" class="text-button" data-preset="gmail" data-target="{{ kind }}_{{ side }}">Use Gmail settings</button>{% endif %}
           {% if kind == "mail" and side == "dest" %}<button type="button" class="text-button" data-preset="jmap" data-target="{{ kind }}_{{ side }}">Use Stalwart JMAP</button>{% endif %}

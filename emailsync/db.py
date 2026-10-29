@@ -79,6 +79,14 @@ CREATE TABLE IF NOT EXISTS events (
     message TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_job ON events(job_id, id);
+CREATE TABLE IF NOT EXISTS accounts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    secrets_enc TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 # Ledger statuses
@@ -135,6 +143,22 @@ class Store:
     def create_job(self, name: str, config: dict, secrets_enc: str | None, status: str = "queued") -> int:
         now = time.time()
         with self.write() as conn:
+            account_ids = {
+                int(endpoint["account_id"])
+                for pair in config.get("endpoints", {}).values()
+                for endpoint in pair.values()
+                if endpoint and endpoint.get("account_id")
+            }
+            if account_ids:
+                existing = {
+                    row["id"]
+                    for row in conn.execute(
+                        f"SELECT id FROM accounts WHERE id IN ({','.join('?' for _ in account_ids)})",
+                        tuple(account_ids),
+                    )
+                }
+                if existing != account_ids:
+                    raise ValueError("A referenced saved account does not exist.")
             cur = conn.execute(
                 "INSERT INTO jobs(name, status, config_json, secrets_enc, created_at, updated_at)"
                 " VALUES (?,?,?,?,?,?)",
@@ -162,6 +186,69 @@ class Store:
             for table in ("ledger", "events", "scopes", "tasks"):
                 conn.execute(f"DELETE FROM {table} WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+
+    # -- saved accounts ----------------------------------------------------------------------
+    def create_account(self, name: str, config: dict, secrets_enc: str | None = None) -> int:
+        now = time.time()
+        with self.write() as conn:
+            cur = conn.execute(
+                "INSERT INTO accounts(name, config_json, secrets_enc, created_at, updated_at)"
+                " VALUES (?,?,?,?,?)",
+                (name, json.dumps(config), secrets_enc, now, now),
+            )
+            return int(cur.lastrowid)
+
+    def get_account(self, account_id: int) -> dict | None:
+        rows = self.query("SELECT * FROM accounts WHERE id=?", (account_id,))
+        return _account_row(rows[0]) if rows else None
+
+    def list_accounts(self) -> list[dict]:
+        return [_account_row(row) for row in self.query("SELECT * FROM accounts ORDER BY name, id")]
+
+    def update_account_config(self, account_id: int, name: str, config: dict) -> None:
+        with self.write() as conn:
+            conn.execute(
+                "UPDATE accounts SET name=?, config_json=?, updated_at=? WHERE id=?",
+                (name, json.dumps(config), time.time(), account_id),
+            )
+
+    def update_account_secrets(self, account_id: int, secrets_enc: str | None) -> None:
+        with self.write() as conn:
+            conn.execute(
+                "UPDATE accounts SET secrets_enc=?, updated_at=? WHERE id=?",
+                (secrets_enc, time.time(), account_id),
+            )
+
+    def account_job_names(self, account_id: int) -> list[str]:
+        names = []
+        for row in self.query("SELECT name, config_json FROM jobs"):
+            config = json.loads(row["config_json"])
+            endpoints = config.get("endpoints", {})
+            if any(
+                int(endpoint.get("account_id") or 0) == int(account_id)
+                for pair in endpoints.values()
+                for endpoint in pair.values()
+                if endpoint
+            ):
+                names.append(row["name"])
+        return names
+
+    def delete_account(self, account_id: int) -> bool:
+        with self.write() as conn:
+            names = []
+            for row in conn.execute("SELECT name, config_json FROM jobs"):
+                config = json.loads(row["config_json"])
+                if any(
+                    int(endpoint.get("account_id") or 0) == int(account_id)
+                    for pair in config.get("endpoints", {}).values()
+                    for endpoint in pair.values()
+                    if endpoint
+                ):
+                    names.append(row["name"])
+            if names:
+                raise ValueError("Account is used by jobs: " + ", ".join(names))
+            cur = conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+            return cur.rowcount > 0
 
     # -- tasks & scopes (progress) -----------------------------------------------------------
     def reset_task(self, job_id: int, kind: str, status: str) -> None:
@@ -331,6 +418,12 @@ class Store:
 
 
 def _job_row(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    d["config"] = json.loads(d.pop("config_json"))
+    return d
+
+
+def _account_row(row: sqlite3.Row) -> dict:
     d = dict(row)
     d["config"] = json.loads(d.pop("config_json"))
     return d

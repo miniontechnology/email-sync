@@ -9,7 +9,7 @@ from emailsync import db
 from emailsync.connectors.dav import DavClient
 from emailsync.dav.jmap_dest import JmapDavDestination
 from emailsync.dav.source import DavSource
-from emailsync.errors import AuthError, FatalError, wrap
+from emailsync.errors import AuthError, FatalError, ReauthRequired, wrap
 from emailsync.jobs.control import TaskResult
 from emailsync.jobs.retry import retry_call
 from emailsync.options import JobConfig
@@ -325,7 +325,7 @@ class DavMigration:
                         self._record_failure(scope.name, source_key, item.uid, target, exc)
             if self.control.aborted:
                 error = str(self.control.error or "Task aborted")
-                status = "failed"
+                status = "paused" if isinstance(self.control.error, ReauthRequired) else "failed"
             elif self.control.stopped:
                 error = None
                 status = "paused" if self.control.reason == "pause" else "cancelled"
@@ -347,10 +347,11 @@ class DavMigration:
             self.log("error", error)
             self.control.abort(exc)
             self.progress.flush(force=True)
+            status = "paused" if isinstance(exc, ReauthRequired) else "failed"
             self.store.update_task(
-                self.job_id, self.kind, status="failed", message=error, finished_at=time.time()
+                self.job_id, self.kind, status=status, message=error, finished_at=time.time()
             )
-            return TaskResult("failed", error)
+            return TaskResult(status, error)
         except BaseException as exc:
             error = str(wrap(exc))
             self.log("error", error)

@@ -23,6 +23,14 @@ class AuthError(SyncError):
     """Credentials rejected: the whole task fails."""
 
 
+class ReauthRequired(AuthError):
+    def __init__(self, account_name):
+        super().__init__(
+            f"Sign-in for account '{account_name}' has expired or was revoked. "
+            "Sign in again on the Accounts page, then resume the job."
+        )
+
+
 class FatalError(SyncError):
     """Unrecoverable for the whole task (e.g. destination over quota)."""
 

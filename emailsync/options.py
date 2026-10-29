@@ -15,6 +15,7 @@ CALENDARS_SOURCE_TYPES = ("caldav", "file")
 @dataclass
 class Endpoint:
     type: str
+    account_id: int | None = None
     host: str = ""
     port: int = 0
     security: str = "ssl"  # ssl | starttls | none
@@ -24,6 +25,7 @@ class Endpoint:
     url: str = ""  # JMAP / DAV base URL
     insecure_tls: bool = False
     files: list[str] = field(default_factory=list)  # uploaded .vcf/.ics/.zip paths
+    token_provider = None
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "Endpoint | None":
@@ -150,13 +152,14 @@ class JobConfig:
                     errors.append(f"{kind} {side}: unsupported type {ep.type!r}.")
                     continue
                 label = f"{kind.capitalize()} {side}"
-                if ep.type in ("imap", "gmail") and not ep.host:
-                    errors.append(f"{label}: host is required.")
-                if ep.type in ("jmap", "carddav", "caldav") and not ep.url:
-                    errors.append(f"{label}: URL is required.")
+                if not ep.account_id:
+                    if ep.type in ("imap", "gmail") and not ep.host:
+                        errors.append(f"{label}: host is required.")
+                    if ep.type in ("jmap", "carddav", "caldav") and not ep.url:
+                        errors.append(f"{label}: URL is required.")
                 if ep.type == "file" and not ep.files:
                     errors.append(f"{label}: upload at least one file.")
-                if ep.type != "file" and not ep.username and not ep.token:
+                if ep.type != "file" and not ep.username and not ep.token and not ep.account_id:
                     errors.append(f"{label}: username is required.")
         if self.options.since:
             import datetime as dt
