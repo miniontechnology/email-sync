@@ -27,11 +27,15 @@ On an x86 Synology NAS with Container Manager / Docker Compose:
 
    Generate a value with a password manager or `openssl rand -hex 32`. Keep this value safe:
    it is used to encrypt saved endpoint credentials.
-3. Start the application:
+3. Start the application with the published image:
 
    ```sh
-   docker compose up -d --build
+   docker compose pull
+   docker compose up -d
    ```
+
+   To upgrade later, run the same two commands. Use `docker compose up -d --build` instead to
+   build from a local checkout.
 4. Open `http://<nas-address>:8080`.
 
 The named `email-sync-data` volume stores the SQLite database, encryption key when no key was
