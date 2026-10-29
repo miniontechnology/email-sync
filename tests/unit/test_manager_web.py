@@ -122,3 +122,83 @@ def test_web_dashboard_detail_validation_and_secret_redaction(tmp_path):
         api = client.get("/api/jobs")
         assert "html-secret" not in api.text
         assert client.get("/healthz").json() == {"ok": True}
+
+
+def test_contacts_jmap_destination_inherits_mail_jmap_url_and_token(tmp_path):
+    class CapturingManager:
+        config = None
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def create_job(self, config):
+            self.config = config
+            return 42
+
+    settings = Settings(tmp_path, "test-key", 2, True, "INFO")
+    manager = CapturingManager()
+    app = create_app(settings, Store(settings.db_path), manager)
+    with TestClient(app) as client:
+        response = client.post(
+            "/jobs",
+            data={
+                "name": "Contacts migration",
+                "mail_source_type": "imap",
+                "mail_source_host": "imap.example.test",
+                "mail_source_username": "alice",
+                "mail_source_password": "source-secret",
+                "mail_dest_type": "jmap",
+                "mail_dest_url": "https://mail.example.test",
+                "mail_dest_username": "alice",
+                "mail_dest_token": "mail-token",
+                "contacts_source_type": "carddav",
+                "contacts_source_url": "https://contacts.example.test",
+                "contacts_source_username": "alice",
+                "contacts_source_password": "dav-secret",
+                "contacts_dest_type": "jmap",
+            },
+            follow_redirects=False,
+        )
+    assert response.status_code == 303
+    destination = manager.config.endpoints["contacts"]["dest"]
+    assert destination.url == "https://mail.example.test"
+    assert destination.username == "alice"
+    assert destination.token == "mail-token"
+    assert destination.password == ""
+
+
+def test_api_test_lists_jmap_dav_destination_collections(tmp_path, monkeypatch):
+    class FakeJmapDestination:
+        collections = [{"displayname": "Default", "id": "address-book-1"}]
+
+        def __init__(self, endpoint, kind):
+            self.endpoint = endpoint
+            self.kind = kind
+
+        def connect(self):
+            return self
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("emailsync.web.app.JmapDavDestination", FakeJmapDestination)
+    settings, store, manager = make_manager(tmp_path)
+    app = create_app(settings, store, manager)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/test",
+            json={
+                "kind": "contacts",
+                "side": "dest",
+                "endpoint": {
+                    "type": "jmap",
+                    "url": "https://jmap.example",
+                    "username": "alice",
+                },
+            },
+        )
+    assert response.status_code == 200
+    assert response.json()["folders"] == [{"source": "Default", "target": "address-book-1"}]

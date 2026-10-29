@@ -138,8 +138,8 @@ class JobConfig:
             )
         allowed = {
             "mail": (MAIL_SOURCE_TYPES, MAIL_DEST_TYPES),
-            "contacts": (CONTACTS_SOURCE_TYPES, ("carddav",)),
-            "calendars": (CALENDARS_SOURCE_TYPES, ("caldav",)),
+            "contacts": (CONTACTS_SOURCE_TYPES, ("carddav", "jmap")),
+            "calendars": (CALENDARS_SOURCE_TYPES, ("caldav", "jmap")),
         }
         for kind in KINDS:
             for side, idx in (("source", 0), ("dest", 1)):

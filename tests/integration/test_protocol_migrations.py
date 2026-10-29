@@ -6,8 +6,11 @@ import pytest
 from imapclient import IMAPClient
 
 from emailsync import db
+from emailsync.connectors.dav import DavClient
 from emailsync.connectors.imap import ssl_context
+from emailsync.dav.jmap_dest import JmapDavDestination
 from emailsync.dav.pipeline import DavMigration
+from emailsync.dav.vobjects import ensure_vcard_uid
 from emailsync.jobs.control import RunControl
 from emailsync.mail.dest import make_dest
 from emailsync.mail.pipeline import MailMigration
@@ -290,3 +293,135 @@ def test_radicale_dav_and_file_sources_to_stalwart(tmp_path, kind, collection, f
     file_job = store.create_job(f"{kind} file", {}, None)
     result = DavMigration(store, file_job, kind, file_config, RunControl()).run()
     assert result.status == "completed", result.error
+
+
+def _file_dav_config(kind, file_path, destination):
+    return JobConfig(
+        f"{kind} JMAP import",
+        {
+            kind: {"source": Endpoint("file", files=[str(file_path)]), "dest": destination},
+            **{
+                other: {"source": None, "dest": None}
+                for other in ("mail", "contacts", "calendars")
+                if other != kind
+            },
+        },
+        Options(workers=1, verify=False),
+    )
+
+
+def _jmap_destination():
+    return Endpoint("jmap", url="http://127.0.0.1:18080", username=STALWART_USER, password=STALWART_PASSWORD)
+
+
+def _query_jmap_items(kind, displayname):
+    destination = JmapDavDestination(_jmap_destination(), kind).connect()
+    try:
+        if displayname.casefold() == "default":
+            collection = next(
+                (item for item in destination.collections if item["displayname"].casefold() == "default"),
+                destination.collections[0],
+            )
+        else:
+            collection = next(item for item in destination.collections if item["displayname"] == displayname)
+        return destination.items(collection)
+    finally:
+        destination.close()
+
+
+def test_file_contacts_to_stalwart_jmap_is_idempotent(tmp_path):
+    file_path = tmp_path / "contacts-jmap.vcf"
+    second_card = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Two Person\r\nEMAIL:two@example.org\r\nEND:VCARD\r\n"
+    second_uid, _card = ensure_vcard_uid(second_card)
+    file_path.write_bytes(
+        (
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:jmap-contact-1\r\nFN:One Person\r\n"
+            "EMAIL:one@example.org\r\nEND:VCARD\r\n" + second_card
+        ).encode()
+    )
+    config = _file_dav_config("contacts", file_path, _jmap_destination())
+    store = db.Store(tmp_path / "contacts-jmap.db")
+    job_id = store.create_job("JMAP contacts", {}, None)
+
+    result = DavMigration(store, job_id, "contacts", config, RunControl()).run()
+    assert result.status == "completed", result.error
+    assert store.get_tasks(job_id)[0]["copied"] == 2
+    items = _query_jmap_items("contacts", "Default")
+    expected_uids = {"jmap-contact-1", second_uid}
+    assert expected_uids <= {item.uid for item in items}
+
+    result = DavMigration(store, job_id, "contacts", config, RunControl()).run()
+    assert result.status == "completed", result.error
+    assert store.get_tasks(job_id)[0]["copied"] == 0
+    assert expected_uids <= {item.uid for item in _query_jmap_items("contacts", "Default")}
+
+
+def test_file_calendar_with_recurrence_to_stalwart_jmap_is_idempotent(tmp_path):
+    file_path = tmp_path / "team-calendar-jmap.ics"
+    file_path.write_bytes(
+        b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Email Sync Tests//EN\r\n"
+        b"BEGIN:VTIMEZONE\r\nTZID:America/New_York\r\n"
+        b"BEGIN:STANDARD\r\nDTSTART:19701101T020000\r\nTZOFFSETFROM:-0400\r\n"
+        b"TZOFFSETTO:-0500\r\nTZNAME:EST\r\nEND:STANDARD\r\n"
+        b"BEGIN:DAYLIGHT\r\nDTSTART:19700308T020000\r\nTZOFFSETFROM:-0500\r\n"
+        b"TZOFFSETTO:-0400\r\nTZNAME:EDT\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\n"
+        b"BEGIN:VEVENT\r\nUID:jmap-weekly-1\r\nDTSTAMP:20240101T000000Z\r\n"
+        b"DTSTART;TZID=America/New_York:20250106T090000\r\n"
+        b"DTEND;TZID=America/New_York:20250106T100000\r\n"
+        b"RRULE:FREQ=WEEKLY;COUNT=4\r\nSUMMARY:Weekly planning\r\nEND:VEVENT\r\n"
+        b"BEGIN:VEVENT\r\nUID:jmap-weekly-1\r\n"
+        b"RECURRENCE-ID;TZID=America/New_York:20250113T090000\r\n"
+        b"DTSTAMP:20240101T000000Z\r\n"
+        b"DTSTART;TZID=America/New_York:20250113T103000\r\n"
+        b"DTEND;TZID=America/New_York:20250113T113000\r\n"
+        b"SUMMARY:Rescheduled planning\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    config = _file_dav_config("calendars", file_path, _jmap_destination())
+    store = db.Store(tmp_path / "calendar-jmap.db")
+    job_id = store.create_job("JMAP calendar", {}, None)
+
+    result = DavMigration(store, job_id, "calendars", config, RunControl()).run()
+    assert result.status == "completed", result.error
+    assert store.get_tasks(job_id)[0]["copied"] == 1
+    items = _query_jmap_items("calendars", file_path.stem)
+    assert [item.uid for item in items] == ["jmap-weekly-1"]
+    assert items[0].fingerprint == ""
+
+    result = DavMigration(store, job_id, "calendars", config, RunControl()).run()
+    assert result.status == "completed", result.error
+    assert store.get_tasks(job_id)[0]["copied"] == 0
+    assert [item.uid for item in _query_jmap_items("calendars", file_path.stem)] == ["jmap-weekly-1"]
+
+
+def test_carddav_preseeded_contact_is_skipped_by_jmap_destination(tmp_path):
+    carddav = DavClient(
+        Endpoint(
+            "carddav",
+            url="http://127.0.0.1:18080",
+            username=STALWART_USER,
+            password=STALWART_PASSWORD,
+        ),
+        "carddav",
+    )
+    contact_data = (
+        b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:cross-protocol-contact-1\r\n"
+        b"FN:Shared Person\r\nEMAIL:shared@example.org\r\nEND:VCARD\r\n"
+    )
+    try:
+        _home, collections = carddav.discover()
+        assert collections
+        default_book = collections[0]
+        assert carddav.put(default_book, "cross-protocol-contact-1.vcf", contact_data) is True
+    finally:
+        carddav.close()
+
+    file_path = tmp_path / "cross-protocol.vcf"
+    file_path.write_bytes(contact_data)
+    config = _file_dav_config("contacts", file_path, _jmap_destination())
+    store = db.Store(tmp_path / "cross-protocol.db")
+    job_id = store.create_job("Cross-protocol contact", {}, None)
+
+    result = DavMigration(store, job_id, "contacts", config, RunControl()).run()
+    assert result.status == "completed", result.error
+    assert store.get_tasks(job_id)[0]["copied"] == 0
+    assert store.get_tasks(job_id)[0]["skipped"] == 1

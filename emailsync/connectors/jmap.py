@@ -1,4 +1,4 @@
-"""Minimal JMAP client (RFC 8620 core + RFC 8621 mail) for importing messages."""
+"""Minimal JMAP client for importing messages, contacts, and calendar events."""
 
 from urllib.parse import urlsplit, urlunsplit
 
@@ -9,6 +9,10 @@ from emailsync.options import Endpoint
 
 CORE = "urn:ietf:params:jmap:core"
 MAIL = "urn:ietf:params:jmap:mail"
+CONTACTS = "urn:ietf:params:jmap:contacts"
+CALENDARS = "urn:ietf:params:jmap:calendars"
+CONTACTS_PARSE = "urn:ietf:params:jmap:contacts:parse"
+CALENDARS_PARSE = "urn:ietf:params:jmap:calendars:parse"
 
 FLAG_TO_KEYWORD = {
     "\\seen": "$seen",
@@ -74,7 +78,7 @@ class JmapClient:
         self.max_objects_in_get = 500
         self.max_calls = 16
 
-    def connect(self) -> "JmapClient":
+    def connect(self, capability=MAIL) -> "JmapClient":
         try:
             r = self.http.get(self.base + "/.well-known/jmap")
             if r.status_code == 404:
@@ -91,9 +95,10 @@ class JmapClient:
         except ValueError as exc:
             raise PermanentError(f"{self.base} did not return a JMAP session document") from exc
         accounts = self.session.get("primaryAccounts", {})
-        if MAIL not in accounts:
-            raise PermanentError("JMAP server does not offer mail for this account")
-        self.account_id = accounts[MAIL]
+        if capability not in accounts:
+            label = {MAIL: "mail", CONTACTS: "contacts", CALENDARS: "calendars"}.get(capability, capability)
+            raise PermanentError(f"JMAP server does not offer {label} for this account")
+        self.account_id = accounts[capability]
         self.api_url = _rebase(self.session["apiUrl"], self.base)
         self.upload_url = _rebase(self.session["uploadUrl"], self.base)
         core = self.session.get("capabilities", {}).get(CORE, {})

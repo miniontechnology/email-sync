@@ -7,8 +7,8 @@ the browser, and can be paused, resumed, and retried.
 Supported sources and destinations:
 
 - Mail: generic IMAP, Gmail over IMAP, and JMAP destinations.
-- Contacts: CardDAV and vCard files.
-- Calendars: CalDAV and iCalendar files.
+- Contacts: CardDAV, JMAP destinations, and vCard files.
+- Calendars: CalDAV, JMAP destinations, and iCalendar files.
 - Takeout `.zip` archives containing `.vcf` or `.ics` files are supported.
 
 The UI has no login and is intended for a trusted private LAN. Do not expose it directly to the
@@ -53,8 +53,9 @@ Changing `EMAIL_SYNC_SECRET_KEY` after creating jobs makes their saved credentia
 3. For contacts and calendars, Google CardDAV/CalDAV requires OAuth, which this application does
    not implement. Export contacts as vCard and calendars as iCalendar using Google Takeout, then
    upload the `.vcf`, `.ics`, or enclosing `.zip` files as file sources. Configure Stalwart's
-   CardDAV and CalDAV endpoints as the destinations. DAV credentials may be left blank to reuse
-   credentials from that side's mail endpoint.
+   CardDAV, CalDAV, or JMAP endpoints as the destinations. JMAP imports require the server's vCard
+   and iCalendar parse capabilities. DAV/JMAP credentials may be left blank to reuse credentials
+   from that side's mail endpoint.
 4. Run a dry run first. Review folder mappings, selected source scopes, and progress before
    running a real copy.
 
@@ -68,7 +69,8 @@ reconciles unfinished uploads against the destination and only copies missing me
 indexes destination messages before copying, so messages already copied by another tool are
 counted and not re-imported. Message matching uses Message-ID where available and a stable
 header fingerprint otherwise. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for details and
-limitations.
+limitations. JMAP calendar destinations match existing events by UID only and do not use event
+fingerprints.
 
 ## Configuration
 
