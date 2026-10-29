@@ -4,9 +4,9 @@ Things deliberately left out of v1 so the core migration path could be made reli
 Roughly in priority order; open an issue/PR to reprioritise.
 
 ## Sources & destinations
-- **Google OAuth 2.0** sign-in (for Gmail IMAP without app passwords, and for Google CardDAV/CalDAV so
-  contacts/calendars can be read live instead of from a Takeout export). Requires a user-supplied
-  Google Cloud OAuth client.
+- **Google account preset** for generic OAuth sign-in (next PR; requires a user-supplied Google Cloud
+  OAuth client).
+- **OAuth device authorization flow** (Stalwart refuses it for self-registered clients; Google excludes mail/contacts/calendar scopes).
 - **JMAP Contacts / Calendars as destinations** (RFC 9610 / draft-ietf-jmap-calendars) — done.
 - **JMAP Contacts / Calendars as sources** (needs JSContact/JSCalendar → vCard/ICS).
 - Gmail mbox import from Google Takeout (for accounts where IMAP is disabled or throttled).

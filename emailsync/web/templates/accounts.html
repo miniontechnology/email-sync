@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Saved accounts{% endblock %}
+{% block content %}
+<div class="page-heading">
+  <div><p class="eyebrow">CONNECTIONS</p><h1>Saved accounts</h1><p class="lead">Credentials are encrypted at rest and are never shown after saving.</p></div>
+  <a class="button primary" href="/accounts/new">Add account</a>
+</div>
+<div class="job-list">
+{% for account in accounts %}
+  <a class="job-card" href="/accounts/{{ account.id }}">
+    <div class="job-card-main"><div class="job-title-row"><h2>{{ account.name }}</h2><span class="badge badge-{{ 'completed' if account.signed_in else 'queued' }}">{{ 'Signed in' if account.signed_in else account.auth_method }}</span></div>
+      <p class="muted">{{ account.type|upper }} · {{ account.username or account.url }}</p>
+    </div><div class="job-card-side"><span class="arrow">→</span></div>
+  </a>
+{% else %}
+  <div class="empty-state"><h2>No saved accounts yet</h2><p>Add a server account to reuse its connection details across migrations.</p></div>
+{% endfor %}
+</div>
+{% endblock %}

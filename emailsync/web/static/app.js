@@ -29,6 +29,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const fields = document.querySelector(`[data-endpoint-fields="${prefix}"]`);
     if (!select || !fields) return;
     const type = select.value;
+    const saved = document.querySelector(`[name="${prefix}_account_id"]`)?.value;
+    fields.hidden = Boolean(saved);
     fields.querySelector(".imap-fields").hidden = !["imap", "gmail"].includes(type);
     fields.querySelector(".url-fields").hidden = !["jmap", "carddav", "caldav"].includes(type);
     fields.querySelector(".credential-fields").hidden = ["none", "file"].includes(type);
@@ -38,6 +40,10 @@ document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll("[data-endpoint-type]").forEach(select => {
     select.addEventListener("change", () => updateEndpoint(select.name.replace(/_type$/, "")));
     updateEndpoint(select.name.replace(/_type$/, ""));
+  });
+  document.querySelectorAll("[data-saved-account]").forEach(select => {
+    select.addEventListener("change", () => updateEndpoint(select.name.replace(/_account_id$/, "")));
+    updateEndpoint(select.name.replace(/_account_id$/, ""));
   });
 
   document.querySelectorAll("[data-preset]").forEach(button => {
@@ -65,6 +71,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const prefix = `${button.dataset.kind}_${button.dataset.side}`;
       const form = document.querySelector("form");
       const endpoint = {type: value(`${prefix}_type`), host: value(`${prefix}_host`),
+        account_id: Number(value(`${prefix}_account_id`) || 0) || null,
         port: Number(value(`${prefix}_port`) || 0), security: value(`${prefix}_security`) || "ssl",
         username: value(`${prefix}_username`), password: value(`${prefix}_password`),
         token: value(`${prefix}_token`), url: value(`${prefix}_url`),

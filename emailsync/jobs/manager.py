@@ -7,10 +7,12 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from emailsync.accounts import load_accounts, resolve_endpoint
 from emailsync.config import Settings
 from emailsync.dav.pipeline import DavMigration
 from emailsync.jobs.control import RunControl, TaskResult
 from emailsync.mail.pipeline import MailMigration
+from emailsync.oauth import TokenManager
 from emailsync.options import JobConfig
 
 _ACTIVE = {"queued", "running"}
@@ -31,6 +33,7 @@ class JobManager:
         self.store = store
         self.secretbox = secretbox
         self.settings = settings
+        self.token_manager = TokenManager(store, secretbox)
         self.mail_factory = mail_factory
         self.dav_factory = dav_factory
         self._lock = threading.RLock()
@@ -133,7 +136,7 @@ class JobManager:
                 thread = self._threads.get(job_id)
             if thread and thread is not threading.current_thread():
                 thread.join()
-        config = self._load_config(job)
+        config = self._load_config(job, resolve=False)
         upload_dirs = set()
         for pair in config.endpoints.values():
             for endpoint in pair.values():
@@ -157,7 +160,7 @@ class JobManager:
         job = self.store.get_job(job_id)
         if not job:
             raise KeyError(job_id)
-        config = self._load_config(job)
+        config = self._load_config(job, resolve=False)
         config.name = f"{config.name} (copy)"
         return self.create_job(config)
 
@@ -171,9 +174,15 @@ class JobManager:
         self.store.add_event(job_id, "info", "Migration progress forgotten")
         return True
 
-    def _load_config(self, job) -> JobConfig:
+    def _load_config(self, job, resolve=True) -> JobConfig:
         secrets = self.secretbox.decrypt(job.get("secrets_enc"))
-        return JobConfig.from_dict(job["config"], secrets)
+        config = JobConfig.from_dict(job["config"], secrets)
+        if resolve:
+            accounts = load_accounts(self.store, self.secretbox)
+            for pair in config.endpoints.values():
+                for side, endpoint in pair.items():
+                    pair[side] = resolve_endpoint(endpoint, accounts, self.token_manager)
+        return config
 
     def _scheduler_loop(self):
         while not self._stop.is_set():

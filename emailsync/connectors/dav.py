@@ -8,6 +8,7 @@ from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 import httpx
 
 from emailsync.errors import AuthError, PermanentError, ThrottledError, wrap
+from emailsync.oauth import OAuthBearerAuth, StaticBearerAuth
 from emailsync.options import Endpoint
 
 DAV = "DAV:"
@@ -72,7 +73,14 @@ class DavClient:
         if not base.startswith(("http://", "https://")):
             base = "https://" + base
         self.base = _safe_url(base.rstrip("/") + "/")
-        self.auth = (endpoint.username, endpoint.password) if endpoint.username or endpoint.password else None
+        if endpoint.token_provider is not None:
+            self.auth = OAuthBearerAuth(endpoint.token_provider)
+        elif endpoint.token:
+            self.auth = StaticBearerAuth(endpoint.token)
+        else:
+            self.auth = (
+                (endpoint.username, endpoint.password) if endpoint.username or endpoint.password else None
+            )
         self.http = httpx.Client(
             verify=not endpoint.insecure_tls,
             timeout=httpx.Timeout(timeout, connect=20.0),

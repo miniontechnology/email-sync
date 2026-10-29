@@ -1,9 +1,11 @@
 """FastAPI application and browser UI."""
 
+import re
 import shutil
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -11,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from emailsync.accounts import load_accounts, resolve_endpoint
 from emailsync.config import Settings, load_settings
 from emailsync.connectors.dav import DavClient
 from emailsync.crypto import SecretBox
@@ -21,6 +24,7 @@ from emailsync.jobs.manager import JobManager
 from emailsync.mail.dest import make_dest
 from emailsync.mail.folders import parse_folder_map
 from emailsync.mail.source import make_source
+from emailsync.oauth import OAuthService, TokenManager
 from emailsync.options import Endpoint, JobConfig, Options
 
 PACKAGE_DIR = Path(__file__).parent
@@ -35,6 +39,20 @@ def _format_job(job):
         if source and dest:
             summaries.append(f"{kind}: {source.get('type', '?')} → {dest.get('type', '?')}")
     return {**job, "summary": " · ".join(summaries) or "No configured migrations"}
+
+
+def _reauth_account_id(job, store):
+    match = re.search(r"Sign-in for account '(.+?)' has expired or was revoked", job.get("last_error") or "")
+    if not match:
+        return None
+    account_name = match.group(1)
+    for pair in job.get("config", {}).get("endpoints", {}).values():
+        for endpoint in pair.values():
+            if endpoint and endpoint.get("account_id"):
+                account = store.get_account(endpoint["account_id"])
+                if account and account["name"] == account_name:
+                    return endpoint["account_id"]
+    return None
 
 
 def _progress(tasks):
@@ -76,12 +94,17 @@ def _endpoint_from_form(form, kind, side, uploads_dir, mail_endpoint=None, uploa
         password = password or (mail_endpoint.password if mail_endpoint else "")
     token = str(form.get(prefix + "token") or "")
     url = str(form.get(prefix + "url") or "").strip()
+    account_id = form.get(prefix + "account_id")
+    account_id = int(account_id) if account_id and str(account_id).isdigit() else None
+    if account_id:
+        username = password = token = ""
     if endpoint_type == "jmap" and mail_endpoint and mail_endpoint.type == "jmap":
         url = url or mail_endpoint.url
         if not password:
             token = token or mail_endpoint.token
     return Endpoint(
         type=endpoint_type,
+        account_id=account_id,
         host=str(form.get(prefix + "host") or "").strip(),
         port=int(form.get(prefix + "port") or 0),
         security=str(form.get(prefix + "security") or "ssl"),
@@ -137,9 +160,12 @@ async def _build_config(request, settings):
 def create_app(settings: Settings | None = None, store=None, manager=None):
     settings = settings or load_settings()
     store = store or Store(settings.db_path)
-    manager = manager or JobManager(
-        store, SecretBox.from_settings(settings.secret_key, settings.data_dir), settings
+    secretbox = getattr(manager, "secretbox", None) or SecretBox.from_settings(
+        settings.secret_key, settings.data_dir
     )
+    manager = manager or JobManager(store, secretbox, settings)
+    token_manager = getattr(manager, "token_manager", None) or TokenManager(store, secretbox)
+    oauth = OAuthService(store, secretbox)
 
     @asynccontextmanager
     async def lifespan(_app):
@@ -151,6 +177,8 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
     app.state.settings = settings
     app.state.store = store
     app.state.manager = manager
+    app.state.secretbox = secretbox
+    app.state.oauth = oauth
     app.mount("/static", StaticFiles(directory=str(PACKAGE_DIR / "static")), name="static")
 
     def _render_jobs(request):
@@ -173,7 +201,9 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
     @app.get("/jobs/new", response_class=HTMLResponse)
     async def new_job(request: Request):
         return templates.TemplateResponse(
-            request=request, name="new_job.html", context={"errors": [], "values": {}}
+            request=request,
+            name="new_job.html",
+            context={"errors": [], "values": {}, "accounts": store.list_accounts()},
         )
 
     @app.post("/jobs", response_class=HTMLResponse)
@@ -187,7 +217,7 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
                 return templates.TemplateResponse(
                     request=request,
                     name="new_job.html",
-                    context={"errors": errors, "values": values},
+                    context={"errors": errors, "values": values, "accounts": store.list_accounts()},
                     status_code=422,
                 )
             job_id = manager.create_job(config)
@@ -197,7 +227,7 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             return templates.TemplateResponse(
                 request=request,
                 name="new_job.html",
-                context={"errors": [str(exc)], "values": {}},
+                context={"errors": [str(exc)], "values": {}, "accounts": store.list_accounts()},
                 status_code=422,
             )
         return RedirectResponse(f"/jobs/{job_id}", status_code=303)
@@ -216,6 +246,7 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
                 "scopes": store.get_scopes(job_id),
                 "events": store.get_events(job_id, 100),
                 "failed": store.ledger_failed(job_id),
+                "reauth_account_id": _reauth_account_id(job, store),
             },
         )
 
@@ -233,6 +264,7 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
                 "scopes": store.get_scopes(job_id),
                 "events": store.get_events(job_id, 100),
                 "failed": store.ledger_failed(job_id),
+                "reauth_account_id": _reauth_account_id(job, store),
             },
         )
 
@@ -268,6 +300,10 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
         if not endpoint:
             return JSONResponse({"ok": False, "detail": "Endpoint is not configured.", "folders": []}, 422)
         options = Options.from_dict(body.get("options"))
+        try:
+            endpoint = resolve_endpoint(endpoint, load_accounts(store, secretbox), token_manager)
+        except Exception as exc:
+            return JSONResponse({"ok": False, "detail": str(exc), "folders": []}, 400)
         folders = []
         try:
             if endpoint.type in ("imap", "gmail") and side == "source":
@@ -329,6 +365,167 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
     @app.get("/healthz")
     async def healthz():
         return {"ok": True}
+
+    def _account_page_data(account_id):
+        account = store.get_account(account_id)
+        if not account:
+            return None
+        secrets = secretbox.decrypt(account.get("secrets_enc"))
+        return {
+            "id": account["id"],
+            "name": account["name"],
+            "config": account["config"],
+            "has_password": bool(secrets.get("password")),
+            "has_token": bool(secrets.get("token")),
+            "has_client_secret": bool(secrets.get("client_secret")),
+            "signed_in": bool(secrets.get("access_token") and secrets.get("refresh_token")),
+        }
+
+    @app.get("/accounts", response_class=HTMLResponse)
+    async def accounts_page(request: Request):
+        accounts = []
+        for account in store.list_accounts():
+            secrets = secretbox.decrypt(account.get("secrets_enc"))
+            accounts.append(
+                {
+                    "id": account["id"],
+                    "name": account["name"],
+                    "type": account["config"].get("type", ""),
+                    "username": account["config"].get("username", ""),
+                    "url": account["config"].get("url", ""),
+                    "auth_method": account["config"].get("auth_method", "password"),
+                    "signed_in": bool(secrets.get("access_token") and secrets.get("refresh_token")),
+                }
+            )
+        return templates.TemplateResponse(
+            request=request, name="accounts.html", context={"accounts": accounts}
+        )
+
+    @app.get("/accounts/new", response_class=HTMLResponse)
+    async def new_account(request: Request):
+        return templates.TemplateResponse(
+            request=request, name="account_form.html", context={"account": None, "error": ""}
+        )
+
+    def _save_account(form, account_id=None):
+        name = str(form.get("name") or "").strip()
+        config = {
+            "type": str(form.get("type") or "jmap"),
+            "url": str(form.get("url") or "").strip(),
+            "host": str(form.get("host") or "").strip(),
+            "port": int(form.get("port") or 0),
+            "security": str(form.get("security") or "ssl"),
+            "username": str(form.get("username") or "").strip(),
+            "insecure_tls": bool(form.get("insecure_tls")),
+            "auth_method": str(form.get("auth_method") or "password"),
+            "issuer_url": str(form.get("issuer_url") or "").strip(),
+            "client_id": str(form.get("client_id") or "").strip(),
+            "scopes": str(form.get("scopes") or "").strip(),
+        }
+        if not name:
+            raise ValueError("Account name is required.")
+        if config["auth_method"] not in ("password", "token", "oauth"):
+            raise ValueError("Unsupported authentication method.")
+        current = store.get_account(account_id) if account_id else None
+        secrets = secretbox.decrypt(current.get("secrets_enc")) if current else {}
+        for field in ("password", "token", "client_secret"):
+            value = str(form.get(field) or "")
+            if value:
+                secrets[field] = value
+        encrypted = secretbox.encrypt(secrets) if secrets else None
+        if current:
+            store.update_account_config(account_id, name, config)
+            store.update_account_secrets(account_id, encrypted)
+            return account_id
+        return store.create_account(name, config, encrypted)
+
+    @app.post("/accounts")
+    async def create_account(request: Request):
+        form = await request.form()
+        try:
+            account_id = _save_account(form)
+        except (ValueError, OSError) as exc:
+            return templates.TemplateResponse(
+                request=request,
+                name="account_form.html",
+                context={"account": None, "error": str(exc)},
+                status_code=422,
+            )
+        return RedirectResponse(f"/accounts/{account_id}", status_code=303)
+
+    @app.get("/accounts/{account_id}", response_class=HTMLResponse)
+    async def account_detail(request: Request, account_id: int, error: str = "", message: str = ""):
+        account = _account_page_data(account_id)
+        if not account:
+            return HTMLResponse("Account not found", status_code=404)
+        return templates.TemplateResponse(
+            request=request,
+            name="account_form.html",
+            context={"account": account, "error": error, "message": message},
+        )
+
+    @app.post("/accounts/{account_id}")
+    async def update_account(request: Request, account_id: int):
+        form = await request.form()
+        if not store.get_account(account_id):
+            return HTMLResponse("Account not found", status_code=404)
+        try:
+            _save_account(form, account_id)
+        except (ValueError, OSError) as exc:
+            return RedirectResponse(
+                f"/accounts/{account_id}?error={urlencode({'error': str(exc)})[6:]}",
+                status_code=303,
+            )
+        return RedirectResponse(f"/accounts/{account_id}?message=Account%20saved", status_code=303)
+
+    @app.post("/accounts/{account_id}/delete")
+    async def delete_account(account_id: int):
+        try:
+            store.delete_account(account_id)
+        except ValueError as exc:
+            return RedirectResponse(
+                f"/accounts/{account_id}?error={urlencode({'error': str(exc)})[6:]}",
+                status_code=303,
+            )
+        return RedirectResponse("/accounts", status_code=303)
+
+    @app.get("/accounts/{account_id}/signin")
+    async def account_signin(account_id: int):
+        try:
+            return RedirectResponse(oauth.start(account_id), status_code=303)
+        except Exception as exc:
+            return RedirectResponse(
+                f"/accounts/{account_id}?error={urlencode({'error': str(exc)})[6:]}",
+                status_code=303,
+            )
+
+    @app.get("/oauth/callback", response_class=HTMLResponse)
+    async def oauth_callback(request: Request):
+        try:
+            account = oauth.complete(str(request.url))
+            return RedirectResponse(f"/accounts/{account['id']}?message=Sign-in%20complete", status_code=303)
+        except Exception as exc:
+            return templates.TemplateResponse(
+                request=request,
+                name="oauth_result.html",
+                context={"error": str(exc), "account_id": None},
+                status_code=400,
+            )
+
+    @app.post("/oauth/complete")
+    async def oauth_complete(request: Request):
+        form = await request.form()
+        callback = str(form.get("callback") or "")
+        try:
+            account = oauth.complete(callback)
+        except Exception as exc:
+            return templates.TemplateResponse(
+                request=request,
+                name="oauth_result.html",
+                context={"error": str(exc), "account_id": None},
+                status_code=400,
+            )
+        return RedirectResponse(f"/accounts/{account['id']}?message=Sign-in%20complete", status_code=303)
 
     return app
 

@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -331,12 +332,16 @@ def _query_jmap_items(kind, displayname):
 
 def test_file_contacts_to_stalwart_jmap_is_idempotent(tmp_path):
     file_path = tmp_path / "contacts-jmap.vcf"
-    second_card = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Two Person\r\nEMAIL:two@example.org\r\nEND:VCARD\r\n"
+    suffix = uuid4().hex
+    second_card = (
+        f"BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Two Person {suffix}\r\n"
+        f"EMAIL:two-{suffix}@example.org\r\nEND:VCARD\r\n"
+    )
     second_uid, _card = ensure_vcard_uid(second_card)
     file_path.write_bytes(
         (
-            "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:jmap-contact-1\r\nFN:One Person\r\n"
-            "EMAIL:one@example.org\r\nEND:VCARD\r\n" + second_card
+            f"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:jmap-contact-{suffix}\r\nFN:One Person\r\n"
+            f"EMAIL:one-{suffix}@example.org\r\nEND:VCARD\r\n" + second_card
         ).encode()
     )
     config = _file_dav_config("contacts", file_path, _jmap_destination())
@@ -347,7 +352,7 @@ def test_file_contacts_to_stalwart_jmap_is_idempotent(tmp_path):
     assert result.status == "completed", result.error
     assert store.get_tasks(job_id)[0]["copied"] == 2
     items = _query_jmap_items("contacts", "Default")
-    expected_uids = {"jmap-contact-1", second_uid}
+    expected_uids = {f"jmap-contact-{suffix}", second_uid}
     assert expected_uids <= {item.uid for item in items}
 
     result = DavMigration(store, job_id, "contacts", config, RunControl()).run()
@@ -358,6 +363,7 @@ def test_file_contacts_to_stalwart_jmap_is_idempotent(tmp_path):
 
 def test_file_calendar_with_recurrence_to_stalwart_jmap_is_idempotent(tmp_path):
     file_path = tmp_path / "team-calendar-jmap.ics"
+    event_uid = f"jmap-weekly-{uuid4().hex}".encode()
     file_path.write_bytes(
         b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Email Sync Tests//EN\r\n"
         b"BEGIN:VTIMEZONE\r\nTZID:America/New_York\r\n"
@@ -365,11 +371,11 @@ def test_file_calendar_with_recurrence_to_stalwart_jmap_is_idempotent(tmp_path):
         b"TZOFFSETTO:-0500\r\nTZNAME:EST\r\nEND:STANDARD\r\n"
         b"BEGIN:DAYLIGHT\r\nDTSTART:19700308T020000\r\nTZOFFSETFROM:-0500\r\n"
         b"TZOFFSETTO:-0400\r\nTZNAME:EDT\r\nEND:DAYLIGHT\r\nEND:VTIMEZONE\r\n"
-        b"BEGIN:VEVENT\r\nUID:jmap-weekly-1\r\nDTSTAMP:20240101T000000Z\r\n"
+        b"BEGIN:VEVENT\r\nUID:" + event_uid + b"\r\nDTSTAMP:20240101T000000Z\r\n"
         b"DTSTART;TZID=America/New_York:20250106T090000\r\n"
         b"DTEND;TZID=America/New_York:20250106T100000\r\n"
         b"RRULE:FREQ=WEEKLY;COUNT=4\r\nSUMMARY:Weekly planning\r\nEND:VEVENT\r\n"
-        b"BEGIN:VEVENT\r\nUID:jmap-weekly-1\r\n"
+        b"BEGIN:VEVENT\r\nUID:" + event_uid + b"\r\n"
         b"RECURRENCE-ID;TZID=America/New_York:20250113T090000\r\n"
         b"DTSTAMP:20240101T000000Z\r\n"
         b"DTSTART;TZID=America/New_York:20250113T103000\r\n"
@@ -384,13 +390,15 @@ def test_file_calendar_with_recurrence_to_stalwart_jmap_is_idempotent(tmp_path):
     assert result.status == "completed", result.error
     assert store.get_tasks(job_id)[0]["copied"] == 1
     items = _query_jmap_items("calendars", file_path.stem)
-    assert [item.uid for item in items] == ["jmap-weekly-1"]
-    assert items[0].fingerprint == ""
+    assert [item.uid for item in items].count(event_uid.decode()) == 1
+    assert next(item for item in items if item.uid == event_uid.decode()).fingerprint == ""
 
     result = DavMigration(store, job_id, "calendars", config, RunControl()).run()
     assert result.status == "completed", result.error
     assert store.get_tasks(job_id)[0]["copied"] == 0
-    assert [item.uid for item in _query_jmap_items("calendars", file_path.stem)] == ["jmap-weekly-1"]
+    assert [item.uid for item in _query_jmap_items("calendars", file_path.stem)].count(
+        event_uid.decode()
+    ) == 1
 
 
 def test_carddav_preseeded_contact_is_skipped_by_jmap_destination(tmp_path):
@@ -403,15 +411,16 @@ def test_carddav_preseeded_contact_is_skipped_by_jmap_destination(tmp_path):
         ),
         "carddav",
     )
+    uid = f"cross-protocol-contact-{uuid4().hex}"
     contact_data = (
-        b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:cross-protocol-contact-1\r\n"
-        b"FN:Shared Person\r\nEMAIL:shared@example.org\r\nEND:VCARD\r\n"
-    )
+        f"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:{uid}\r\n"
+        f"FN:Shared Person\r\nEMAIL:{uid}@example.org\r\nEND:VCARD\r\n"
+    ).encode()
     try:
         _home, collections = carddav.discover()
         assert collections
         default_book = collections[0]
-        assert carddav.put(default_book, "cross-protocol-contact-1.vcf", contact_data) is True
+        assert carddav.put(default_book, f"{uid}.vcf", contact_data) is True
     finally:
         carddav.close()
 
