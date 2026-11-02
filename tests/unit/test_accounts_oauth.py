@@ -9,9 +9,10 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from emailsync.accounts import resolve_endpoint
+from emailsync.accounts import check_account_compat, resolve_endpoint
 from emailsync.config import Settings
 from emailsync.connectors.dav import DavClient
+from emailsync.connectors.jmap import MAIL, JmapClient
 from emailsync.crypto import SecretBox
 from emailsync.db import Store
 from emailsync.errors import AuthError, PermanentError, ReauthRequired
@@ -22,6 +23,7 @@ from emailsync.oauth import (
     OAuthService,
     TokenManager,
     _oauth_post,
+    default_scopes,
     discover,
     register_client,
 )
@@ -145,6 +147,7 @@ def test_oauth_registration_pkce_exchange_and_secrets_persist(tmp_path):
         "http://127.0.0.1:8080/oauth/callback?"
         + urlencode({"code": "auth-code", "state": query["state"][0], "iss": "https://idp.example.test"})
     )
+    assert store.get_account(account_id)["config"]["client_registered"] is True
     fields = seen["token_request"]
     expected = base64.urlsafe_b64encode(hashlib.sha256(fields["code_verifier"].encode()).digest())
     assert expected.decode().rstrip("=") == query["code_challenge"][0]
@@ -448,6 +451,226 @@ def test_token_exchange_uses_supported_client_auth_method(method, expected_auth,
     assert ("client_id" in captured["body"]) is not expected_auth
 
 
+def test_token_exchange_defaults_to_client_secret_basic():
+    captured = {}
+
+    def handler(request):
+        captured["authorization"] = request.headers.get("Authorization")
+        captured["body"] = dict(parse_qsl(request.content.decode()))
+        return httpx.Response(200, json={"access_token": "access"})
+
+    _oauth_post(
+        "https://idp.example.test/token",
+        {"grant_type": "authorization_code", "client_id": "client"},
+        {"client_id": "client"},
+        "client-secret",
+        transport=httpx.MockTransport(handler),
+    )
+    assert captured["authorization"] == "Basic " + base64.b64encode(b"client:client-secret").decode()
+    assert "client_secret" not in captured["body"]
+    assert "client_id" not in captured["body"]
+
+
+def test_default_scopes_falls_back_and_rejects_empty_intersection():
+    assert default_scopes({"scopes_supported": ["email", "profile"]}) == ["email", "profile"]
+    with pytest.raises(
+        PermanentError,
+        match="The server lists no usable scopes; enter scopes on the account.",
+    ):
+        default_scopes({"scopes_supported": ["unrelated"]})
+
+
+def test_complete_drops_old_refresh_token_when_response_omits_it(tmp_path):
+    _settings, store, secretbox = _store(tmp_path)
+    account_id = _account(store, secretbox, secrets={"refresh_token": "old-refresh"})
+
+    def handler(request):
+        if request.url.path.endswith("oauth-authorization-server"):
+            return httpx.Response(200, json=_metadata())
+        return httpx.Response(200, json={"access_token": "new-access", "expires_in": 3600})
+
+    service = OAuthService(store, secretbox, transport=httpx.MockTransport(handler))
+    query = parse_qs(urlsplit(service.start(account_id)).query)
+    service.complete("?code=code&state=" + query["state"][0])
+    assert "refresh_token" not in secretbox.decrypt(store.get_account(account_id)["secrets_enc"])
+
+
+def test_account_compatibility_and_job_creation_validation(tmp_path):
+    settings, store, secretbox = _store(tmp_path)
+    account_id = _account(
+        store,
+        secretbox,
+        config={"type": "jmap", "url": "https://saved.test", "auth_method": "token"},
+    )
+    endpoint = Endpoint("imap", account_id=account_id)
+    account = store.get_account(account_id)
+    assert check_account_compat(endpoint, account) == (
+        "Account 'Saved' uses a static token, which IMAP can't use; use a password or OAuth"
+    )
+    with pytest.raises(PermanentError, match="static token"):
+        resolve_endpoint(endpoint, {account_id: account})
+    config = JobConfig(
+        "Mismatch",
+        {
+            "mail": {"source": endpoint, "dest": Endpoint("jmap", account_id=account_id)},
+            "contacts": {"source": None, "dest": None},
+            "calendars": {"source": None, "dest": None},
+        },
+        Options(),
+    )
+    with pytest.raises(ValueError, match="static token"):
+        JobManager(store, secretbox, settings).create_job(config)
+    with TestClient(create_app(settings, store)) as client:
+        response = client.post(
+            "/jobs",
+            data={
+                "name": "Mismatch",
+                "mail_source_type": "imap",
+                "mail_source_account_id": str(account_id),
+                "mail_dest_type": "jmap",
+                "mail_dest_account_id": str(account_id),
+            },
+        )
+    assert response.status_code == 422
+    assert "uses a static token" in response.text
+
+
+def test_account_form_rejects_static_token_for_imap(tmp_path):
+    settings, store, _secretbox = _store(tmp_path)
+    with TestClient(create_app(settings, store)) as client:
+        response = client.post(
+            "/accounts",
+            data={"name": "IMAP", "type": "imap", "host": "mail.test", "auth_method": "token"},
+        )
+    assert response.status_code == 422
+    assert "IMAP accounts cannot use static-token authentication." in response.text
+    with TestClient(create_app(settings, store)) as client:
+        response = client.post(
+            "/accounts",
+            data={
+                "name": "Manual OAuth",
+                "type": "jmap",
+                "url": "https://idp.test",
+                "auth_method": "oauth",
+                "client_id": "manual-client",
+            },
+            follow_redirects=False,
+        )
+    manual = store.get_account(int(response.headers["location"].split("/")[-1]))
+    assert manual["config"]["client_registered"] is False
+
+
+def test_account_identity_edit_clears_tokens_and_dynamic_registration(tmp_path):
+    settings, store, secretbox = _store(tmp_path)
+    account_id = _account(
+        store,
+        secretbox,
+        config={
+            "type": "jmap",
+            "url": "https://old.test",
+            "issuer_url": "",
+            "auth_method": "oauth",
+            "client_id": "registered-id",
+            "client_registered": True,
+            "scopes": "openid",
+        },
+        secrets={
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_at": time.time() + 3600,
+            "client_secret": "client-secret",
+        },
+    )
+    with TestClient(create_app(settings, store)) as client:
+        response = client.post(
+            f"/accounts/{account_id}",
+            data={
+                "name": "Saved",
+                "type": "jmap",
+                "url": "https://new.test",
+                "issuer_url": "",
+                "auth_method": "oauth",
+                "client_id": "registered-id",
+                "scopes": "openid",
+            },
+            follow_redirects=False,
+        )
+    updated = store.get_account(account_id)
+    assert response.status_code == 303
+    assert updated["config"]["client_id"] == ""
+    assert not updated["config"]["client_registered"]
+    assert secretbox.decrypt(updated["secrets_enc"]) == {}
+
+
+def test_unexpired_access_token_without_refresh_is_shown_as_signed_in(tmp_path):
+    settings, store, secretbox = _store(tmp_path)
+    account_id = _account(
+        store,
+        secretbox,
+        secrets={"access_token": "access", "expires_at": time.time() + 600},
+    )
+    with TestClient(create_app(settings, store)) as client:
+        response = client.get(f"/accounts/{account_id}")
+    assert "Signed in (no refresh token — you'll need to sign in again when it expires in " in response.text
+
+
+def test_jmap_oauth_redirect_does_not_send_bearer_after_redirect_or_401_retry():
+    class Provider:
+        def __init__(self):
+            self.refreshes = 0
+
+        def token(self, force_refresh=False, rejected_token=None):
+            if force_refresh:
+                self.refreshes += 1
+            return "bearer"
+
+    seen = []
+    remote_resource_requests = 0
+
+    def handler(request):
+        nonlocal remote_resource_requests
+        seen.append((request.url.host, request.headers.get("Authorization")))
+        if request.url.path == "/.well-known/jmap":
+            return httpx.Response(307, headers={"Location": "https://other.example.test/session"})
+        if request.url.host == "other.example.test" and request.url.path == "/session":
+            return httpx.Response(
+                200,
+                json={
+                    "primaryAccounts": {MAIL: "account"},
+                    "apiUrl": "https://api.example.test/api",
+                    "uploadUrl": "https://api.example.test/upload",
+                    "capabilities": {},
+                },
+            )
+        if request.url.host == "api.example.test" and request.url.path == "/resource":
+            return httpx.Response(307, headers={"Location": "https://other.example.test/resource"})
+        if request.url.host == "other.example.test" and request.url.path == "/resource":
+            remote_resource_requests += 1
+            return httpx.Response(401 if remote_resource_requests == 1 else 200)
+        return httpx.Response(401)
+
+    provider = Provider()
+    endpoint = Endpoint("jmap", url="https://api.example.test")
+    endpoint.token_provider = provider
+    client = JmapClient(endpoint)
+    client.http.close()
+    client.http = httpx.Client(
+        transport=httpx.MockTransport(handler),
+        auth=OAuthBearerAuth(provider),
+        follow_redirects=True,
+    )
+    try:
+        client.connect()
+        response = client.http.get("https://api.example.test/resource")
+        assert response.status_code == 200
+    finally:
+        client.close()
+    remote_auth = [auth for host, auth in seen if host == "other.example.test"]
+    assert remote_auth
+    assert all(auth is None for auth in remote_auth)
+    assert provider.refreshes == 1
+
+
 @pytest.mark.parametrize(
     "capability,mechanism", [("AUTH=OAUTHBEARER", "OAUTHBEARER"), ("AUTH=XOAUTH2", "XOAUTH2")]
 )
@@ -572,7 +795,7 @@ def test_reauth_pauses_mail_task_and_clone_preserves_account_reference(tmp_path)
 
 def test_manager_does_not_auto_resume_paused_reauth_job(tmp_path):
     _settings, store, secretbox = _store(tmp_path)
-    account_id = _account(store, secretbox)
+    account_id = _account(store, secretbox, config={**_account_config(), "host": "imap.example.test"})
     config = JobConfig(
         "Paused OAuth",
         {

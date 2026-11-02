@@ -7,7 +7,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from emailsync.accounts import load_accounts, resolve_endpoint
+from emailsync.accounts import check_account_compat, load_accounts, resolve_endpoint
 from emailsync.config import Settings
 from emailsync.dav.pipeline import DavMigration
 from emailsync.jobs.control import RunControl, TaskResult
@@ -74,6 +74,15 @@ class JobManager:
 
     def create_job(self, config: JobConfig) -> int:
         errors = config.validate()
+        accounts = {int(account["id"]): account for account in self.store.list_accounts()}
+        for pair in config.endpoints.values():
+            for endpoint in pair.values():
+                if endpoint and endpoint.account_id is not None:
+                    account = accounts.get(int(endpoint.account_id))
+                    if account is None:
+                        errors.append(f"Saved account {endpoint.account_id} no longer exists.")
+                    elif error := check_account_compat(endpoint, account):
+                        errors.append(error)
         if errors:
             raise ValueError(" ".join(errors))
         public, secrets = config.split()

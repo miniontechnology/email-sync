@@ -119,13 +119,17 @@ def register_client(metadata, redirect_uri, insecure_tls=False, transport=None, 
 
 def default_scopes(metadata):
     supported = metadata.get("scopes_supported")
-    if isinstance(supported, list):
-        return [scope for scope in MIGRATION_SCOPES if scope in supported]
-    return list(DEFAULT_SCOPES)
+    supported = supported if isinstance(supported, list) else []
+    scopes = [scope for scope in MIGRATION_SCOPES if scope in supported]
+    if not scopes:
+        scopes = [scope for scope in DEFAULT_SCOPES if scope in supported]
+    if not scopes:
+        raise PermanentError("The server lists no usable scopes; enter scopes on the account.")
+    return scopes
 
 
 def _oauth_post(url, data, config, client_secret, *, insecure_tls=False, refresh=False, transport=None):
-    methods = config.get("token_endpoint_auth_methods_supported") or []
+    methods = config.get("token_endpoint_auth_methods_supported") or ["client_secret_basic"]
     auth = None
     if client_secret and "client_secret_basic" in methods:
         auth = (config["client_id"], client_secret)
@@ -227,6 +231,7 @@ class OAuthService:
                 scopes=scopes,
             )
             config["client_id"] = registration["client_id"]
+            config["client_registered"] = True
             if registration.get("client_secret"):
                 secret["client_secret"] = registration["client_secret"]
             changed = True
@@ -303,6 +308,8 @@ class OAuthService:
         secret["access_token"] = result["access_token"]
         if result.get("refresh_token"):
             secret["refresh_token"] = result["refresh_token"]
+        else:
+            secret.pop("refresh_token", None)
         secret["expires_at"] = time.time() + int(result.get("expires_in", 3600))
         if not config.get("username"):
             config["username"] = _id_token_email(result.get("id_token", ""))

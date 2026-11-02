@@ -2,6 +2,7 @@
 
 import re
 import shutil
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -378,7 +379,12 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             "has_password": bool(secrets.get("password")),
             "has_token": bool(secrets.get("token")),
             "has_client_secret": bool(secrets.get("client_secret")),
-            "signed_in": bool(secrets.get("access_token") and secrets.get("refresh_token")),
+            "signed_in": bool(
+                secrets.get("refresh_token")
+                or (secrets.get("access_token") and float(secrets.get("expires_at", 0)) > time.time())
+            ),
+            "has_refresh_token": bool(secrets.get("refresh_token")),
+            "no_refresh_minutes": max(1, int((float(secrets.get("expires_at", 0)) - time.time()) / 60)),
         }
 
     @app.get("/accounts", response_class=HTMLResponse)
@@ -394,7 +400,14 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
                     "username": account["config"].get("username", ""),
                     "url": account["config"].get("url", ""),
                     "auth_method": account["config"].get("auth_method", "password"),
-                    "signed_in": bool(secrets.get("access_token") and secrets.get("refresh_token")),
+                    "signed_in": bool(
+                        secrets.get("refresh_token")
+                        or (secrets.get("access_token") and float(secrets.get("expires_at", 0)) > time.time())
+                    ),
+                    "has_refresh_token": bool(secrets.get("refresh_token")),
+                    "no_refresh_minutes": max(
+                        1, int((float(secrets.get("expires_at", 0)) - time.time()) / 60)
+                    ),
                 }
             )
         return templates.TemplateResponse(
@@ -426,8 +439,31 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             raise ValueError("Account name is required.")
         if config["auth_method"] not in ("password", "token", "oauth"):
             raise ValueError("Unsupported authentication method.")
+        if config["auth_method"] == "token" and config["type"] == "imap":
+            raise ValueError("IMAP accounts cannot use static-token authentication.")
         current = store.get_account(account_id) if account_id else None
         secrets = secretbox.decrypt(current.get("secrets_enc")) if current else {}
+        old_config = current.get("config", {}) if current else {}
+        config["client_registered"] = bool(old_config.get("client_registered"))
+        if config["client_id"] and config["client_id"] != old_config.get("client_id"):
+            config["client_registered"] = False
+        issuer_changed = old_config.get("issuer_url", "") != config["issuer_url"] or (
+            not old_config.get("issuer_url")
+            and not config["issuer_url"]
+            and old_config.get("url", "") != config["url"]
+        )
+        identity_changed = (
+            issuer_changed
+            or old_config.get("client_id", "") != config["client_id"]
+            or old_config.get("scopes", "") != config["scopes"]
+        )
+        if identity_changed:
+            for field in ("access_token", "refresh_token", "expires_at"):
+                secrets.pop(field, None)
+        if issuer_changed and old_config.get("client_registered"):
+            config["client_id"] = ""
+            config["client_registered"] = False
+            secrets.pop("client_secret", None)
         for field in ("password", "token", "client_secret"):
             value = str(form.get(field) or "")
             if value:

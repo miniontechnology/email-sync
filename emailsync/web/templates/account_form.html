@@ -42,7 +42,7 @@
 {% if account %}
   {% if config.get('auth_method') == 'oauth' %}
   <section class="panel">
-    <div class="section-heading"><div><h2>Sign in</h2><p>{% if account.signed_in %}Signed in as {{ config.get('username') or 'user' }}; the token refreshes automatically.{% else %}Not signed in. Register the app with the identity provider, then approve access.{% endif %}</p></div></div>
+    <div class="section-heading"><div><h2>Sign in</h2><p>{% if account.signed_in %}{% if not account.has_refresh_token %}Signed in (no refresh token — you'll need to sign in again when it expires in {{ account.no_refresh_minutes }} min){% else %}Signed in as {{ config.get('username') or 'user' }}; the token refreshes automatically.{% endif %}{% else %}Not signed in. Register the app with the identity provider, then approve access.{% endif %}</p></div></div>
     <a class="button primary" href="/accounts/{{ account.id }}/signin">Sign in with OAuth</a>
     <p class="muted">After approving, your browser may show a page that can’t be reached at <code>127.0.0.1</code> — copy that whole address and paste it here.</p>
     <form method="post" action="/oauth/complete" class="inline-form"><label class="field full"><span>Complete callback URL</span><input name="callback" required placeholder="http://127.0.0.1:8080/oauth/callback?code=…&amp;state=…"></label><button class="button secondary">Complete sign-in</button></form>
