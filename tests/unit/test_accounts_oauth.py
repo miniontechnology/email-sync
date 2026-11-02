@@ -19,6 +19,7 @@ from emailsync.errors import AuthError, PermanentError, ReauthRequired
 from emailsync.jobs.control import RunControl, TaskResult
 from emailsync.jobs.manager import JobManager
 from emailsync.oauth import (
+    DEFAULT_SCOPES,
     OAuthBearerAuth,
     OAuthService,
     TokenManager,
@@ -472,6 +473,7 @@ def test_token_exchange_defaults_to_client_secret_basic():
 
 
 def test_default_scopes_falls_back_and_rejects_empty_intersection():
+    assert default_scopes({}) == list(DEFAULT_SCOPES)
     assert default_scopes({"scopes_supported": ["email", "profile"]}) == ["email", "profile"]
     with pytest.raises(
         PermanentError,
@@ -600,6 +602,43 @@ def test_account_identity_edit_clears_tokens_and_dynamic_registration(tmp_path):
     assert updated["config"]["client_id"] == ""
     assert not updated["config"]["client_registered"]
     assert secretbox.decrypt(updated["secrets_enc"]) == {}
+
+
+def test_account_issuer_edit_keeps_new_manual_client_id(tmp_path):
+    settings, store, secretbox = _store(tmp_path)
+    account_id = _account(
+        store,
+        secretbox,
+        config={
+            "type": "jmap",
+            "url": "https://old.test",
+            "issuer_url": "",
+            "auth_method": "oauth",
+            "client_id": "registered-id",
+            "client_registered": True,
+            "scopes": "openid",
+        },
+        secrets={"refresh_token": "refresh", "client_secret": "old-secret"},
+    )
+    with TestClient(create_app(settings, store)) as client:
+        client.post(
+            f"/accounts/{account_id}",
+            data={
+                "name": "Saved",
+                "type": "jmap",
+                "url": "https://old.test",
+                "issuer_url": "https://idp.test",
+                "auth_method": "oauth",
+                "client_id": "manual-id",
+                "client_secret": "manual-secret",
+                "scopes": "openid",
+            },
+            follow_redirects=False,
+        )
+    updated = store.get_account(account_id)
+    assert updated["config"]["client_id"] == "manual-id"
+    assert not updated["config"]["client_registered"]
+    assert secretbox.decrypt(updated["secrets_enc"]) == {"client_secret": "manual-secret"}
 
 
 def test_unexpired_access_token_without_refresh_is_shown_as_signed_in(tmp_path):

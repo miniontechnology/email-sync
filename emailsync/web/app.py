@@ -4,7 +4,7 @@ import re
 import shutil
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -441,39 +441,44 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             raise ValueError("Unsupported authentication method.")
         if config["auth_method"] == "token" and config["type"] == "imap":
             raise ValueError("IMAP accounts cannot use static-token authentication.")
-        current = store.get_account(account_id) if account_id else None
-        secrets = secretbox.decrypt(current.get("secrets_enc")) if current else {}
-        old_config = current.get("config", {}) if current else {}
-        config["client_registered"] = bool(old_config.get("client_registered"))
-        if config["client_id"] and config["client_id"] != old_config.get("client_id"):
-            config["client_registered"] = False
-        issuer_changed = old_config.get("issuer_url", "") != config["issuer_url"] or (
-            not old_config.get("issuer_url")
-            and not config["issuer_url"]
-            and old_config.get("url", "") != config["url"]
-        )
-        identity_changed = (
-            issuer_changed
-            or old_config.get("client_id", "") != config["client_id"]
-            or old_config.get("scopes", "") != config["scopes"]
-        )
-        if identity_changed:
-            for field in ("access_token", "refresh_token", "expires_at"):
-                secrets.pop(field, None)
-        if issuer_changed and old_config.get("client_registered"):
-            config["client_id"] = ""
-            config["client_registered"] = False
-            secrets.pop("client_secret", None)
-        for field in ("password", "token", "client_secret"):
-            value = str(form.get(field) or "")
-            if value:
-                secrets[field] = value
-        encrypted = secretbox.encrypt(secrets) if secrets else None
-        if current:
-            store.update_account_config(account_id, name, config)
-            store.update_account_secrets(account_id, encrypted)
-            return account_id
-        return store.create_account(name, config, encrypted)
+        with token_manager.account_lock(account_id) if account_id else nullcontext():
+            current = store.get_account(account_id) if account_id else None
+            secrets = secretbox.decrypt(current.get("secrets_enc")) if current else {}
+            old_config = current.get("config", {}) if current else {}
+            config["client_registered"] = bool(old_config.get("client_registered"))
+            if config["client_id"] and config["client_id"] != old_config.get("client_id"):
+                config["client_registered"] = False
+            issuer_changed = old_config.get("issuer_url", "") != config["issuer_url"] or (
+                not old_config.get("issuer_url")
+                and not config["issuer_url"]
+                and old_config.get("url", "") != config["url"]
+            )
+            identity_changed = (
+                issuer_changed
+                or old_config.get("client_id", "") != config["client_id"]
+                or old_config.get("scopes", "") != config["scopes"]
+            )
+            if identity_changed:
+                for field in ("access_token", "refresh_token", "expires_at"):
+                    secrets.pop(field, None)
+            if (
+                issuer_changed
+                and old_config.get("client_registered")
+                and config["client_id"] == old_config.get("client_id")
+            ):
+                config["client_id"] = ""
+                config["client_registered"] = False
+                secrets.pop("client_secret", None)
+            for field in ("password", "token", "client_secret"):
+                value = str(form.get(field) or "")
+                if value:
+                    secrets[field] = value
+            encrypted = secretbox.encrypt(secrets) if secrets else None
+            if current:
+                store.update_account_config(account_id, name, config)
+                store.update_account_secrets(account_id, encrypted)
+                return account_id
+            return store.create_account(name, config, encrypted)
 
     @app.post("/accounts")
     async def create_account(request: Request):

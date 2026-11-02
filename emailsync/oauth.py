@@ -119,7 +119,8 @@ def register_client(metadata, redirect_uri, insecure_tls=False, transport=None, 
 
 def default_scopes(metadata):
     supported = metadata.get("scopes_supported")
-    supported = supported if isinstance(supported, list) else []
+    if not isinstance(supported, list):
+        return list(DEFAULT_SCOPES)
     scopes = [scope for scope in MIGRATION_SCOPES if scope in supported]
     if not scopes:
         scopes = [scope for scope in DEFAULT_SCOPES if scope in supported]
@@ -333,15 +334,17 @@ class TokenManager:
                 self._locks[account_id] = threading.Lock()
             return self._providers[account_id]
 
+    def account_lock(self, account_id):
+        with self._lock:
+            return self._locks.setdefault(account_id, threading.Lock())
+
     def _token(self, account_id, force_refresh=False, rejected_token=None):
         previous_access = None
         if force_refresh and rejected_token is None:
             current = self.store.get_account(account_id)
             if current:
                 previous_access = self.secretbox.decrypt(current.get("secrets_enc")).get("access_token")
-        with self._lock:
-            lock = self._locks.setdefault(account_id, threading.Lock())
-        with lock:
+        with self.account_lock(account_id):
             account = self.store.get_account(account_id)
             if not account:
                 raise ReauthRequired(f"account {account_id}")
