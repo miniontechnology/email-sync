@@ -78,6 +78,7 @@ def test_google_account_save_normalizes_preset_and_requires_client_credentials(t
                 "url": "https://ignored.example.test",
                 "host": "ignored.example.test",
                 "port": "993",
+                "insecure_tls": "on",
                 "auth_method": "token",
                 "issuer_url": "https://ignored.example.test",
                 "client_id": "desktop-client",
@@ -130,7 +131,7 @@ def test_google_oauth_discovery_pkce_authorization_and_completion(tmp_path):
     account_id = _google_account(
         store,
         secretbox,
-        config=_google_config(scopes=""),
+        config=_google_config(scopes="", username="old-user@example.com"),
         secrets={"client_secret": "desktop-secret"},
     )
     seen = []

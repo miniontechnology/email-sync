@@ -317,8 +317,9 @@ class OAuthService:
         else:
             secret.pop("refresh_token", None)
         secret["expires_at"] = time.time() + int(result.get("expires_in", 3600))
-        if not config.get("username"):
-            config["username"] = _id_token_email(result.get("id_token", ""))
+        id_token_email = _id_token_email(result.get("id_token", ""))
+        if id_token_email and (not config.get("username") or config.get("type") in PROVIDER_PRESETS):
+            config["username"] = id_token_email
         self._save(account)
         return account
 
