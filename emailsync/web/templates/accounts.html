@@ -10,6 +10,7 @@
   <a class="job-card" href="/accounts/{{ account.id }}">
     <div class="job-card-main"><div class="job-title-row"><h2>{{ account.name }}</h2><span class="badge badge-{{ 'completed' if account.signed_in else 'queued' }}">{{ 'Signed in' if account.signed_in else account.auth_method }}</span></div>
       <p class="muted">{{ account.type|upper }} · {{ account.username or account.url }}</p>
+      {% if account.signed_in and account.auth_method == 'oauth' and not account.has_refresh_token %}<p class="muted">Signed in (no refresh token — you'll need to sign in again when it expires in {{ account.no_refresh_minutes }} min)</p>{% endif %}
     </div><div class="job-card-side"><span class="arrow">→</span></div>
   </a>
 {% else %}
