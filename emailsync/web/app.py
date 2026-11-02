@@ -448,6 +448,7 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
                     "port": 0,
                     "scopes": config["scopes"] or preset["scopes"],
                     "client_registered": False,
+                    "insecure_tls": False,
                 }
             )
         if not name:
