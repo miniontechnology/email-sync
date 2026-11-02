@@ -12,7 +12,7 @@
     <div class="options-grid">
       <label class="field"><span>Account name</span><input name="name" required value="{{ account.name if account else '' }}"></label>
       <label class="field"><span>Connection type</span><select name="type">
-        {% for value, label in [('jmap','JMAP'),('imap','IMAP'),('carddav','CardDAV'),('caldav','CalDAV')] %}
+        {% for value, label in [('jmap','JMAP'),('imap','IMAP'),('carddav','CardDAV'),('caldav','CalDAV'),('google','Google')] %}
         <option value="{{ value }}" {% if config.get('type','jmap') == value %}selected{% endif %}>{{ label }}</option>
         {% endfor %}
       </select></label>
@@ -35,6 +35,7 @@
       <label class="field"><span>New OAuth client secret</span><input type="password" name="client_secret" autocomplete="new-password" placeholder="{{ 'Secret saved; leave blank to keep it' if account and account.has_client_secret else 'Leave blank for public clients' }}"></label>
       <label class="field full"><span>OAuth scopes (space separated; blank uses supported migration scopes)</span><input name="scopes" value="{{ config.get('scopes','') }}"></label>
     </div>
+    <p class="muted">Google: enter the client ID and secret of your Google Cloud Desktop OAuth client, save, then sign in. Server, host and authentication fields are ignored.</p>
     <label class="check-field"><input type="checkbox" name="insecure_tls" {% if config.get('insecure_tls') %}checked{% endif %}><span>Allow self-signed TLS certificates</span></label>
     <div class="form-actions"><a class="button secondary" href="/accounts">Cancel</a><button class="button primary" type="submit">Save account</button></div>
   </section>

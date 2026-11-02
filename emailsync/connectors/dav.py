@@ -72,7 +72,9 @@ class DavClient:
         base = endpoint.url.strip()
         if not base.startswith(("http://", "https://")):
             base = "https://" + base
-        self.base = _safe_url(base.rstrip("/") + "/")
+        path = urlsplit(base).path
+        normalized = base.rstrip("/") if path.startswith("/.well-known/") else base.rstrip("/") + "/"
+        self.base = _safe_url(normalized)
         if endpoint.token_provider is not None:
             self.auth = OAuthBearerAuth(endpoint.token_provider)
         elif endpoint.token:
@@ -209,7 +211,8 @@ class DavClient:
         except PermanentError:
             current = ET.Element("empty")
         if self._collection_type(current):
-            return self.base, [self._collection(self.base, current)]
+            collection_url = _safe_url(str(first.url)) if responses else self.base
+            return collection_url, [self._collection(collection_url, current)]
         home = self._home(self.base, current)
         principal = self._principal(self.base, current)
         if not home and principal:

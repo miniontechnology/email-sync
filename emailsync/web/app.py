@@ -27,6 +27,7 @@ from emailsync.mail.folders import parse_folder_map
 from emailsync.mail.source import make_source
 from emailsync.oauth import OAuthService, TokenManager
 from emailsync.options import Endpoint, JobConfig, Options
+from emailsync.providers import GOOGLE_CLIENT_REQUIRED, PROVIDER_PRESETS
 
 PACKAGE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(PACKAGE_DIR / "templates"))
@@ -422,8 +423,10 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
 
     def _save_account(form, account_id=None):
         name = str(form.get("name") or "").strip()
+        account_type = str(form.get("type") or "jmap")
+        preset = PROVIDER_PRESETS.get(account_type)
         config = {
-            "type": str(form.get("type") or "jmap"),
+            "type": account_type,
             "url": str(form.get("url") or "").strip(),
             "host": str(form.get("host") or "").strip(),
             "port": int(form.get("port") or 0),
@@ -435,6 +438,18 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             "client_id": str(form.get("client_id") or "").strip(),
             "scopes": str(form.get("scopes") or "").strip(),
         }
+        if preset:
+            config.update(
+                {
+                    "auth_method": "oauth",
+                    "issuer_url": preset["issuer_url"],
+                    "url": "",
+                    "host": "",
+                    "port": 0,
+                    "scopes": config["scopes"] or preset["scopes"],
+                    "client_registered": False,
+                }
+            )
         if not name:
             raise ValueError("Account name is required.")
         if config["auth_method"] not in ("password", "token", "oauth"):
@@ -445,7 +460,7 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             current = store.get_account(account_id) if account_id else None
             secrets = secretbox.decrypt(current.get("secrets_enc")) if current else {}
             old_config = current.get("config", {}) if current else {}
-            config["client_registered"] = bool(old_config.get("client_registered"))
+            config["client_registered"] = False if preset else bool(old_config.get("client_registered"))
             if config["client_id"] and config["client_id"] != old_config.get("client_id"):
                 config["client_registered"] = False
             issuer_changed = old_config.get("issuer_url", "") != config["issuer_url"] or (
@@ -465,6 +480,7 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
                 issuer_changed
                 and old_config.get("client_registered")
                 and config["client_id"] == old_config.get("client_id")
+                and not preset
             ):
                 config["client_id"] = ""
                 config["client_registered"] = False
@@ -473,6 +489,8 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
                 value = str(form.get(field) or "")
                 if value:
                     secrets[field] = value
+            if preset and (not config["client_id"] or not secrets.get("client_secret")):
+                raise ValueError(GOOGLE_CLIENT_REQUIRED)
             encrypted = secretbox.encrypt(secrets) if secrets else None
             if current:
                 store.update_account_config(account_id, name, config)
