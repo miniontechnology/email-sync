@@ -114,6 +114,15 @@ header fingerprint otherwise. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) f
 limitations. JMAP calendar destinations match existing events by UID only and do not use event
 fingerprints.
 
+## Updating copied mail state
+
+Repeat syncs update flags and labels on already-copied messages by default, without downloading or
+uploading message bodies. Only source-side flag changes are applied; destination-only flag edits
+are preserved unless that same flag changed at the source. Removed labels are left in place by
+default. Enable **Also remove from folders whose label was removed** to remove stale destination
+copies; the last copy is always protected, and IMAP removal requires UIDPLUS support on the
+destination server.
+
 ## Configuration
 
 | Variable | Default | Description |

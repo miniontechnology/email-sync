@@ -16,8 +16,8 @@ Roughly in priority order; open an issue/PR to reprioritise.
 ## Sync behaviour
 - **Two-way sync.**
 - **Propagating deletions** (source → destination), with a safety threshold.
-- Propagating flag / label changes on messages that were already copied (currently only new messages
-  are picked up by repeat syncs).
+- Generic IMAP sources: a message moved to another source folder is copied again into the new
+  destination folder; the old destination copy remains.
 - Updating contacts/events that changed on the source after they were copied (currently "skip existing").
 - CONDSTORE/QRESYNC-based change detection to make large incremental syncs cheaper.
 

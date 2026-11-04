@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from emailsync.connectors.imap import ImapConnection
 from emailsync.errors import PermanentError
 from emailsync.mail.fingerprint import summary_from_headers
-from emailsync.mail.folders import Folder, gmail_targets, map_source_folder
+from emailsync.mail.folders import Folder, gmail_real_targets, map_source_folder
 from emailsync.options import Endpoint, Options
 
 
@@ -27,10 +27,18 @@ class MessageMeta:
     size: int = 0
     subject: str = ""
     extra: dict = field(default_factory=dict)
+    archived: bool = False
 
     @property
     def deleted(self) -> bool:
         return any(f.lower() == "\\deleted" for f in self.flags)
+
+
+@dataclass
+class SourceState:
+    flags: tuple
+    targets: list[str]
+    archived: bool = False
 
 
 class ImapSource:
@@ -91,8 +99,12 @@ class ImapSource:
         for uid, data in raw.items():
             summary = summary_from_headers(data["header"])
             flags = data["flags"]
+            archived = False
             if scope.gmail_labels:
-                targets, starred = gmail_targets(data["labels"], self.options)
+                targets, starred = gmail_real_targets(data["labels"], self.options)
+                archived = not targets and bool(self.options.archive_target)
+                if archived:
+                    targets = [self.options.archive_target]
                 if starred and not any(f.lower() == "\\flagged" for f in flags):
                     flags = (*flags, "\\Flagged")
             else:
@@ -106,7 +118,26 @@ class ImapSource:
                 size=data["size"],
                 subject=summary["subject"],
                 extra={"labels": data["labels"]},
+                archived=archived,
             )
+        return out
+
+    def fetch_state(self, scope: Scope, uids: list[int]) -> dict[int, SourceState]:
+        self.ensure_scope(scope)
+        raw = self.conn.fetch_state(uids, gmail=scope.gmail_labels)
+        out = {}
+        for uid, data in raw.items():
+            flags = data["flags"]
+            archived = False
+            if scope.gmail_labels:
+                real_targets, starred = gmail_real_targets(data["labels"], self.options)
+                archived = not real_targets and bool(self.options.archive_target)
+                targets = [self.options.archive_target] if archived else real_targets
+                if starred and not any(flag.lower() == "\\flagged" for flag in flags):
+                    flags = (*flags, "\\Flagged")
+            else:
+                targets = [scope.target] if scope.target else []
+            out[uid] = SourceState(tuple(flags), targets, archived)
         return out
 
     def fetch_bodies(self, scope: Scope, uids: list[int]) -> dict[int, bytes]:

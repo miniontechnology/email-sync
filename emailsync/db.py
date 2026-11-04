@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     copied INTEGER NOT NULL DEFAULT 0,
     skipped INTEGER NOT NULL DEFAULT 0,
     failed INTEGER NOT NULL DEFAULT 0,
+    updated INTEGER NOT NULL DEFAULT 0,
     bytes INTEGER NOT NULL DEFAULT 0,
     message TEXT,
     started_at REAL,
@@ -53,6 +54,7 @@ CREATE TABLE IF NOT EXISTS scopes (
     copied INTEGER NOT NULL DEFAULT 0,
     skipped INTEGER NOT NULL DEFAULT 0,
     failed INTEGER NOT NULL DEFAULT 0,
+    updated INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
     PRIMARY KEY (job_id, kind, name)
 );
@@ -108,7 +110,12 @@ class Store:
         self._write_lock = threading.RLock()
         with self._write_lock:
             # executescript manages its own transaction, so it must not run inside write().
-            self.conn().executescript(SCHEMA)
+            conn = self.conn()
+            conn.executescript(SCHEMA)
+            for table in ("tasks", "scopes"):
+                columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+                if "updated" not in columns:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN updated INTEGER NOT NULL DEFAULT 0")
 
     # -- connections -------------------------------------------------------------------------
     def conn(self) -> sqlite3.Connection:
@@ -257,7 +264,7 @@ class Store:
             conn.execute(
                 "INSERT INTO tasks(job_id, kind, status, started_at) VALUES (?,?,?,?)"
                 " ON CONFLICT(job_id, kind) DO UPDATE SET status=excluded.status, total=0, already=0,"
-                " copied=0, skipped=0, failed=0, bytes=0, message=NULL, started_at=excluded.started_at,"
+                " copied=0, skipped=0, failed=0, updated=0, bytes=0, message=NULL, started_at=excluded.started_at,"
                 " finished_at=NULL",
                 (job_id, kind, status, now),
             )
@@ -279,10 +286,11 @@ class Store:
         with self.write() as conn:
             for name, s in scopes.items():
                 conn.execute(
-                    "INSERT INTO scopes(job_id, kind, name, total, already, copied, skipped, failed, status)"
-                    " VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id, kind, name) DO UPDATE SET"
+                    "INSERT INTO scopes(job_id, kind, name, total, already, copied, skipped, failed, updated, status)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id, kind, name) DO UPDATE SET"
                     " total=excluded.total, already=excluded.already, copied=excluded.copied,"
-                    " skipped=excluded.skipped, failed=excluded.failed, status=excluded.status",
+                    " skipped=excluded.skipped, failed=excluded.failed, updated=excluded.updated,"
+                    " status=excluded.status",
                     (
                         job_id,
                         kind,
@@ -292,6 +300,7 @@ class Store:
                         s.get("copied", 0),
                         s.get("skipped", 0),
                         s.get("failed", 0),
+                        s.get("updated", 0),
                         s.get("status", "pending"),
                     ),
                 )

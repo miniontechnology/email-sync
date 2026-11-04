@@ -9,12 +9,16 @@ from imapclient import IMAPClient
 from emailsync import db
 from emailsync.connectors.dav import DavClient
 from emailsync.connectors.imap import ssl_context
+from emailsync.connectors.jmap import MAIL, JmapClient, keywords_to_flags
 from emailsync.dav.jmap_dest import JmapDavDestination
 from emailsync.dav.pipeline import DavMigration
 from emailsync.dav.vobjects import ensure_vcard_uid
 from emailsync.jobs.control import RunControl
 from emailsync.mail.dest import make_dest
+from emailsync.mail.fingerprint import key_from_jmap, summary_from_headers
+from emailsync.mail.index import DestIndex
 from emailsync.mail.pipeline import MailMigration
+from emailsync.mail.state import StateChange
 from emailsync.options import Endpoint, JobConfig, Options
 
 pytestmark = pytest.mark.integration
@@ -128,6 +132,15 @@ def _destination_imap():
     )
 
 
+def _destination_jmap():
+    return Endpoint(
+        "jmap",
+        url="http://127.0.0.1:18080",
+        username=STALWART_USER,
+        password=STALWART_PASSWORD,
+    )
+
+
 def _assert_destination_count(folder, count):
     conn = _imap(_destination_imap())
     try:
@@ -190,6 +203,104 @@ def test_greenmail_to_stalwart_jmap_and_resume_after_pause(tmp_path):
     assert rerun.status == "completed"
     assert store.get_tasks(job_id)[0]["copied"] == 0
     assert store.get_job(job_id) is not None
+
+
+@pytest.mark.parametrize("destination_kind", ["imap", "jmap"])
+def test_repeat_mail_sync_reconciles_source_flags_without_duplicate_messages(tmp_path, destination_kind):
+    _clear_stalwart()
+    raw_messages = [_raw(f"state-{uuid4()}-{i}", f"state-{i}") for i in range(2)]
+    expected_keys = [summary_from_headers(raw)["key"] for raw in raw_messages]
+    source = _seed_greenmail([("INBOX", raw) for raw in raw_messages])
+    source_conn = _imap(source)
+    try:
+        source_conn.select_folder("INBOX", readonly=False)
+        source_uids = sorted(source_conn.search(["ALL"]))
+        source_conn.add_flags([source_uids[1]], ["\\Seen"], silent=True)
+    finally:
+        source_conn.logout()
+
+    destination = _destination_imap() if destination_kind == "imap" else _destination_jmap()
+    config = _mail_config(source, destination)
+    result, store, job_id = _run_mail(tmp_path, source, destination, config=config)
+    assert result.status == "completed", result.error
+
+    source_conn = _imap(source)
+    try:
+        source_conn.select_folder("INBOX", readonly=False)
+        source_conn.add_flags([source_uids[0]], ["\\Seen", "\\Flagged"], silent=True)
+        source_conn.remove_flags([source_uids[1]], ["\\Seen"], silent=True)
+    finally:
+        source_conn.logout()
+
+    result, _store, _job_id = _run_mail(
+        tmp_path, source, destination, config=config, store=store, job_id=job_id
+    )
+    assert result.status == "completed", result.error
+    assert store.get_tasks(job_id)[0]["updated"] == 2
+    assert store.get_tasks(job_id)[0]["copied"] == 0
+
+    if destination_kind == "imap":
+        dest_conn = _imap(destination)
+        try:
+            dest_conn.select_folder("INBOX", readonly=True)
+            dest_uids = sorted(dest_conn.search(["ALL"]))
+            flags = dest_conn.fetch(dest_uids, [b"FLAGS"])
+            assert len(dest_uids) == 2
+            assert {flag.lower() for flag in flags[dest_uids[0]][b"FLAGS"]} >= {
+                b"\\seen",
+                b"\\flagged",
+            }
+            assert b"\\seen" not in {flag.lower() for flag in flags[dest_uids[1]][b"FLAGS"]}
+        finally:
+            dest_conn.logout()
+    else:
+        client = JmapClient(destination)
+        try:
+            client.connect(MAIL)
+            emails = list(client.iter_email_index())
+            assert len(emails) == 2
+            states = {key_from_jmap(email): keywords_to_flags(email.get("keywords", {})) for email in emails}
+            assert states[expected_keys[0]] >= frozenset({"\\seen", "\\flagged"})
+            assert "\\seen" not in states[expected_keys[1]]
+        finally:
+            client.close()
+
+
+@pytest.mark.parametrize("destination_kind", ["imap", "jmap"])
+def test_stalwart_dest_apply_state_moves_only_copy_and_preserves_flags(destination_kind):
+    _clear_stalwart()
+    endpoint = _destination_imap() if destination_kind == "imap" else _destination_jmap()
+    destination = make_dest(endpoint, Options(sync_flags_labels=True))
+    raw = _raw(f"move-{destination_kind}-{uuid4()}", "move")
+    key = summary_from_headers(raw)["key"]
+    try:
+        destination.connect()
+        inbox, _ = destination.resolve("INBOX", create=False)
+        work, _ = destination.resolve("Work", create=True)
+        destination.upload(raw, [inbox], ["\\Seen"], datetime.now(UTC), key, DestIndex())
+        before = DestIndex()
+        if destination_kind == "imap":
+            destination.index_folder(inbox, before)
+        else:
+            destination.index_all(before)
+        copies = before.copies(key)
+        assert len(copies) == 1
+        change = StateChange(key, copies, [], [work], [inbox])
+        errors = destination.apply_state([change], retry=lambda operation: operation())
+        assert errors == {}
+
+        after = DestIndex()
+        if destination_kind == "imap":
+            destination.index_folder(inbox, after)
+            destination.index_folder(work, after)
+        else:
+            destination.index_all(after)
+        copies = after.copies(key)
+        assert len(copies) == 1
+        assert copies[0].folders == frozenset({work})
+        assert "\\seen" in copies[0].flags
+    finally:
+        destination.close()
 
 
 def test_preseeded_destination_only_receives_missing_messages(tmp_path):

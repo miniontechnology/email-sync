@@ -93,6 +93,8 @@
       <label class="check-field"><input type="checkbox" name="skip_deleted" {% if not values or values.get('skip_deleted') %}checked{% endif %}><span>Skip deleted mail</span></label>
       <label class="check-field"><input type="checkbox" name="dry_run" {% if values.get('dry_run') %}checked{% endif %}><span>Dry run</span></label>
       <label class="check-field"><input type="checkbox" name="verify" {% if not values or values.get('verify') %}checked{% endif %}><span>Verify copied mail</span></label>
+      <label class="check-field"><input type="checkbox" name="sync_flags_labels" {% if not values or values.get('sync_flags_labels') %}checked{% endif %}><span>Update flags and labels on copied mail</span></label>
+      <label class="check-field"><input type="checkbox" name="remove_stale_labels" {% if values.get('remove_stale_labels') %}checked{% endif %}><span>Also remove from folders whose label was removed</span></label>
     </div>
   </section>
   <div class="form-actions"><a class="button secondary" href="/">Cancel</a><button class="button primary" type="submit">Create migration</button></div>

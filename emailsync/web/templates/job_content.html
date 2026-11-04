@@ -8,6 +8,7 @@
     <div class="stats">
       <div><strong>{{ task.total }}</strong><span>Total</span></div><div><strong>{{ task.already }}</strong><span>Already</span></div>
       <div><strong>{{ task.copied }}</strong><span>Copied</span></div><div><strong>{{ task.skipped }}</strong><span>Skipped</span></div>
+      <div><strong>{{ task.updated }}</strong><span>Updated</span></div>
       <div><strong>{{ task.failed }}</strong><span>Failed</span></div>{% if task.bytes %}<div><strong>{{ task.rate }} KB/s</strong><span>Average rate</span></div>{% endif %}
     </div>
   </section>
@@ -16,8 +17,8 @@
 {% if scopes %}
 <section class="panel table-panel">
   <div class="section-heading"><div><h2>Folders and collections</h2><p>Progress by source scope.</p></div></div>
-  <div class="table-wrap"><table><thead><tr><th>Scope</th><th>Status</th><th>Total</th><th>Already</th><th>Copied</th><th>Skipped</th><th>Failed</th></tr></thead><tbody>
-  {% for scope in scopes %}<tr><td class="scope-name">{{ scope.name }}</td><td><span class="badge badge-{{ scope.status }}">{{ scope.status }}</span></td><td>{{ scope.total }}</td><td>{{ scope.already }}</td><td>{{ scope.copied }}</td><td>{{ scope.skipped }}</td><td>{{ scope.failed }}</td></tr>{% endfor %}
+  <div class="table-wrap"><table><thead><tr><th>Scope</th><th>Status</th><th>Total</th><th>Already</th><th>Copied</th><th>Skipped</th><th>Updated</th><th>Failed</th></tr></thead><tbody>
+  {% for scope in scopes %}<tr><td class="scope-name">{{ scope.name }}</td><td><span class="badge badge-{{ scope.status }}">{{ scope.status }}</span></td><td>{{ scope.total }}</td><td>{{ scope.already }}</td><td>{{ scope.copied }}</td><td>{{ scope.skipped }}</td><td>{{ scope.updated }}</td><td>{{ scope.failed }}</td></tr>{% endfor %}
   </tbody></table></div>
 </section>
 {% endif %}

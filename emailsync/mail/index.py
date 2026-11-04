@@ -8,13 +8,15 @@ message that is already there, whether we or another tool put it there.
 import threading
 from collections import Counter, defaultdict
 
+from emailsync.mail.state import DestCopy, normalize_flags
+
 
 class DestIndex:
     def __init__(self, scope: str = "folder"):
         self.scope = scope
         self._counts: dict[str, Counter] = defaultdict(Counter)
         self._global: Counter = Counter()
-        self._refs: dict[str, list[tuple[str, frozenset]]] = defaultdict(list)
+        self._refs: dict[str, list[DestCopy]] = defaultdict(list)
         self._indexed: set[str] = set()
         self._lock = threading.Lock()
 
@@ -29,14 +31,18 @@ class DestIndex:
             self._counts[folder][key] += 1
             self._global[key] += 1
 
-    def add_ref(self, key: str, ref: str, folders) -> None:
+    def add_ref(self, key: str, ref: str, folders, flags=()) -> None:
         """Remember a destination object (e.g. JMAP email id) and the folders it is in."""
         with self._lock:
-            self._refs[key].append((ref, frozenset(folders)))
+            self._refs[key].append(DestCopy(ref, frozenset(folders), normalize_flags(flags)))
 
     def ref_for(self, key: str) -> tuple[str, frozenset] | None:
-        refs = self._refs.get(key)
-        return refs[0] if refs else None
+        copies = self.copies(key)
+        return (copies[0].ref, copies[0].folders) if copies else None
+
+    def copies(self, key: str) -> list[DestCopy]:
+        with self._lock:
+            return list(self._refs.get(key, ()))
 
     def count(self, folder: str, key: str) -> int:
         return self._counts[folder][key]
