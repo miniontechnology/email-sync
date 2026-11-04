@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 import httpx
 
 from emailsync.errors import AuthError, PermanentError, ReauthRequired, TransientError
+from emailsync.providers import GOOGLE_CLIENT_REQUIRED, PROVIDER_PRESETS
 
 DEFAULT_SCOPES = ("openid", "offline_access", "email", "profile")
 MIGRATION_SCOPES = (
@@ -133,7 +134,7 @@ def _oauth_post(url, data, config, client_secret, *, insecure_tls=False, refresh
     methods = config.get("token_endpoint_auth_methods_supported") or ["client_secret_basic"]
     auth = None
     if client_secret and "client_secret_basic" in methods:
-        auth = (config["client_id"], client_secret)
+        auth = (data.get("client_id") or config.get("client_id", ""), client_secret)
         data = {key: value for key, value in data.items() if key not in ("client_id", "client_secret")}
     elif client_secret and "client_secret_post" in methods:
         data = {**data, "client_secret": client_secret}
@@ -210,6 +211,9 @@ class OAuthService:
         config, secret = account["config"], account["secrets"]
         if config.get("auth_method") != "oauth":
             raise PermanentError("Select OAuth as the account authentication method first.")
+        preset = PROVIDER_PRESETS.get(config.get("type"))
+        if preset and not config.get("client_id"):
+            raise PermanentError(GOOGLE_CLIENT_REQUIRED)
         issuer_url = config.get("issuer_url") or config.get("url") or ""
         metadata = discover(
             issuer_url,
@@ -220,7 +224,7 @@ class OAuthService:
         scopes = str(config.get("scopes") or "").split()
         changed = False
         if not scopes:
-            scopes = default_scopes(metadata)
+            scopes = preset["scopes"].split() if preset else default_scopes(metadata)
             config["scopes"] = " ".join(scopes)
             changed = True
         if not config.get("client_id"):
@@ -252,17 +256,18 @@ class OAuthService:
                 "scopes": scopes,
                 "redirect_uri": self.redirect_uri,
             }
-        query = urlencode(
-            {
-                "response_type": "code",
-                "client_id": config["client_id"],
-                "redirect_uri": self.redirect_uri,
-                "scope": " ".join(scopes),
-                "state": state,
-                "code_challenge": challenge,
-                "code_challenge_method": "S256",
-            }
-        )
+        query_params = {
+            "response_type": "code",
+            "client_id": config["client_id"],
+            "redirect_uri": self.redirect_uri,
+            "scope": " ".join(scopes),
+            "state": state,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }
+        if preset:
+            query_params.update(preset["auth_params"])
+        query = urlencode(query_params)
         return (
             metadata["authorization_endpoint"]
             + ("&" if "?" in metadata["authorization_endpoint"] else "?")
@@ -312,8 +317,9 @@ class OAuthService:
         else:
             secret.pop("refresh_token", None)
         secret["expires_at"] = time.time() + int(result.get("expires_in", 3600))
-        if not config.get("username"):
-            config["username"] = _id_token_email(result.get("id_token", ""))
+        id_token_email = _id_token_email(result.get("id_token", ""))
+        if id_token_email and (not config.get("username") or config.get("type") in PROVIDER_PRESETS):
+            config["username"] = id_token_email
         self._save(account)
         return account
 

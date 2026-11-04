@@ -4,8 +4,8 @@ Things deliberately left out of v1 so the core migration path could be made reli
 Roughly in priority order; open an issue/PR to reprioritise.
 
 ## Sources & destinations
-- **Google account preset** for generic OAuth sign-in (next PR; requires a user-supplied Google Cloud
-  OAuth client).
+- **Google account preset** for generic OAuth sign-in (requires a user-supplied Google Cloud OAuth
+  client) — done.
 - **OAuth device authorization flow** (Stalwart refuses it for self-registered clients; Google excludes mail/contacts/calendar scopes).
 - **JMAP Contacts / Calendars as destinations** (RFC 9610 / draft-ietf-jmap-calendars) — done.
 - **JMAP Contacts / Calendars as sources** (needs JSContact/JSCalendar → vCard/ICS).

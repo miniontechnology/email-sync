@@ -42,19 +42,42 @@ The named `email-sync-data` volume stores the SQLite database, encryption key wh
 configured, and any uploaded Takeout files. Back this volume up before upgrading or moving hosts.
 Changing `EMAIL_SYNC_SECRET_KEY` after creating jobs makes their saved credentials unreadable.
 
+## Google sign-in (OAuth)
+
+The Google preset uses an OAuth client that you create in your own Google Cloud project:
+
+1. In Google Cloud Console, create a project and enable **CalDAV API** and **Google Contacts
+   CardDAV API**.
+2. Configure the OAuth consent screen as **External**, add yourself as a test user, and add these
+   scopes: `openid`, `email`, `https://mail.google.com/`,
+   `https://www.googleapis.com/auth/carddav`, and
+   `https://www.googleapis.com/auth/calendar`.
+3. Create credentials as **OAuth client ID → Desktop app**.
+4. In Email Sync, create an account, choose **Google**, enter the client ID and secret, and save.
+   Select **Sign in with OAuth** and continue past Google's “unverified app” warning. If the
+   browser cannot reach the callback, copy the complete `127.0.0.1` address from the browser and
+   paste it into the account page to finish sign-in.
+
+While the consent screen publishing status is **Testing**, Google refresh tokens expire after
+7 days; affected jobs pause until you sign in again and resume them. Switching the consent screen
+to **In production** avoids this testing-mode expiry. Gmail IMAP access must also be enabled in
+Gmail settings.
+
+Google Account app passwords and Google Takeout exports remain supported alternatives. App
+passwords can be used for Gmail IMAP; Takeout `.vcf`, `.ics`, or `.zip` files can be used as
+contacts and calendar sources.
+
 ## Gmail to Stalwart
 
-1. In Google Account security, enable two-step verification and create an app password. Confirm
-   that IMAP access is enabled in Gmail settings. Use the Gmail address and app password in the
-   source fields; select the Gmail preset.
-2. For mail, configure Stalwart as the JMAP destination. Use the account's JMAP base URL, for
-   example `https://mail.example.com`, and the full account name and password (or a JMAP token).
-   Allow self-signed TLS only for a trusted test server.
-3. For contacts and calendars, export Google data as vCard/iCalendar using Google Takeout, then
-   upload the `.vcf`, `.ics`, or enclosing `.zip` files as file sources. Configure Stalwart's
-   CardDAV, CalDAV, or JMAP endpoints as the destinations. JMAP imports require the server's vCard
-   and iCalendar parse capabilities. DAV/JMAP credentials may be left blank to reuse credentials
-   from that side's mail endpoint.
+1. For mail, select the saved Google account as the Gmail source. Alternatively, use a Gmail app
+   password with the Gmail source fields.
+2. Configure Stalwart as the JMAP destination. Use the account's JMAP base URL, for example
+   `https://mail.example.com`, and the full account name and password (or a JMAP token). Allow
+   self-signed TLS only for a trusted test server.
+3. For contacts and calendars, select the saved Google account as the CardDAV/CalDAV source, or
+   use Google Takeout files. Configure Stalwart's CardDAV, CalDAV, or JMAP endpoints as the
+   destinations. JMAP imports require the server's vCard and iCalendar parse capabilities.
+   DAV/JMAP credentials may be left blank to reuse credentials from that side's mail endpoint.
 4. Run a dry run first. Review folder mappings, selected source scopes, and progress before
    running a real copy.
 
@@ -78,8 +101,8 @@ the account's server URL. An administrator must configure the IdP trust and scop
 
 After approving access, the browser may show a page that cannot be reached at `127.0.0.1`. Copy the
 complete address from the browser and paste it into the saved account page to finish sign-in. The
-Google-specific OAuth preset and device authorization flow are not included yet; Google Takeout
-files remain a straightforward source for contacts and calendars.
+Google preset uses this authorization-code flow; the OAuth device authorization flow is not
+included.
 
 ## Resume and duplicate handling
 
