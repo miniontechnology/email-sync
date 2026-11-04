@@ -80,6 +80,36 @@ def test_duplicate_message_ids_preserve_source_copy_count(tmp_path):
     assert state.destination["INBOX"].count("mid:duplicate") == 3
 
 
+def test_duplicate_message_ids_in_other_folders_keep_flag_updates_separate(tmp_path):
+    store, job_id = make_store(tmp_path)
+    inbox_message = FakeMail("mid:duplicate", b"inbox copy", ["INBOX"])
+    work_message = FakeMail("mid:duplicate", b"work copy", ["Work"])
+    state = FakeMailState({"INBOX": [inbox_message], "Work": [work_message]})
+    assert run_migration(store, job_id, state).status == "completed"
+
+    inbox_message.flags = ("\\Seen",)
+    assert run_migration(store, job_id, state).status == "completed"
+    assert state.dest_flags[("INBOX", "mid:duplicate")] == frozenset({"\\seen"})
+    assert state.dest_flags[("Work", "mid:duplicate")] == frozenset()
+
+
+def test_ambiguous_destination_copies_preserve_baseline_and_warn(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:ambiguous", b"body", ["INBOX"], flags=("\\Seen",))
+    state = FakeMailState({"INBOX": [message]})
+    state.destination["INBOX"] = ["mid:ambiguous", "mid:ambiguous"]
+
+    assert run_migration(store, job_id, state).status == "completed"
+    row = store.ledger_items(job_id, "mail")[0]
+    assert row["status"] == db.SKIPPED
+    assert row["info"] is None
+    assert store.get_tasks(job_id)[0]["updated"] == 0
+    assert any(
+        "1 message(s) had ambiguous destination copies" in event["message"]
+        for event in store.get_events(job_id)
+    )
+
+
 def test_multi_target_copies_one_source_to_each_folder(tmp_path):
     store, job_id = make_store(tmp_path)
     state = FakeMailState({"All Mail": [FakeMail("mid:labelled", b"mail", ["INBOX", "Work"])]})

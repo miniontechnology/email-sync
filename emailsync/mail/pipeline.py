@@ -126,6 +126,7 @@ class MailMigration:
         self._failed = 0
         self._failure_lock = threading.Lock()
         self._state_not_found = 0
+        self._state_ambiguous = 0
         self._state_error_count = 0
         self._state_summary_emitted = False
         self._queue = queue.Queue(maxsize=max(2, self.options.workers * 2))
@@ -213,13 +214,15 @@ class MailMigration:
         return old_flags, old_targets
 
     @staticmethod
-    def _select_copies(copies, dest_ref) -> list:
+    def _select_copies(copies, dest_ref, target_folders=()) -> list:
         tokens = {token.strip().split(" ", 1)[0] for token in str(dest_ref or "").split(";") if token.strip()}
-        selected = [copy for copy in copies if copy.ref in tokens]
+        target_folders = set(target_folders)
+        candidates = [copy for copy in copies if copy.ref in tokens or copy.folders & target_folders]
+        selected = [copy for copy in candidates if copy.ref in tokens]
         covered = {folder for copy in selected for folder in copy.folders}
-        all_folders = {folder for copy in copies for folder in copy.folders}
+        all_folders = {folder for copy in candidates for folder in copy.folders} & target_folders
         for folder in all_folders - covered:
-            in_folder = [copy for copy in copies if folder in copy.folders]
+            in_folder = [copy for copy in candidates if folder in copy.folders]
             if len(in_folder) == 1 and in_folder[0] not in selected:
                 selected.append(in_folder[0])
                 covered.update(in_folder[0].folders)
@@ -237,6 +240,12 @@ class MailMigration:
         if self._state_not_found:
             self._say(
                 f"{self._state_not_found} already-copied message(s) weren't found in the destination; "
+                "their flags and labels weren't updated",
+                "warning",
+            )
+        if self._state_ambiguous:
+            self._say(
+                f"{self._state_ambiguous} message(s) had ambiguous destination copies; "
                 "their flags and labels weren't updated",
                 "warning",
             )
@@ -266,7 +275,11 @@ class MailMigration:
             if not present_folders:
                 self._state_not_found += 1
                 continue
-            copies = self._select_copies(all_copies, row.get("dest_ref"))
+            target_folders = [*(row.get("targets") or []), *old_targets, *new_targets]
+            copies = self._select_copies(all_copies, row.get("dest_ref"), target_folders)
+            if not copies:
+                self._state_ambiguous += 1
+                continue
             remove_stale = self.options.remove_stale_labels and dest.can_remove
             change = plan_change(
                 source_key,
