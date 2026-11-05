@@ -1,5 +1,6 @@
 """Crash-safe coordinator and worker pool for mail migrations."""
 
+import json
 import queue
 import threading
 import time
@@ -11,7 +12,8 @@ from emailsync.jobs.control import RunControl, TaskResult
 from emailsync.jobs.retry import retry_call
 from emailsync.mail.dest import make_dest
 from emailsync.mail.index import DestIndex
-from emailsync.mail.source import make_source
+from emailsync.mail.source import SourceState, make_source
+from emailsync.mail.state import normalize_flags, plan_change
 from emailsync.options import JobConfig
 
 MAX_BATCH_MESSAGES = 25
@@ -39,7 +41,7 @@ class _Progress:
         self.job_id = job_id
         self.kind = kind
         self.lock = threading.Lock()
-        self.values = dict(total=0, already=0, copied=0, skipped=0, failed=0, bytes=0)
+        self.values = dict(total=0, already=0, copied=0, skipped=0, updated=0, failed=0, bytes=0)
         self.scopes = {}
         self.message = "Connecting"
         self.last_flush = 0.0
@@ -57,10 +59,10 @@ class _Progress:
     def update_scope(self, name, **changes):
         with self.lock:
             row = self.scopes.setdefault(
-                name, dict(total=0, already=0, copied=0, skipped=0, failed=0, status="pending")
+                name, dict(total=0, already=0, copied=0, skipped=0, updated=0, failed=0, status="pending")
             )
             row.update(changes)
-            for key in ("total", "already", "copied", "skipped", "failed"):
+            for key in ("total", "already", "copied", "skipped", "updated", "failed"):
                 if key in changes:
                     self.values[key] += changes[key] - row.get(f"_old_{key}", 0)
                     row[f"_old_{key}"] = changes[key]
@@ -70,7 +72,7 @@ class _Progress:
         with self.lock:
             self.values[field] += amount
             row = self.scopes.setdefault(
-                name, dict(total=0, already=0, copied=0, skipped=0, failed=0, status="running")
+                name, dict(total=0, already=0, copied=0, skipped=0, updated=0, failed=0, status="running")
             )
             row[field] = row.get(field, 0) + amount
         self.flush()
@@ -78,7 +80,7 @@ class _Progress:
     def total(self, name, amount):
         with self.lock:
             old = self.scopes.setdefault(
-                name, dict(total=0, already=0, copied=0, skipped=0, failed=0, status="pending")
+                name, dict(total=0, already=0, copied=0, skipped=0, updated=0, failed=0, status="pending")
             ).get("total", 0)
             self.values["total"] += amount - old
             self.scopes[name]["total"] = amount
@@ -123,6 +125,10 @@ class MailMigration:
         self.index = DestIndex(scope=self.options.dedup_scope)
         self._failed = 0
         self._failure_lock = threading.Lock()
+        self._state_not_found = 0
+        self._state_ambiguous = 0
+        self._state_error_count = 0
+        self._state_summary_emitted = False
         self._queue = queue.Queue(maxsize=max(2, self.options.workers * 2))
         self._coordinator_source = None
         self._coordinator_dest = None
@@ -174,6 +180,184 @@ class MailMigration:
                 names.append(name)
         return names
 
+    @staticmethod
+    def _baseline_info(flags, targets) -> str:
+        return json.dumps(
+            {
+                "flags": sorted(normalize_flags(flags)),
+                "src_targets": list(dict.fromkeys(targets)),
+            },
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _read_baseline(row) -> tuple[frozenset[str] | None, list[str]]:
+        row_targets = list(row.get("targets") or [])
+        try:
+            info = json.loads(row.get("info") or "")
+        except (TypeError, ValueError):
+            return None, row_targets
+        if not isinstance(info, dict):
+            return None, row_targets
+        flags = info.get("flags")
+        targets = info.get("src_targets")
+        old_flags = (
+            normalize_flags(flags)
+            if isinstance(flags, list) and all(isinstance(flag, str) for flag in flags)
+            else None
+        )
+        old_targets = (
+            list(dict.fromkeys(targets))
+            if isinstance(targets, list) and all(isinstance(target, str) for target in targets)
+            else row_targets
+        )
+        return old_flags, old_targets
+
+    @staticmethod
+    def _select_copies(copies, dest_ref, target_folders=()) -> list:
+        tokens = {token.strip().split(" ", 1)[0] for token in str(dest_ref or "").split(";") if token.strip()}
+        target_folders = set(target_folders)
+        candidates = [copy for copy in copies if copy.ref in tokens or copy.folders & target_folders]
+        selected = [copy for copy in candidates if copy.ref in tokens]
+        covered = {folder for copy in selected for folder in copy.folders}
+        all_folders = {folder for copy in candidates for folder in copy.folders} & target_folders
+        for folder in all_folders - covered:
+            in_folder = [copy for copy in candidates if folder in copy.folders]
+            if len(in_folder) == 1 and in_folder[0] not in selected:
+                selected.append(in_folder[0])
+                covered.update(in_folder[0].folders)
+        return selected
+
+    def _state_failure(self, source_key, error):
+        self._state_error_count += 1
+        if self._state_error_count <= 20:
+            self._say(f"Flags/labels update failed for {source_key}: {error}", "warning")
+
+    def _emit_state_summaries(self):
+        if self._state_summary_emitted:
+            return
+        self._state_summary_emitted = True
+        if self._state_not_found:
+            self._say(
+                f"{self._state_not_found} already-copied message(s) weren't found in the destination; "
+                "their flags and labels weren't updated",
+                "warning",
+            )
+        if self._state_ambiguous:
+            self._say(
+                f"{self._state_ambiguous} message(s) had ambiguous destination copies; "
+                "their flags and labels weren't updated",
+                "warning",
+            )
+        if self._state_error_count > 20:
+            self._say(
+                f"{self._state_error_count - 20} additional flags/labels update warning(s) were suppressed",
+                "warning",
+            )
+
+    def _reconcile_state_batch(self, dest, scope_name, entries):
+        pending = []
+        for row, source_state, newly_skipped in entries:
+            source_key = row["source_key"]
+            key = row.get("match_key") or ""
+            if newly_skipped:
+                old_flags = None
+                old_targets = list(row.get("targets") or [])
+            else:
+                old_flags, old_targets = self._read_baseline(row)
+            new_flags = normalize_flags(source_state.flags)
+            new_targets = self._resolve_targets(dest, source_state.targets)
+            for folder in dict.fromkeys([*old_targets, *new_targets]):
+                self._index_folder(dest, folder)
+
+            all_copies = self.index.copies(key)
+            present_folders = {folder for copy in all_copies for folder in copy.folders}
+            if not present_folders:
+                self._state_not_found += 1
+                continue
+            target_folders = [*(row.get("targets") or []), *old_targets, *new_targets]
+            copies = self._select_copies(all_copies, row.get("dest_ref"), target_folders)
+            if not copies:
+                self._state_ambiguous += 1
+                continue
+            remove_stale = self.options.remove_stale_labels and dest.can_remove
+            change = plan_change(
+                source_key,
+                copies,
+                present_folders,
+                old_flags,
+                new_flags,
+                old_targets,
+                new_targets,
+                source_state.archived,
+                remove_stale,
+            )
+            baseline = self._baseline_info(new_flags, new_targets)
+            baseline_changed = old_flags is None or old_flags != new_flags or old_targets != new_targets
+            final_targets = []
+            removed = set(change.remove_folders)
+            keep_targets = present_folders | set(change.add_folders)
+            for target in [*(row.get("targets") or []), *new_targets]:
+                if target in removed or target in final_targets:
+                    continue
+                if target in (row.get("targets") or []) or target in keep_targets:
+                    final_targets.append(target)
+
+            if change.empty and not baseline_changed:
+                continue
+            if change.empty:
+                if not self.options.dry_run:
+                    self.store.ledger_mark(
+                        self.job_id,
+                        "mail",
+                        source_key,
+                        row["status"],
+                        match_key=key,
+                        targets=final_targets,
+                        info=baseline,
+                        error=None,
+                    )
+                continue
+            if self.options.dry_run:
+                self.progress.increment(scope_name, "updated")
+                continue
+            pending.append((row, change, baseline, final_targets))
+
+        if not pending or self.options.dry_run:
+            return
+        changes = [entry[1] for entry in pending]
+        try:
+            errors = dest.apply_state(changes, retry=lambda fn: self._retry(fn, dest)) or {}
+        except (AuthError, FatalError):
+            raise
+        except Exception as exc:
+            error = wrap(exc)
+            if isinstance(error, (AuthError, FatalError)):
+                raise error from exc
+            errors = {change.source_key: str(error) for change in changes}
+
+        for row, change, baseline, targets in pending:
+            error = errors.get(change.source_key)
+            if error:
+                self.store.ledger_mark(
+                    self.job_id, "mail", change.source_key, row["status"], error=str(error)
+                )
+                with self._failure_lock:
+                    self._failed += 1
+                self._state_failure(change.source_key, error)
+                continue
+            self.store.ledger_mark(
+                self.job_id,
+                "mail",
+                change.source_key,
+                row["status"],
+                match_key=row.get("match_key"),
+                targets=targets,
+                info=baseline,
+                error=None,
+            )
+            self.progress.increment(scope_name, "updated")
+
     def _enqueue(self, batch):
         while not self.control.stopped and not self.control.aborted:
             try:
@@ -201,6 +385,8 @@ class MailMigration:
                 break
             chunk = uids[uid_chunk_start : uid_chunk_start + META_BATCH_SIZE]
             metadata_uids = []
+            settled_rows = []
+            skipped_rows = []
             for uid in chunk:
                 row = rows.get(f"{scope.name}|{validity}|{uid}")
                 if row and row["status"] in db.SETTLED:
@@ -209,11 +395,15 @@ class MailMigration:
                         self._index_folder(dest, target)
                     self.index.account_for(row.get("match_key") or "", targets)
                     self.progress.increment(scope.name, "already")
+                    if self.options.sync_flags_labels:
+                        settled_rows.append((uid, row))
                 else:
                     metadata_uids.append(uid)
-            if not metadata_uids:
-                continue
-            metas = self._retry(lambda uids=metadata_uids: src.fetch_meta(scope, uids), src) or {}
+            metas = (
+                self._retry(lambda uids=metadata_uids: src.fetch_meta(scope, uids), src) or {}
+                if metadata_uids
+                else {}
+            )
             for uid in metadata_uids:
                 if self.control.stopped or self.control.aborted:
                     break
@@ -237,6 +427,21 @@ class MailMigration:
                         self.job_id, "mail", source_key, db.SKIPPED, match_key=meta.key, targets=folder_keys
                     )
                     self.progress.increment(scope.name, "skipped")
+                    if self.options.sync_flags_labels:
+                        skipped_rows.append(
+                            (
+                                {
+                                    "source_key": source_key,
+                                    "status": db.SKIPPED,
+                                    "match_key": meta.key,
+                                    "targets": folder_keys,
+                                    "dest_ref": None,
+                                    "info": None,
+                                },
+                                SourceState(tuple(meta.flags), list(meta.targets), meta.archived),
+                                True,
+                            )
+                        )
                     continue
                 if self.options.dry_run:
                     self.progress.increment(scope.name, "copied")
@@ -258,6 +463,22 @@ class MailMigration:
                     work, work_bytes = [], 0
                 work.append(item)
                 work_bytes += max(0, item.size)
+            if self.options.sync_flags_labels and not self.control.stopped and not self.control.aborted:
+                state_rows = []
+                if settled_rows:
+                    source_states = (
+                        self._retry(
+                            lambda uids=[uid for uid, _row in settled_rows]: src.fetch_state(scope, uids),
+                            src,
+                        )
+                        or {}
+                    )
+                    state_rows.extend(
+                        (row, source_states[uid], False) for uid, row in settled_rows if uid in source_states
+                    )
+                state_rows.extend(skipped_rows)
+                if state_rows:
+                    self._reconcile_state_batch(dest, scope.name, state_rows)
         if work and not self.control.stopped and not self.control.aborted:
             self._enqueue(work)
         self.progress.update_scope(scope.name, status="done" if not self.control.stopped else "paused")
@@ -354,6 +575,7 @@ class MailMigration:
                     match_key=item.key,
                     targets=item.folders,
                     dest_ref=ref,
+                    info=self._baseline_info(item.flags, item.folders),
                 )
                 self.progress.increment(item.scope.name, "copied")
                 self.progress.increment(item.scope.name, "bytes", len(raw))
@@ -413,10 +635,24 @@ class MailMigration:
             scopes = self._retry(self._coordinator_source.scopes, self._coordinator_source) or []
             self.progress.set_scopes(
                 {
-                    scope.name: dict(total=0, already=0, copied=0, skipped=0, failed=0, status="pending")
+                    scope.name: dict(
+                        total=0,
+                        already=0,
+                        copied=0,
+                        skipped=0,
+                        updated=0,
+                        failed=0,
+                        status="pending",
+                    )
                     for scope in scopes
                 }
             )
+            if self.options.remove_stale_labels and not self._coordinator_dest.can_remove:
+                self._say(
+                    "Stale-label removal was requested, but the destination server lacks UIDPLUS; "
+                    "removed labels will be kept",
+                    "warning",
+                )
             if (
                 getattr(self._coordinator_dest, "index_mode", "lazy") == "all"
                 or self.options.dedup_scope == "account"
@@ -449,6 +685,7 @@ class MailMigration:
                             continue
                 for thread in workers:
                     thread.join()
+            self._emit_state_summaries()
             if self.control.aborted:
                 error = str(self.control.error or "Task aborted")
                 status = "paused" if isinstance(self.control.error, ReauthRequired) else "failed"

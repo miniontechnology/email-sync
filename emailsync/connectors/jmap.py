@@ -5,6 +5,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from emailsync.errors import AuthError, PermanentError, SyncError, TransientError, wrap
+from emailsync.mail.state import normalize_flags
 from emailsync.oauth import OAuthBearerAuth
 from emailsync.options import Endpoint
 
@@ -40,6 +41,15 @@ def flags_to_keywords(flags) -> dict[str, bool]:
         elif lowered and not (set(lowered) & _KEYWORD_FORBIDDEN) and len(lowered) <= 255:
             out[lowered] = True
     return out
+
+
+def keywords_to_flags(keywords) -> frozenset[str]:
+    system_flags = {keyword: flag for flag, keyword in FLAG_TO_KEYWORD.items() if flag.startswith("\\")}
+    flags = []
+    for keyword in keywords or {}:
+        lowered = str(keyword).lower()
+        flags.append(system_flags.get(lowered, lowered))
+    return normalize_flags(flags)
 
 
 def _rebase(url: str, base: str) -> str:
@@ -184,7 +194,7 @@ class JmapClient:
         """Yield every email's identity fields, paging through Email/query."""
         page = min(page or self.max_objects_in_get, self.max_objects_in_get)
         position = 0
-        props = ["id", "messageId", "mailboxIds", "sentAt", "from", "to", "subject"]
+        props = ["id", "messageId", "mailboxIds", "keywords", "sentAt", "from", "to", "subject"]
         while True:
             resp = self.call(
                 [
@@ -234,6 +244,21 @@ class JmapClient:
 
             raise FatalError(f"Destination over quota: {err.get('description', '')}")
         raise PermanentError(f"Email/import rejected: {err.get('type')} {err.get('description', '')}".strip())
+
+    def update_emails(self, patches: dict[str, dict]) -> dict[str, str]:
+        errors = {}
+        items = list(patches.items())
+        for i in range(0, len(items), 100):
+            batch = dict(items[i : i + 100])
+            resp = self.call([["Email/set", {"accountId": self.account_id, "update": batch}, "0"]])
+            for email_id, error in (resp[0][1].get("notUpdated") or {}).items():
+                if isinstance(error, dict):
+                    error_type = error.get("type", "")
+                    description = error.get("description", "")
+                    errors[email_id] = f"{error_type}: {description}".strip(": ")
+                else:
+                    errors[email_id] = str(error)
+        return errors
 
     def add_to_mailboxes(self, email_id: str, mailbox_ids: list[str]) -> bool:
         patch = {f"mailboxIds/{m}": True for m in mailbox_ids}

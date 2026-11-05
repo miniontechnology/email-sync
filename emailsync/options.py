@@ -72,6 +72,8 @@ class Options:
     since: str = ""  # YYYY-MM-DD, only messages on/after this date
     dry_run: bool = False
     verify: bool = True
+    sync_flags_labels: bool = True
+    remove_stale_labels: bool = False
     sync_interval_minutes: int = 0
     dav_match_fingerprint: bool = True
 

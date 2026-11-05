@@ -112,8 +112,8 @@ def map_source_folder(folder: Folder, options: Options) -> str | None:
     return "/".join(parts)
 
 
-def gmail_targets(labels, options: Options) -> tuple[list[str], bool]:
-    """Targets for a Gmail message from its X-GM-LABELS. Returns (targets, starred)."""
+def gmail_real_targets(labels, options: Options) -> tuple[list[str], bool]:
+    """Return explicit Gmail targets and whether the message is starred."""
     targets: list[str] = []
     starred = False
     for label in labels or ():
@@ -138,11 +138,17 @@ def gmail_targets(labels, options: Options) -> tuple[list[str], bool]:
         if lowered.startswith("\\"):
             continue  # unknown system label
         targets.append(label)
-    if not targets and options.archive_target:
-        targets.append(options.archive_target)
     seen: set[str] = set()
     unique = [t for t in targets if not (t in seen or seen.add(t))]
     return unique, starred
+
+
+def gmail_targets(labels, options: Options) -> tuple[list[str], bool]:
+    """Targets for a Gmail message from its X-GM-LABELS. Returns (targets, starred)."""
+    targets, starred = gmail_real_targets(labels, options)
+    if not targets and options.archive_target:
+        targets.append(options.archive_target)
+    return targets, starred
 
 
 def gmail_folder_label(folder: Folder) -> str | None:

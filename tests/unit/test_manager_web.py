@@ -91,6 +91,11 @@ def test_web_dashboard_detail_validation_and_secret_redaction(tmp_path):
     settings, store, manager = make_manager(tmp_path)
     app = create_app(settings, store, manager)
     with TestClient(app) as client:
+        form = client.get("/jobs/new")
+        assert form.status_code == 200
+        assert 'name="sync_flags_labels" checked' in form.text
+        assert 'name="remove_stale_labels" checked' not in form.text
+
         invalid = client.post("/jobs", data={"name": ""})
         assert invalid.status_code == 422
         assert "Configure a source and a destination" in invalid.text
@@ -110,11 +115,15 @@ def test_web_dashboard_detail_validation_and_secret_redaction(tmp_path):
                 "dedup_scope": "folder",
                 "skip_deleted": "on",
                 "verify": "on",
+                "sync_flags_labels": "on",
             },
             follow_redirects=False,
         )
         assert response.status_code == 303
         job_id = int(response.headers["location"].split("/")[-1])
+        options = store.get_job(job_id)["config"]["options"]
+        assert options["sync_flags_labels"] is True
+        assert options["remove_stale_labels"] is False
         for url in ("/", f"/jobs/{job_id}", f"/jobs/{job_id}/fragment", "/jobs/fragment"):
             page = client.get(url)
             assert page.status_code == 200

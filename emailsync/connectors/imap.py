@@ -46,6 +46,8 @@ class ImapConnection:
         self.timeout = timeout
         self.client: IMAPClient | None = None
         self.selected: str | None = None
+        self.selected_readonly: bool | None = None
+        self.selected_info: dict = {}
         self.capabilities: set[str] = set()
 
     # -- lifecycle ---------------------------------------------------------------------------
@@ -105,6 +107,8 @@ class ImapConnection:
         self.client = client
         self.capabilities = {_str(c).upper() for c in client.capabilities()}
         self.selected = None
+        self.selected_readonly = None
+        self.selected_info = {}
         return self
 
     @staticmethod
@@ -125,6 +129,8 @@ class ImapConnection:
                 pass
         self.client = None
         self.selected = None
+        self.selected_readonly = None
+        self.selected_info = {}
 
     def reconnect(self) -> None:
         self.close()
@@ -171,15 +177,22 @@ class ImapConnection:
     def select(self, name: str, readonly: bool = True) -> dict:
         info = self.c.select_folder(name, readonly=readonly)
         self.selected = name
-        return {
+        self.selected_readonly = readonly
+        self.selected_info = {
             "uidvalidity": int(info.get(b"UIDVALIDITY", 0) or 0),
             "exists": int(info.get(b"EXISTS", 0) or 0),
             "uidnext": int(info.get(b"UIDNEXT", 0) or 0),
+            "permanentflags": {_str(flag).lower() for flag in info.get(b"PERMANENTFLAGS", ())},
         }
+        return self.selected_info
 
-    def ensure_selected(self, name: str) -> None:
-        if self.selected != name:
-            self.select(name)
+    def ensure_selected(self, name: str, readonly: bool = True) -> dict:
+        if self.selected != name or (not readonly and self.selected_readonly):
+            return self.select(name, readonly=readonly)
+        return self.selected_info
+
+    def ensure_writable(self, name: str) -> dict:
+        return self.ensure_selected(name, readonly=False)
 
     # -- messages ----------------------------------------------------------------------------
     def search_uids(self, since: dt.date | None = None) -> list[int]:
@@ -207,6 +220,19 @@ class ImapConnection:
             }
         return out
 
+    def fetch_state(self, uids: list[int], gmail: bool = False) -> dict[int, dict]:
+        items = [b"FLAGS"]
+        if gmail:
+            items.append(b"X-GM-LABELS")
+        resp = self.c.fetch(uids, items)
+        return {
+            int(uid): {
+                "flags": tuple(_str(flag) for flag in data.get(b"FLAGS", ())),
+                "labels": [decode_label(label) for label in data.get(b"X-GM-LABELS", ())] if gmail else [],
+            }
+            for uid, data in resp.items()
+        }
+
     def fetch_bodies(self, uids: list[int]) -> dict[int, bytes]:
         resp = self.c.fetch(uids, [b"BODY.PEEK[]"])
         out = {}
@@ -215,6 +241,18 @@ class ImapConnection:
             if body is not None:
                 out[int(uid)] = body
         return out
+
+    def add_flags(self, uids: list[int], flags) -> None:
+        self.c.add_flags(uids, flags, silent=True)
+
+    def remove_flags(self, uids: list[int], flags) -> None:
+        self.c.remove_flags(uids, flags, silent=True)
+
+    def copy(self, uids: list[int], folder: str) -> None:
+        self.c.copy(uids, folder)
+
+    def uid_expunge(self, uids: list[int]) -> None:
+        self.c.expunge(uids)
 
     def append(self, folder: str, raw: bytes, flags, internaldate) -> str | None:
         clean = [f for f in flags if f.lower() not in UNSETTABLE_FLAGS]

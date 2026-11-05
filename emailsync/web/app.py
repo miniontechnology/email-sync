@@ -144,6 +144,8 @@ async def _build_config(request, settings):
         since=str(form.get("since") or "").strip(),
         dry_run=bool(form.get("dry_run")),
         verify=bool(form.get("verify")),
+        sync_flags_labels=bool(form.get("sync_flags_labels")),
+        remove_stale_labels=bool(form.get("remove_stale_labels")),
         sync_interval_minutes=int(form.get("sync_interval_minutes") or 0),
     )
     config = JobConfig(
