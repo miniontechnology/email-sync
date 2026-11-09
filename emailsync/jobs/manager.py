@@ -205,7 +205,7 @@ class JobManager:
             return
         referenced = set()
         for job in self.store.list_jobs():
-            referenced.update(self._upload_dirs(self._load_config(job, resolve=False)))
+            referenced.update(self._upload_dirs(JobConfig.from_dict(job["config"])))
         referenced_children = set()
         for directory in referenced:
             try:
@@ -232,7 +232,7 @@ class JobManager:
         upload_dirs = set()
         for other in self.store.list_jobs():
             if other["id"] != job_id:
-                upload_dirs.update(self._upload_dirs(self._load_config(other, resolve=False)))
+                upload_dirs.update(self._upload_dirs(JobConfig.from_dict(other["config"])))
         return upload_dirs
 
     def edit_job(self, job_id: int, config: JobConfig, *, confirm_reset: bool = False) -> list[str]:
