@@ -495,6 +495,21 @@ def test_edit_post_keeps_blank_password_and_save_and_run_queues_job(tmp_path):
         assert store.get_job(job_id)["status"] == "queued"
 
 
+def test_edit_preserves_options_not_in_the_form(tmp_path):
+    settings, store, manager = make_manager(tmp_path)
+    original = mail_config()
+    original.options.dav_match_fingerprint = False
+    job_id = completed_job(manager, store, original)
+    manager._schedule_once = lambda: None
+    edited = mail_config()
+    edited.options.dav_match_fingerprint = True
+
+    manager.edit_job(job_id, edited)
+
+    saved = manager._load_config(store.get_job(job_id), resolve=False)
+    assert saved.options.dav_match_fingerprint is False
+
+
 def test_edit_preserves_separate_dav_password_and_updates_inherited_password(tmp_path):
     settings, store, manager = make_manager(tmp_path)
     separate = config_with_contacts("mail-old")

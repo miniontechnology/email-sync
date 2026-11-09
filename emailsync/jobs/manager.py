@@ -203,6 +203,7 @@ class JobManager:
                 raise ValueError("Pause the migration or wait for it to finish before editing it.")
 
             old = self._load_config(job, resolve=False)
+            config.options.dav_match_fingerprint = old.options.dav_match_fingerprint
             errors = [*merge_saved_settings(config, old), *self._validate(config)]
             if errors:
                 raise ValueError(" ".join(errors))
