@@ -189,7 +189,10 @@ class DavMigration:
         target = next((c for c in collections if c["displayname"].casefold() == source_name.casefold()), None)
         if target is None and not self.options.dry_run:
             target = self._retry(lambda: dest.create_collection(source_name or "Calendar"), dest)
-        return target or {"href": dest.home, "displayname": source_name or "Calendar"}
+        if target:
+            return target
+        href = f"{dest.home}#dry-run:{source_name}" if self.options.dry_run else dest.home
+        return {"href": href, "displayname": source_name or "Calendar"}
 
     def _record_failure(self, scope, key, uid, target, error):
         if not self.options.dry_run:
