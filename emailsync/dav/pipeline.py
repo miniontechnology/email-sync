@@ -192,15 +192,16 @@ class DavMigration:
         return target or {"href": dest.home, "displayname": source_name or "Calendar"}
 
     def _record_failure(self, scope, key, uid, target, error):
-        self.store.ledger_mark(
-            self.job_id,
-            self.kind,
-            key,
-            db.FAILED,
-            match_key=uid,
-            targets=[target["displayname"]],
-            error=str(error)[:1000],
-        )
+        if not self.options.dry_run:
+            self.store.ledger_mark(
+                self.job_id,
+                self.kind,
+                key,
+                db.FAILED,
+                match_key=uid,
+                targets=[target["displayname"]],
+                error=str(error)[:1000],
+            )
         self.progress.update(scope, "failed")
         with self._failed_lock:
             self.failed += 1
@@ -216,18 +217,24 @@ class DavMigration:
                 self.options.dav_match_fingerprint and fingerprint in indexed["fingerprints"]
             )
             if exists:
-                self.store.ledger_mark(
-                    self.job_id,
-                    self.kind,
-                    source_key,
-                    db.SKIPPED,
-                    match_key=item.uid,
-                    targets=[collection_name],
-                    info=fingerprint,
-                )
+                if not self.options.dry_run:
+                    self.store.ledger_mark(
+                        self.job_id,
+                        self.kind,
+                        source_key,
+                        db.SKIPPED,
+                        match_key=item.uid,
+                        targets=[collection_name],
+                        info=fingerprint,
+                    )
                 indexed["uids"].add(item.uid)
                 indexed["fingerprints"].add(fingerprint)
                 self.progress.update(scope.name, "skipped")
+                return
+            if self.options.dry_run:
+                indexed["uids"].add(item.uid)
+                indexed["fingerprints"].add(fingerprint)
+                self.progress.update(scope.name, "copied")
                 return
             extension = ".vcf" if self.kind == "contacts" else ".ics"
             safe_uid = re.sub(r"[^A-Za-z0-9._@+-]", "_", item.uid)[:180] or "item"
