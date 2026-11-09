@@ -1,10 +1,12 @@
 """FastAPI application and browser UI."""
 
 import re
+import secrets
 import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -31,6 +33,16 @@ from emailsync.providers import GOOGLE_CLIENT_REQUIRED, PROVIDER_PRESETS
 
 PACKAGE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(PACKAGE_DIR / "templates"))
+PENDING_EDIT_TTL_SECONDS = 30 * 60
+
+
+@dataclass
+class PendingEdit:
+    job_id: int
+    config: JobConfig
+    upload_dirs: set[Path]
+    then_run: bool
+    created: float
 
 
 def _format_job(job):
@@ -240,7 +252,19 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
     app.state.manager = manager
     app.state.secretbox = secretbox
     app.state.oauth = oauth
+    app.state.pending_edits = {}
     app.mount("/static", StaticFiles(directory=str(PACKAGE_DIR / "static")), name="static")
+
+    def _remove_upload_dirs(upload_dirs):
+        for directory in upload_dirs:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def _purge_pending_edits():
+        now = time.time()
+        for token, pending in list(app.state.pending_edits.items()):
+            if now - pending.created >= PENDING_EDIT_TTL_SECONDS:
+                app.state.pending_edits.pop(token, None)
+                _remove_upload_dirs(pending.upload_dirs)
 
     def _render_jobs(request):
         jobs = [_format_job(job) for job in store.list_jobs()]
@@ -309,6 +333,7 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
 
     @app.get("/jobs/{job_id}/edit", response_class=HTMLResponse)
     async def edit_job_form(request: Request, job_id: int):
+        _purge_pending_edits()
         job = store.get_job(job_id)
         if not job:
             return HTMLResponse("Job not found", status_code=404)
@@ -325,12 +350,12 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
                 "editing": True,
                 "form_action": f"/jobs/{job_id}/edit",
                 "job_id": job_id,
-                "reset_kinds": [],
             },
         )
 
     @app.post("/jobs/{job_id}/edit", response_class=HTMLResponse)
     async def edit_job_form_post(request: Request, job_id: int):
+        _purge_pending_edits()
         upload_dirs = set()
         values = {}
         form = await request.form()
@@ -344,28 +369,28 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
         try:
             config, values, _upload_dirs = await _build_config(request, settings, upload_dirs)
             form = await request.form()
-            manager.edit_job(job_id, config, confirm_reset=bool(form.get("confirm_reset")))
+            then_run = bool(form.get("then_run"))
+            manager.edit_job(job_id, config)
         except ResetConfirmationRequired as exc:
-            for directory in upload_dirs:
-                shutil.rmtree(directory, ignore_errors=True)
+            _purge_pending_edits()
+            token = secrets.token_urlsafe(16)
+            app.state.pending_edits[token] = PendingEdit(
+                job_id, config, set(upload_dirs), then_run, time.time()
+            )
             return templates.TemplateResponse(
                 request=request,
-                name="new_job.html",
+                name="confirm_edit.html",
                 context={
-                    **context,
-                    "errors": [],
-                    "values": values,
-                    "reset_kinds": exc.kinds,
+                    "job_id": job_id,
+                    "token": token,
+                    "kinds": exc.kinds,
                 },
-                status_code=422,
             )
         except KeyError:
-            for directory in upload_dirs:
-                shutil.rmtree(directory, ignore_errors=True)
+            _remove_upload_dirs(upload_dirs)
             return HTMLResponse("Job not found", status_code=404)
         except (ValueError, OSError) as exc:
-            for directory in upload_dirs:
-                shutil.rmtree(directory, ignore_errors=True)
+            _remove_upload_dirs(upload_dirs)
             return templates.TemplateResponse(
                 request=request,
                 name="new_job.html",
@@ -373,15 +398,54 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
                     **context,
                     "errors": [str(exc)],
                     "values": values,
-                    "reset_kinds": [],
                 },
                 status_code=422,
             )
         except Exception:
-            for directory in upload_dirs:
-                shutil.rmtree(directory, ignore_errors=True)
+            _remove_upload_dirs(upload_dirs)
             raise
-        if form.get("then_run"):
+        if then_run:
+            manager.resume(job_id)
+        return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
+    @app.post("/jobs/{job_id}/edit/confirm", response_class=HTMLResponse)
+    async def confirm_edit(request: Request, job_id: int):
+        _purge_pending_edits()
+        form = await request.form()
+        token = str(form.get("token") or "")
+        pending = app.state.pending_edits.pop(token, None)
+        if pending is None:
+            return RedirectResponse(f"/jobs/{job_id}/edit", status_code=303)
+        if pending.job_id != job_id:
+            _remove_upload_dirs(pending.upload_dirs)
+            return RedirectResponse(f"/jobs/{job_id}/edit", status_code=303)
+        try:
+            manager.edit_job(job_id, pending.config, confirm_reset=True)
+        except KeyError:
+            _remove_upload_dirs(pending.upload_dirs)
+            return HTMLResponse("Job not found", status_code=404)
+        except (ValueError, OSError) as exc:
+            _remove_upload_dirs(pending.upload_dirs)
+            job = store.get_job(job_id)
+            if not job:
+                return HTMLResponse("Job not found", status_code=404)
+            return templates.TemplateResponse(
+                request=request,
+                name="new_job.html",
+                context={
+                    "errors": [str(exc)],
+                    "values": _config_to_values(pending.config.split()[0]),
+                    "accounts": store.list_accounts(),
+                    "editing": True,
+                    "form_action": f"/jobs/{job_id}/edit",
+                    "job_id": job_id,
+                },
+                status_code=422,
+            )
+        except Exception:
+            _remove_upload_dirs(pending.upload_dirs)
+            raise
+        if pending.then_run:
             manager.resume(job_id)
         return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 

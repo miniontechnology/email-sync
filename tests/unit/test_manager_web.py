@@ -1,4 +1,5 @@
 import time
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -501,24 +502,27 @@ def test_edit_reset_warning_requires_confirmation_then_clears_records(tmp_path):
     manager._schedule_once = lambda: None
     data = edit_form_data(mail_dest_url="https://new-mail.example", mail_dest_password="new-secret")
 
-    with TestClient(create_app(settings, store, manager)) as client:
+    app = create_app(settings, store, manager)
+    with TestClient(app) as client:
         warning = client.post(f"/jobs/{job_id}/edit", data=data)
-        assert warning.status_code == 422
+        assert warning.status_code == 200
+        assert "Confirm migration edit" in warning.text
         assert "Changing the source or destination clears the copy records for: mail." in warning.text
-        assert 'name="confirm_reset"' in warning.text
-        assert " required" in warning.text
         assert "new-secret" not in warning.text
-        form_start = warning.text.index("<form")
-        form_end = warning.text.index("</form>", form_start)
-        assert form_start < warning.text.index('name="confirm_reset"') < form_end
+        token = next(iter(app.state.pending_edits))
+        assert token in warning.text
 
         confirmed = client.post(
-            f"/jobs/{job_id}/edit",
-            data={**data, "confirm_reset": "1"},
+            f"/jobs/{job_id}/edit/confirm",
+            data={"token": token},
             follow_redirects=False,
         )
         assert confirmed.status_code == 303
     assert store.ledger_counts(job_id, "mail") == {}
+    assert (
+        manager._load_config(store.get_job(job_id), resolve=False).endpoints["mail"]["dest"].password
+        == "new-secret"
+    )
 
 
 def test_job_page_edit_dry_run_badge_and_run_for_real(tmp_path):
@@ -587,7 +591,7 @@ def test_edit_error_preserves_submitted_values_without_secrets(tmp_path):
     assert "not-rendered" not in response.text
 
 
-def test_edit_confirmation_error_removes_new_uploads(tmp_path):
+def test_edit_confirmation_preserves_new_credentials_and_uploads(tmp_path):
     settings, store, manager = make_manager(tmp_path)
     old_dir = settings.uploads_dir / "old"
     old_dir.mkdir(parents=True)
@@ -598,24 +602,83 @@ def test_edit_confirmation_error_removes_new_uploads(tmp_path):
     job_id = completed_job(manager, store, config)
     store.ledger_mark(job_id, "contacts", "contact-1", db.DONE)
     manager._schedule_once = lambda: None
-    original_upload_dirs = set(settings.uploads_dir.iterdir())
     data = edit_form_data(
         contacts_source_type="file",
         contacts_dest_type="carddav",
         contacts_dest_url="https://new-contacts.example",
         contacts_dest_username="alice",
         contacts_dest_password="new-secret",
+        then_run="1",
     )
+    app = create_app(settings, store, manager)
 
-    with TestClient(create_app(settings, store, manager)) as client:
+    with TestClient(app) as client:
         response = client.post(
             f"/jobs/{job_id}/edit",
             data=data,
             files={"contacts_source_files": ("replacement.vcf", b"new", "text/vcard")},
         )
+        assert response.status_code == 200
+        assert "new-secret" not in response.text
+        assert "replacement.vcf" not in response.text
+        token = next(iter(app.state.pending_edits))
+        pending = app.state.pending_edits[token]
+        assert pending.config.endpoints["contacts"]["dest"].password == "new-secret"
+        new_file = Path(pending.config.endpoints["contacts"]["source"].files[0])
+        assert new_file.read_bytes() == b"new"
+        assert new_file.parent.exists()
 
-    assert response.status_code == 422
-    assert set(settings.uploads_dir.iterdir()) == original_upload_dirs
+        confirmed = client.post(
+            f"/jobs/{job_id}/edit/confirm",
+            data={"token": token},
+            follow_redirects=False,
+        )
+
+    assert confirmed.status_code == 303
+    assert store.get_job(job_id)["status"] == "queued"
+    saved = manager._load_config(store.get_job(job_id), resolve=False)
+    assert saved.endpoints["contacts"]["dest"].password == "new-secret"
+    assert saved.endpoints["contacts"]["source"].files == [str(new_file)]
+    assert new_file.exists()
+    assert not old_dir.exists()
+    assert set(settings.uploads_dir.iterdir()) == {new_file.parent}
+
+
+def test_unknown_or_expired_confirmation_token_does_not_save(tmp_path):
+    settings, store, manager = make_manager(tmp_path)
+    job_id = completed_job(manager, store, mail_config())
+    store.ledger_mark(job_id, "mail", "message-1", db.DONE)
+    manager._schedule_once = lambda: None
+    app = create_app(settings, store, manager)
+    changed = edit_form_data(mail_dest_url="https://new-mail.example", mail_dest_password="new-secret")
+
+    with TestClient(app) as client:
+        unknown = client.post(
+            f"/jobs/{job_id}/edit/confirm",
+            data={"token": "unknown-token"},
+            follow_redirects=False,
+        )
+        assert unknown.status_code == 303
+        assert unknown.headers["location"] == f"/jobs/{job_id}/edit"
+
+        pending_page = client.post(f"/jobs/{job_id}/edit", data=changed)
+        assert pending_page.status_code == 200
+        token = next(iter(app.state.pending_edits))
+        app.state.pending_edits[token].created = time.time() - 1801
+
+        expired = client.post(
+            f"/jobs/{job_id}/edit/confirm",
+            data={"token": token},
+            follow_redirects=False,
+        )
+
+    assert expired.status_code == 303
+    assert expired.headers["location"] == f"/jobs/{job_id}/edit"
+    assert app.state.pending_edits == {}
+    saved = manager._load_config(store.get_job(job_id), resolve=False)
+    assert saved.endpoints["mail"]["dest"].url == "https://mail.example.com"
+    assert saved.endpoints["mail"]["dest"].password == "super-secret"
+    assert store.ledger_counts(job_id, "mail") == {db.DONE: 1}
 
 
 def test_api_test_fills_saved_password_for_matching_job_endpoint(tmp_path, monkeypatch):

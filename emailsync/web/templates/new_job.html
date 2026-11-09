@@ -11,12 +11,6 @@
 <div class="alert error"><strong>Please review these details</strong><ul>{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul></div>
 {% endif %}
 <form action="{{ form_action }}" method="post" enctype="multipart/form-data" class="form-stack" {% if editing %}data-job-id="{{ job_id }}"{% endif %}>
-  {% if reset_kinds %}
-  <div class="alert warning">
-    <p>Changing the source or destination clears the copy records for: {{ reset_kinds|join(", ") }}. Already-copied items will be matched against the destination again; nothing is deleted.</p>
-    <label class="check-field"><input type="checkbox" name="confirm_reset" value="1" required {% if values.get('confirm_reset') %}checked{% endif %}><span>Confirm clearing these copy records</span></label>
-  </div>
-  {% endif %}
   <section class="panel">
     <div class="section-heading"><div><h2>Basics</h2><p>Name this migration so it’s easy to find later.</p></div></div>
     <label class="field narrow"><span>Migration name</span><input name="name" required value="{{ values.get('name','') }}" placeholder="Gmail to Stalwart"></label>
