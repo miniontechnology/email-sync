@@ -495,6 +495,35 @@ def test_edit_post_keeps_blank_password_and_save_and_run_queues_job(tmp_path):
         assert store.get_job(job_id)["status"] == "queued"
 
 
+def test_edit_preserves_separate_dav_password_and_updates_inherited_password(tmp_path):
+    settings, store, manager = make_manager(tmp_path)
+    separate = config_with_contacts("mail-old")
+    separate.endpoints["contacts"]["dest"].password = "carddav-own"
+    separate_id = completed_job(manager, store, separate)
+    inherited_id = completed_job(manager, store, config_with_contacts("mail-old"))
+    manager._schedule_once = lambda: None
+    app = create_app(settings, store, manager)
+    form = edit_form_data(
+        mail_dest_password="mail-new",
+        contacts_source_type="carddav",
+        contacts_source_url="https://contacts.source",
+        contacts_source_username="alice",
+        contacts_dest_type="carddav",
+        contacts_dest_url="https://contacts.dest",
+        contacts_dest_username="alice",
+    )
+
+    with TestClient(app) as client:
+        for job_id in (separate_id, inherited_id):
+            response = client.post(f"/jobs/{job_id}/edit", data=form, follow_redirects=False)
+            assert response.status_code == 303
+
+    separate_saved = manager._load_config(store.get_job(separate_id), resolve=False)
+    inherited_saved = manager._load_config(store.get_job(inherited_id), resolve=False)
+    assert separate_saved.endpoints["contacts"]["dest"].password == "carddav-own"
+    assert inherited_saved.endpoints["contacts"]["dest"].password == "mail-new"
+
+
 def test_edit_reset_warning_requires_confirmation_then_clears_records(tmp_path):
     settings, store, manager = make_manager(tmp_path)
     job_id = completed_job(manager, store, mail_config())

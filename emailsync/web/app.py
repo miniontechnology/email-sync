@@ -140,7 +140,9 @@ def _progress(tasks):
     return tasks
 
 
-def _endpoint_from_form(form, kind, side, uploads_dir, mail_endpoint=None, upload_dirs=None):
+def _endpoint_from_form(
+    form, kind, side, uploads_dir, mail_endpoint=None, upload_dirs=None, inherit_mail_credentials=True
+):
     prefix = f"{kind}_{side}_"
     endpoint_type = str(form.get(prefix + "type") or "").strip()
     if endpoint_type in ("", "none"):
@@ -163,7 +165,11 @@ def _endpoint_from_form(form, kind, side, uploads_dir, mail_endpoint=None, uploa
         files.append(str(path))
     username = str(form.get(prefix + "username") or "").strip()
     password = str(form.get(prefix + "password") or "")
-    if endpoint_type in ("carddav", "caldav", "jmap") and (not username or not password):
+    if (
+        inherit_mail_credentials
+        and endpoint_type in ("carddav", "caldav", "jmap")
+        and (not username or not password)
+    ):
         username = username or (mail_endpoint.username if mail_endpoint else "")
         password = password or (mail_endpoint.password if mail_endpoint else "")
     token = str(form.get(prefix + "token") or "")
@@ -174,7 +180,7 @@ def _endpoint_from_form(form, kind, side, uploads_dir, mail_endpoint=None, uploa
         username = password = token = ""
     if endpoint_type == "jmap" and mail_endpoint and mail_endpoint.type == "jmap":
         url = url or mail_endpoint.url
-        if not password:
+        if inherit_mail_credentials and not password:
             token = token or mail_endpoint.token
     return Endpoint(
         type=endpoint_type,
@@ -191,7 +197,7 @@ def _endpoint_from_form(form, kind, side, uploads_dir, mail_endpoint=None, uploa
     )
 
 
-async def _build_config(request, settings, upload_dirs=None):
+async def _build_config(request, settings, upload_dirs=None, inherit_mail_credentials=True):
     form = await request.form()
     upload_dir = settings.uploads_dir
     upload_dirs = upload_dirs if upload_dirs is not None else set()
@@ -200,7 +206,13 @@ async def _build_config(request, settings, upload_dirs=None):
         for side in ("source", "dest"):
             mail_endpoint = endpoints["mail"][side] if kind != "mail" else None
             endpoints[kind][side] = _endpoint_from_form(
-                form, kind, side, upload_dir, mail_endpoint, upload_dirs
+                form,
+                kind,
+                side,
+                upload_dir,
+                mail_endpoint,
+                upload_dirs,
+                inherit_mail_credentials=inherit_mail_credentials,
             )
     options = Options(
         workers=int(form.get("workers") or 4),
@@ -367,7 +379,9 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             "job_id": job_id,
         }
         try:
-            config, values, _upload_dirs = await _build_config(request, settings, upload_dirs)
+            config, values, _upload_dirs = await _build_config(
+                request, settings, upload_dirs, inherit_mail_credentials=False
+            )
             form = await request.form()
             then_run = bool(form.get("then_run"))
             manager.edit_job(job_id, config)
