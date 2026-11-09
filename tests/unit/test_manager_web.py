@@ -303,6 +303,37 @@ def test_startup_auto_resume_and_due_sync_schedule_jobs(tmp_path):
     assert any(event["message"] == "Scheduled sync run queued" for event in store.get_events(job_id))
 
 
+def test_startup_removes_orphan_upload_dirs_and_keeps_referenced_dirs(tmp_path):
+    settings, store, manager = make_manager(tmp_path)
+    upload_root = settings.uploads_dir
+    upload_root.mkdir(parents=True, exist_ok=True)
+    referenced_dir = upload_root / "referenced"
+    referenced_dir.mkdir()
+    referenced_file = referenced_dir / "people.vcf"
+    referenced_file.write_text("people")
+    orphan_dir = upload_root / "orphan"
+    orphan_dir.mkdir()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_file = outside_dir / "keep.txt"
+    outside_file.write_text("outside")
+    outside_link = upload_root / "outside-link"
+    outside_link.symlink_to(outside_dir, target_is_directory=True)
+    config = config_with_contacts()
+    config.endpoints["contacts"]["source"] = Endpoint("file", files=[str(referenced_file)])
+    completed_job(manager, store, config)
+    manager._scheduler_loop = lambda: None
+
+    manager.start()
+    manager.stop()
+
+    assert referenced_dir.exists()
+    assert referenced_file.exists()
+    assert not orphan_dir.exists()
+    assert outside_file.exists()
+    assert outside_link.is_symlink()
+
+
 def test_web_dashboard_detail_validation_and_secret_redaction(tmp_path):
     settings, store, manager = make_manager(tmp_path)
     app = create_app(settings, store, manager)
@@ -730,6 +761,42 @@ def test_edit_confirmation_preserves_new_credentials_and_uploads(tmp_path):
     assert new_file.exists()
     assert not old_dir.exists()
     assert set(settings.uploads_dir.iterdir()) == {new_file.parent}
+
+
+def test_edit_page_discards_pending_uploads_for_go_back(tmp_path):
+    settings, store, manager = make_manager(tmp_path)
+    job_id = completed_job(manager, store, config_with_contacts())
+    store.ledger_mark(job_id, "contacts", "contact-1", db.DONE)
+    manager._schedule_once = lambda: None
+    app = create_app(settings, store, manager)
+    data = edit_form_data(
+        contacts_source_type="file",
+        contacts_dest_type="carddav",
+        contacts_dest_url="https://new-contacts.example",
+        contacts_dest_username="alice",
+        contacts_dest_password="new-secret",
+    )
+
+    with TestClient(app) as client:
+        confirmation = client.post(
+            f"/jobs/{job_id}/edit",
+            data=data,
+            files={"contacts_source_files": ("replacement.vcf", b"new", "text/vcard")},
+        )
+        assert confirmation.status_code == 200
+        assert f'href="/jobs/{job_id}/edit"' in confirmation.text
+        token = next(iter(app.state.pending_edits))
+        pending = app.state.pending_edits[token]
+        new_file = Path(pending.config.endpoints["contacts"]["source"].files[0])
+        assert new_file.exists()
+
+        edit_page = client.get(f"/jobs/{job_id}/edit")
+
+    assert edit_page.status_code == 200
+    assert app.state.pending_edits == {}
+    assert not new_file.parent.exists()
+    saved = manager._load_config(store.get_job(job_id), resolve=False)
+    assert saved.endpoints["contacts"]["dest"].url == "https://contacts.dest"
 
 
 def test_unknown_or_expired_confirmation_token_does_not_save(tmp_path):

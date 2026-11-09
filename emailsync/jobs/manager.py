@@ -135,6 +135,7 @@ class JobManager:
             if self._scheduler and self._scheduler.is_alive():
                 return
             self._stop.clear()
+            self._sweep_unreferenced_upload_dirs()
             for job in self.store.list_jobs():
                 if job["status"] in _ACTIVE:
                     if self.settings.auto_resume:
@@ -197,6 +198,35 @@ class JobManager:
                             continue
                         upload_dirs.add(parent)
         return upload_dirs
+
+    def _sweep_unreferenced_upload_dirs(self):
+        upload_root = self.settings.uploads_dir.resolve()
+        if not upload_root.is_dir():
+            return
+        referenced = set()
+        for job in self.store.list_jobs():
+            referenced.update(self._upload_dirs(self._load_config(job, resolve=False)))
+        referenced_children = set()
+        for directory in referenced:
+            try:
+                relative = directory.resolve().relative_to(upload_root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if relative.parts:
+                referenced_children.add(upload_root / relative.parts[0])
+        try:
+            children = list(upload_root.iterdir())
+        except OSError:
+            return
+        for child in children:
+            try:
+                resolved = child.resolve()
+                if resolved.parent != upload_root or not resolved.is_dir():
+                    continue
+                if resolved not in referenced_children:
+                    shutil.rmtree(resolved, ignore_errors=True)
+            except (OSError, RuntimeError):
+                continue
 
     def _other_job_upload_dirs(self, job_id):
         upload_dirs = set()

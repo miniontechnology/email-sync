@@ -346,6 +346,10 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
     @app.get("/jobs/{job_id}/edit", response_class=HTMLResponse)
     async def edit_job_form(request: Request, job_id: int):
         _purge_pending_edits()
+        for token, pending in list(app.state.pending_edits.items()):
+            if pending.job_id == job_id:
+                app.state.pending_edits.pop(token, None)
+                _remove_upload_dirs(pending.upload_dirs)
         job = store.get_job(job_id)
         if not job:
             return HTMLResponse("Job not found", status_code=404)
