@@ -225,6 +225,24 @@ def test_dav_dry_run_missing_calendars_use_independent_indexes(tmp_path):
     assert store.ledger_items(job_id, "calendars", limit=None) == []
 
 
+def test_dav_dry_run_case_variant_calendars_share_index(tmp_path):
+    store = db.Store(tmp_path / "calendar.db")
+    job_id = store.create_job("calendar", {}, None)
+    item = DavItem("same-event", b"calendar event", "event-fingerprint")
+    state = State({"Work": [item], "work": [item]}, {}, collections=[])
+
+    result = migrate(store, job_id, "calendars", state, Options(dry_run=True))
+
+    assert result.status == "completed"
+    task = store.get_tasks(job_id)[0]
+    assert task["copied"] == 1
+    assert task["skipped"] == 1
+    assert state.item_requests == []
+    assert state.create_calls == 0
+    assert state.put_calls == 0
+    assert store.ledger_items(job_id, "calendars", limit=None) == []
+
+
 def test_jmap_dav_dry_run_with_no_collections_does_not_request_home(tmp_path, monkeypatch):
     calls = []
 

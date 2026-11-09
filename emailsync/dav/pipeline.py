@@ -191,7 +191,7 @@ class DavMigration:
             target = self._retry(lambda: dest.create_collection(source_name or "Calendar"), dest)
         if target:
             return target
-        href = f"{dest.home}#dry-run:{source_name}" if self.options.dry_run else dest.home
+        href = f"{dest.home}#dry-run:{source_name.casefold()}" if self.options.dry_run else dest.home
         return {"href": href, "displayname": source_name or "Calendar"}
 
     def _record_failure(self, scope, key, uid, target, error):
