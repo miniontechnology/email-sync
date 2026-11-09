@@ -21,9 +21,9 @@ from emailsync.crypto import SecretBox
 from emailsync.dav.jmap_dest import JmapDavDestination
 from emailsync.dav.source import DavSource
 from emailsync.db import Store
-from emailsync.jobs.manager import JobManager
+from emailsync.jobs.manager import JobManager, ResetConfirmationRequired, merge_saved_settings
 from emailsync.mail.dest import make_dest
-from emailsync.mail.folders import parse_folder_map
+from emailsync.mail.folders import format_folder_map, parse_folder_map
 from emailsync.mail.source import make_source
 from emailsync.oauth import OAuthService, TokenManager
 from emailsync.options import Endpoint, JobConfig, Options
@@ -35,12 +35,72 @@ templates = Jinja2Templates(directory=str(PACKAGE_DIR / "templates"))
 
 def _format_job(job):
     config = job["config"]
+    options = config.get("options") or {}
     summaries = []
     for kind, pair in config.get("endpoints", {}).items():
         source, dest = pair.get("source"), pair.get("dest")
         if source and dest:
             summaries.append(f"{kind}: {source.get('type', '?')} → {dest.get('type', '?')}")
-    return {**job, "summary": " · ".join(summaries) or "No configured migrations"}
+    return {
+        **job,
+        "summary": " · ".join(summaries) or "No configured migrations",
+        "dry_run": bool(options.get("dry_run")),
+        "editable": job["status"] not in ("running", "queued"),
+    }
+
+
+def _config_to_values(public_config):
+    values = {"name": public_config.get("name", "")}
+    endpoints = public_config.get("endpoints") or {}
+    endpoint_fields = ("type", "account_id", "host", "port", "security", "url", "username")
+    for kind in ("mail", "contacts", "calendars"):
+        pair = endpoints.get(kind) or {}
+        for side in ("source", "dest"):
+            prefix = f"{kind}_{side}_"
+            endpoint = pair.get(side) or {}
+            values[prefix + "type"] = endpoint.get("type") or "none"
+            for field in endpoint_fields[1:]:
+                value = endpoint.get(field, "")
+                values[prefix + field] = "" if value is None else value
+            values[prefix + "insecure_tls"] = "on" if endpoint.get("insecure_tls") else ""
+            values[prefix + "files_existing"] = ", ".join(
+                Path(filename).name for filename in endpoint.get("files") or []
+            )
+
+    options = Options.from_dict(public_config.get("options"))
+    values.update(
+        {
+            "workers": options.workers,
+            "dedup_scope": options.dedup_scope,
+            "archive_target": options.archive_target,
+            "since": options.since,
+            "sync_interval_minutes": options.sync_interval_minutes,
+            "folder_map": format_folder_map(options.folder_map),
+            "exclude_folders": "\n".join(options.exclude_folders),
+        }
+    )
+    for field in (
+        "include_spam",
+        "include_trash",
+        "skip_deleted",
+        "gmail_important_as_folder",
+        "dry_run",
+        "verify",
+        "sync_flags_labels",
+        "remove_stale_labels",
+    ):
+        if getattr(options, field):
+            values[field] = "on"
+    return values
+
+
+def _safe_form_values(form):
+    return {
+        key: value
+        for key, value in form.items()
+        if not key.endswith(("_password", "_token", "_client_secret"))
+        and not isinstance(value, StarletteUploadFile)
+    }
 
 
 def _reauth_account_id(job, store):
@@ -119,10 +179,10 @@ def _endpoint_from_form(form, kind, side, uploads_dir, mail_endpoint=None, uploa
     )
 
 
-async def _build_config(request, settings):
+async def _build_config(request, settings, upload_dirs=None):
     form = await request.form()
     upload_dir = settings.uploads_dir
-    upload_dirs = set()
+    upload_dirs = upload_dirs if upload_dirs is not None else set()
     endpoints = {kind: {"source": None, "dest": None} for kind in ("mail", "contacts", "calendars")}
     for kind in endpoints:
         for side in ("source", "dest"):
@@ -136,6 +196,7 @@ async def _build_config(request, settings):
         include_spam=bool(form.get("include_spam")),
         include_trash=bool(form.get("include_trash")),
         skip_deleted=bool(form.get("skip_deleted")),
+        gmail_important_as_folder=bool(form.get("gmail_important_as_folder")),
         archive_target=str(form.get("archive_target") or ""),
         folder_map=parse_folder_map(str(form.get("folder_map") or "")),
         exclude_folders=[
@@ -153,11 +214,7 @@ async def _build_config(request, settings):
         endpoints=endpoints,
         options=options,
     )
-    values = {
-        key: value
-        for key, value in form.items()
-        if not key.endswith(("_password", "_token")) and not isinstance(value, StarletteUploadFile)
-    }
+    values = _safe_form_values(form)
     return config, values, upload_dirs
 
 
@@ -207,14 +264,22 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
         return templates.TemplateResponse(
             request=request,
             name="new_job.html",
-            context={"errors": [], "values": {}, "accounts": store.list_accounts()},
+            context={
+                "errors": [],
+                "values": {},
+                "accounts": store.list_accounts(),
+                "editing": False,
+                "form_action": "/jobs",
+            },
         )
 
     @app.post("/jobs", response_class=HTMLResponse)
     async def create_job(request: Request):
         upload_dirs = set()
+        values = {}
         try:
-            config, values, upload_dirs = await _build_config(request, settings)
+            values = _safe_form_values(await request.form())
+            config, values, _upload_dirs = await _build_config(request, settings, upload_dirs)
             if errors := config.validate():
                 for directory in upload_dirs:
                     shutil.rmtree(directory, ignore_errors=True)
@@ -231,9 +296,93 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             return templates.TemplateResponse(
                 request=request,
                 name="new_job.html",
-                context={"errors": [str(exc)], "values": {}, "accounts": store.list_accounts()},
+                context={
+                    "errors": [str(exc)],
+                    "values": values,
+                    "accounts": store.list_accounts(),
+                    "editing": False,
+                    "form_action": "/jobs",
+                },
                 status_code=422,
             )
+        return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
+    @app.get("/jobs/{job_id}/edit", response_class=HTMLResponse)
+    async def edit_job_form(request: Request, job_id: int):
+        job = store.get_job(job_id)
+        if not job:
+            return HTMLResponse("Job not found", status_code=404)
+        formatted = _format_job(job)
+        if not formatted["editable"]:
+            return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+        return templates.TemplateResponse(
+            request=request,
+            name="new_job.html",
+            context={
+                "errors": [],
+                "values": _config_to_values(job["config"]),
+                "accounts": store.list_accounts(),
+                "editing": True,
+                "form_action": f"/jobs/{job_id}/edit",
+                "job_id": job_id,
+                "reset_kinds": [],
+            },
+        )
+
+    @app.post("/jobs/{job_id}/edit", response_class=HTMLResponse)
+    async def edit_job_form_post(request: Request, job_id: int):
+        upload_dirs = set()
+        values = {}
+        form = await request.form()
+        values = _safe_form_values(form)
+        context = {
+            "accounts": store.list_accounts(),
+            "editing": True,
+            "form_action": f"/jobs/{job_id}/edit",
+            "job_id": job_id,
+        }
+        try:
+            config, values, _upload_dirs = await _build_config(request, settings, upload_dirs)
+            form = await request.form()
+            manager.edit_job(job_id, config, confirm_reset=bool(form.get("confirm_reset")))
+        except ResetConfirmationRequired as exc:
+            for directory in upload_dirs:
+                shutil.rmtree(directory, ignore_errors=True)
+            return templates.TemplateResponse(
+                request=request,
+                name="new_job.html",
+                context={
+                    **context,
+                    "errors": [],
+                    "values": values,
+                    "reset_kinds": exc.kinds,
+                },
+                status_code=422,
+            )
+        except KeyError:
+            for directory in upload_dirs:
+                shutil.rmtree(directory, ignore_errors=True)
+            return HTMLResponse("Job not found", status_code=404)
+        except (ValueError, OSError) as exc:
+            for directory in upload_dirs:
+                shutil.rmtree(directory, ignore_errors=True)
+            return templates.TemplateResponse(
+                request=request,
+                name="new_job.html",
+                context={
+                    **context,
+                    "errors": [str(exc)],
+                    "values": values,
+                    "reset_kinds": [],
+                },
+                status_code=422,
+            )
+        except Exception:
+            for directory in upload_dirs:
+                shutil.rmtree(directory, ignore_errors=True)
+            raise
+        if form.get("then_run"):
+            manager.resume(job_id)
         return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)
@@ -272,6 +421,16 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             },
         )
 
+    @app.post("/jobs/{job_id}/run-real")
+    async def run_for_real(job_id: int):
+        try:
+            manager.run_for_real(job_id)
+        except KeyError:
+            return HTMLResponse("Job not found", status_code=404)
+        except ValueError as exc:
+            return HTMLResponse(str(exc), status_code=400)
+        return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
     @app.post("/jobs/{job_id}/{action}")
     async def job_action(job_id: int, action: str):
         try:
@@ -304,6 +463,25 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
         if not endpoint:
             return JSONResponse({"ok": False, "detail": "Endpoint is not configured.", "folders": []}, 422)
         options = Options.from_dict(body.get("options"))
+        if body.get("job_id") is not None:
+            try:
+                job = store.get_job(int(body["job_id"]))
+                if not job:
+                    return JSONResponse({"ok": False, "detail": "Job not found.", "folders": []}, 404)
+                endpoints = {
+                    configured_kind: {"source": None, "dest": None}
+                    for configured_kind in ("mail", "contacts", "calendars")
+                }
+                if kind not in endpoints or side not in ("source", "dest"):
+                    return JSONResponse(
+                        {"ok": False, "detail": "Invalid migration endpoint.", "folders": []}, 422
+                    )
+                endpoints[kind][side] = endpoint
+                test_config = JobConfig("", endpoints, options)
+                merge_saved_settings(test_config, manager._load_config(job, resolve=False))
+                endpoint = test_config.endpoints[kind][side]
+            except (TypeError, ValueError) as exc:
+                return JSONResponse({"ok": False, "detail": str(exc), "folders": []}, 400)
         try:
             endpoint = resolve_endpoint(endpoint, load_accounts(store, secretbox), token_manager)
         except Exception as exc:

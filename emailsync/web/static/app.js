@@ -81,7 +81,8 @@ document.addEventListener("DOMContentLoaded", () => {
       button.disabled = true; result.textContent = "Testing connection…"; result.className = "test-result";
       try {
         const response = await fetch("/api/test", {method: "POST", headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({kind: button.dataset.kind, side: button.dataset.side, endpoint})});
+          body: JSON.stringify({kind: button.dataset.kind, side: button.dataset.side, endpoint,
+            job_id: form.dataset.jobId || null})});
         const data = await response.json();
         result.classList.add(data.ok ? "success" : "failure");
         result.textContent = data.detail + (data.folders?.length ? ` · ${data.folders.map(x => x.source).join(", ")}` : "");

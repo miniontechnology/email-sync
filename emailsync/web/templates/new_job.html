@@ -1,14 +1,22 @@
 {% extends "base.html" %}
-{% block title %}New migration{% endblock %}
+{% set editing = editing|default(false) %}
+{% set form_action = form_action|default('/jobs') %}
+{% block title %}{{ "Edit migration" if editing else "New migration" }}{% endblock %}
 {% block content %}
 <div class="page-heading compact">
-  <div><p class="eyebrow">NEW MIGRATION</p><h1>Set up a migration</h1><p class="lead">Credentials are encrypted at rest and never shown again.</p></div>
-  <a class="button secondary" href="/">Cancel</a>
+  <div><p class="eyebrow">{{ "EDIT MIGRATION" if editing else "NEW MIGRATION" }}</p><h1>{{ "Edit migration" if editing else "Set up a migration" }}</h1><p class="lead">Credentials are encrypted at rest and never shown again.</p></div>
+  <a class="button secondary" href="{{ '/jobs/' ~ job_id if editing else '/' }}">Cancel</a>
 </div>
 {% if errors %}
 <div class="alert error"><strong>Please review these details</strong><ul>{% for error in errors %}<li>{{ error }}</li>{% endfor %}</ul></div>
 {% endif %}
-<form action="/jobs" method="post" enctype="multipart/form-data" class="form-stack">
+<form action="{{ form_action }}" method="post" enctype="multipart/form-data" class="form-stack" {% if editing %}data-job-id="{{ job_id }}"{% endif %}>
+  {% if reset_kinds %}
+  <div class="alert warning">
+    <p>Changing the source or destination clears the copy records for: {{ reset_kinds|join(", ") }}. Already-copied items will be matched against the destination again; nothing is deleted.</p>
+    <label class="check-field"><input type="checkbox" name="confirm_reset" value="1" required {% if values.get('confirm_reset') %}checked{% endif %}><span>Confirm clearing these copy records</span></label>
+  </div>
+  {% endif %}
   <section class="panel">
     <div class="section-heading"><div><h2>Basics</h2><p>Name this migration so it’s easy to find later.</p></div></div>
     <label class="field narrow"><span>Migration name</span><input name="name" required value="{{ values.get('name','') }}" placeholder="Gmail to Stalwart"></label>
@@ -63,11 +71,11 @@
           </div>
           <div class="credential-fields">
             <label class="field"><span>Username</span><input name="{{ kind }}_{{ side }}_username" value="{{ values.get(kind ~ '_' ~ side ~ '_username','') }}" autocomplete="username"></label>
-            <label class="field"><span>Password</span><input type="password" name="{{ kind }}_{{ side }}_password" autocomplete="new-password" placeholder="Stored securely"></label>
-            {% if side == "dest" %}<label class="field"><span>JMAP token (optional)</span><input type="password" name="{{ kind }}_{{ side }}_token" autocomplete="new-password"></label>{% endif %}
+            <label class="field"><span>Password</span><input type="password" name="{{ kind }}_{{ side }}_password" autocomplete="new-password" placeholder="{{ 'Leave blank to keep the saved password' if editing else 'Stored securely' }}"></label>
+            {% if side == "dest" %}<label class="field"><span>JMAP token (optional)</span><input type="password" name="{{ kind }}_{{ side }}_token" autocomplete="new-password" placeholder="{{ 'Leave blank to keep the saved token' if editing else '' }}"></label>{% endif %}
           </div>
-          <div class="file-fields"><label class="field"><span>Choose files</span><input type="file" name="{{ kind }}_{{ side }}_files" multiple accept=".vcf,.ics,.zip"><small>Google Takeout exports are supported.</small></label></div>
-          <label class="check-field"><input type="checkbox" name="{{ kind }}_{{ side }}_insecure_tls"><span>Allow self-signed TLS certificates</span></label>
+          <div class="file-fields"><label class="field"><span>Choose files</span><input type="file" name="{{ kind }}_{{ side }}_files" multiple accept=".vcf,.ics,.zip"><small>Google Takeout exports are supported.</small>{% if editing and values.get(kind ~ '_' ~ side ~ '_files_existing') %}<small>Currently: {{ values.get(kind ~ '_' ~ side ~ '_files_existing') }} — choose files to replace them</small>{% endif %}</label></div>
+          <label class="check-field"><input type="checkbox" name="{{ kind }}_{{ side }}_insecure_tls" {% if values.get(kind ~ '_' ~ side ~ '_insecure_tls') %}checked{% endif %}><span>Allow self-signed TLS certificates</span></label>
         </div>
         <div class="test-result" aria-live="polite"></div>
       </fieldset>
@@ -90,6 +98,7 @@
     <div class="checks-row">
       <label class="check-field"><input type="checkbox" name="include_spam" {% if values.get('include_spam') %}checked{% endif %}><span>Include spam</span></label>
       <label class="check-field"><input type="checkbox" name="include_trash" {% if values.get('include_trash') %}checked{% endif %}><span>Include trash</span></label>
+      <label class="check-field"><input type="checkbox" name="gmail_important_as_folder" {% if values.get('gmail_important_as_folder') %}checked{% endif %}><span>Import Gmail Important as a folder</span></label>
       <label class="check-field"><input type="checkbox" name="skip_deleted" {% if not values or values.get('skip_deleted') %}checked{% endif %}><span>Skip deleted mail</span></label>
       <label class="check-field"><input type="checkbox" name="dry_run" {% if values.get('dry_run') %}checked{% endif %}><span>Dry run</span></label>
       <label class="check-field"><input type="checkbox" name="verify" {% if not values or values.get('verify') %}checked{% endif %}><span>Verify copied mail</span></label>
@@ -97,6 +106,6 @@
       <label class="check-field"><input type="checkbox" name="remove_stale_labels" {% if values.get('remove_stale_labels') %}checked{% endif %}><span>Also remove from folders whose label was removed</span></label>
     </div>
   </section>
-  <div class="form-actions"><a class="button secondary" href="/">Cancel</a><button class="button primary" type="submit">Create migration</button></div>
+  <div class="form-actions"><a class="button secondary" href="{{ '/jobs/' ~ job_id if editing else '/' }}">Cancel</a>{% if editing %}<button class="button secondary" type="submit">Save</button><button class="button primary" type="submit" name="then_run" value="1">Save and run</button>{% else %}<button class="button primary" type="submit">Create migration</button>{% endif %}</div>
 </form>
 {% endblock %}

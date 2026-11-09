@@ -404,9 +404,12 @@ class Store:
         )
         return [dict(r) for r in rows]
 
-    def ledger_reset(self, job_id: int) -> None:
+    def ledger_reset(self, job_id: int, kind: str | None = None) -> None:
         with self.write() as conn:
-            conn.execute("DELETE FROM ledger WHERE job_id=?", (job_id,))
+            if kind is None:
+                conn.execute("DELETE FROM ledger WHERE job_id=?", (job_id,))
+            else:
+                conn.execute("DELETE FROM ledger WHERE job_id=? AND kind=?", (job_id, kind))
 
     # -- events ------------------------------------------------------------------------------
     def add_event(self, job_id: int, level: str, message: str) -> None:

@@ -3,7 +3,7 @@
   {% for job in jobs %}
   <a class="job-card" href="/jobs/{{ job.id }}">
     <div class="job-card-main">
-      <div class="job-title-row"><h2>{{ job.name }}</h2><span class="badge badge-{{ job.status }}">{{ job.status|replace('_',' ') }}</span></div>
+      <div class="job-title-row"><h2>{{ job.name }}</h2><span class="badge badge-{{ job.status }}">{{ job.status|replace('_',' ') }}</span>{% if job.dry_run %}<span class="badge">Dry run</span>{% endif %}</div>
       <p class="muted">{{ job.summary }}</p>
       {% if job.last_error %}<p class="error-text">{{ job.last_error }}</p>{% endif %}
       {% if job.tasks %}
