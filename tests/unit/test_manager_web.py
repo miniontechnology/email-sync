@@ -9,7 +9,7 @@ from emailsync.config import Settings
 from emailsync.crypto import SecretBox
 from emailsync.db import Store
 from emailsync.jobs.control import TaskResult
-from emailsync.jobs.manager import JobManager, ResetConfirmationRequired
+from emailsync.jobs.manager import JobManager, ResetConfirmationRequired, merge_saved_settings
 from emailsync.options import Endpoint, JobConfig, Options
 from emailsync.web.app import create_app
 
@@ -510,33 +510,77 @@ def test_edit_preserves_options_not_in_the_form(tmp_path):
     assert saved.options.dav_match_fingerprint is False
 
 
-def test_edit_preserves_separate_dav_password_and_updates_inherited_password(tmp_path):
+def test_edit_preserves_separate_dav_credentials_and_updates_inherited_credentials(tmp_path):
     settings, store, manager = make_manager(tmp_path)
     separate = config_with_contacts("mail-old")
     separate.endpoints["contacts"]["dest"].password = "carddav-own"
     separate_id = completed_job(manager, store, separate)
     inherited_id = completed_job(manager, store, config_with_contacts("mail-old"))
+    username_id = completed_job(manager, store, config_with_contacts("mail-old"))
+    explicit_id = completed_job(manager, store, config_with_contacts("mail-old"))
+    changed_url_id = completed_job(manager, store, config_with_contacts("mail-old"))
     manager._schedule_once = lambda: None
     app = create_app(settings, store, manager)
-    form = edit_form_data(
-        mail_dest_password="mail-new",
-        contacts_source_type="carddav",
-        contacts_source_url="https://contacts.source",
-        contacts_source_username="alice",
-        contacts_dest_type="carddav",
-        contacts_dest_url="https://contacts.dest",
-        contacts_dest_username="alice",
-    )
+
+    def form_data(**overrides):
+        return edit_form_data(
+            contacts_source_type="carddav",
+            contacts_source_url="https://contacts.source",
+            contacts_source_username="alice",
+            contacts_dest_type="carddav",
+            contacts_dest_url="https://contacts.dest",
+            contacts_dest_username="alice",
+            **overrides,
+        )
 
     with TestClient(app) as client:
-        for job_id in (separate_id, inherited_id):
-            response = client.post(f"/jobs/{job_id}/edit", data=form, follow_redirects=False)
-            assert response.status_code == 303
+        separate_response = client.post(
+            f"/jobs/{separate_id}/edit",
+            data=form_data(mail_dest_password="mail-new"),
+            follow_redirects=False,
+        )
+        inherited_response = client.post(
+            f"/jobs/{inherited_id}/edit",
+            data=form_data(mail_dest_password="mail-new"),
+            follow_redirects=False,
+        )
+        username_response = client.post(
+            f"/jobs/{username_id}/edit",
+            data=form_data(mail_dest_username="bob", mail_dest_password="mail-new"),
+            follow_redirects=False,
+        )
+        explicit_response = client.post(
+            f"/jobs/{explicit_id}/edit",
+            data=form_data(
+                mail_dest_password="mail-new",
+                contacts_dest_password="typed-dav",
+            ),
+            follow_redirects=False,
+        )
+
+    assert separate_response.status_code == 303
+    assert inherited_response.status_code == 303
+    assert username_response.status_code == 303
+    assert explicit_response.status_code == 303
 
     separate_saved = manager._load_config(store.get_job(separate_id), resolve=False)
     inherited_saved = manager._load_config(store.get_job(inherited_id), resolve=False)
+    username_saved = manager._load_config(store.get_job(username_id), resolve=False)
+    explicit_saved = manager._load_config(store.get_job(explicit_id), resolve=False)
     assert separate_saved.endpoints["contacts"]["dest"].password == "carddav-own"
     assert inherited_saved.endpoints["contacts"]["dest"].password == "mail-new"
+    assert username_saved.endpoints["contacts"]["dest"].username == "bob"
+    assert username_saved.endpoints["contacts"]["dest"].password == "mail-new"
+    assert explicit_saved.endpoints["contacts"]["dest"].password == "typed-dav"
+
+    previous = manager._load_config(store.get_job(changed_url_id), resolve=False)
+    changed = manager._load_config(store.get_job(changed_url_id), resolve=False)
+    changed.endpoints["mail"]["dest"].password = "mail-new"
+    changed.endpoints["contacts"]["dest"].url = "https://contacts.changed"
+    changed.endpoints["contacts"]["dest"].password = ""
+    errors = merge_saved_settings(changed, previous)
+    assert any("Contacts dest: enter the password again" in error for error in errors)
+    assert changed.endpoints["contacts"]["dest"].password == ""
 
 
 def test_edit_reset_warning_requires_confirmation_then_clears_records(tmp_path):

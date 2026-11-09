@@ -43,6 +43,14 @@ def _same_server(new, old):
     )
 
 
+def _same_server_ignoring_username(new, old):
+    return (
+        new.type == old.type
+        and new.host.lower() == old.host.lower()
+        and new.url.rstrip("/").lower() == old.url.rstrip("/").lower()
+    )
+
+
 def merge_saved_settings(config: JobConfig, old: JobConfig) -> list[str]:
     errors = []
     ordered_kinds = sorted(config.endpoints, key=lambda kind: kind != "mail")
@@ -57,24 +65,28 @@ def merge_saved_settings(config: JobConfig, old: JobConfig) -> list[str]:
                 if not endpoint.files:
                     endpoint.files = list(previous.files)
                 continue
+            if kind != "mail" and (endpoint.password or endpoint.token):
+                continue
             if kind != "mail":
                 previous_mail = (old.endpoints.get("mail") or {}).get(side)
                 current_mail = (config.endpoints.get("mail") or {}).get(side)
                 inherited_credentials = (
                     previous_mail is not None
-                    and (previous.password or previous.token)
                     and previous.password == previous_mail.password
                     and previous.token == previous_mail.token
+                    and previous.username == previous_mail.username
                 )
                 current_mail_has_credentials = current_mail and (current_mail.password or current_mail.token)
-                if inherited_credentials and current_mail_has_credentials:
-                    inherited_username = previous.username == previous_mail.username
-                    if _same_server(endpoint, previous) or (not endpoint.username and inherited_username):
-                        if not endpoint.username and inherited_username:
-                            endpoint.username = current_mail.username
-                        endpoint.password = current_mail.password
-                        endpoint.token = current_mail.token
-                        continue
+                if (
+                    inherited_credentials
+                    and current_mail_has_credentials
+                    and _same_server_ignoring_username(endpoint, previous)
+                    and (not endpoint.username or endpoint.username == previous.username)
+                ):
+                    endpoint.username = current_mail.username
+                    endpoint.password = current_mail.password
+                    endpoint.token = current_mail.token
+                    continue
             if endpoint.password or endpoint.token or not (previous.password or previous.token):
                 continue
             if _same_server(endpoint, previous):
