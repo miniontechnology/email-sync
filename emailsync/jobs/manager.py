@@ -166,6 +166,13 @@ class JobManager:
                         upload_dirs.add(parent)
         return upload_dirs
 
+    def _other_job_upload_dirs(self, job_id):
+        upload_dirs = set()
+        for other in self.store.list_jobs():
+            if other["id"] != job_id:
+                upload_dirs.update(self._upload_dirs(self._load_config(other, resolve=False)))
+        return upload_dirs
+
     def edit_job(self, job_id: int, config: JobConfig, *, confirm_reset: bool = False) -> list[str]:
         with self._lock:
             job = self.store.get_job(job_id)
@@ -202,7 +209,10 @@ class JobManager:
                     "info",
                     f"Copy records for {kind} cleared because its source or destination changed",
                 )
-            for directory in self._upload_dirs(old) - self._upload_dirs(config):
+            unused_upload_dirs = (
+                self._upload_dirs(old) - self._upload_dirs(config) - self._other_job_upload_dirs(job_id)
+            )
+            for directory in unused_upload_dirs:
                 shutil.rmtree(directory, ignore_errors=True)
             self.store.add_event(job_id, "info", "Settings updated")
             return changed_kinds
@@ -279,7 +289,7 @@ class JobManager:
             if thread and thread is not threading.current_thread():
                 thread.join()
         config = self._load_config(job, resolve=False)
-        upload_dirs = self._upload_dirs(config)
+        upload_dirs = self._upload_dirs(config) - self._other_job_upload_dirs(job_id)
         self.store.delete_job(job_id)
         for directory in upload_dirs:
             shutil.rmtree(directory, ignore_errors=True)

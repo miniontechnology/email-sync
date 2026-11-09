@@ -216,6 +216,43 @@ def test_edit_file_endpoint_keeps_or_replaces_uploads_safely(tmp_path):
     assert new_file.exists()
 
 
+def test_editing_and_deleting_clone_preserves_original_uploads(tmp_path):
+    settings, store, manager = make_manager(tmp_path)
+    old_dir = settings.uploads_dir / "shared"
+    old_dir.mkdir(parents=True)
+    old_file = old_dir / "contacts.vcf"
+    old_file.write_text("original")
+    config = JobConfig(
+        "File migration",
+        {
+            "mail": {"source": None, "dest": None},
+            "contacts": {
+                "source": Endpoint("file", files=[str(old_file)]),
+                "dest": Endpoint("carddav", url="https://contacts.dest", username="alice", password="secret"),
+            },
+            "calendars": {"source": None, "dest": None},
+        },
+        Options(verify=False),
+    )
+    original_id = completed_job(manager, store, config)
+    clone_id = manager.clone(original_id)
+    store.update_job(clone_id, status="paused")
+
+    new_dir = settings.uploads_dir / "clone"
+    new_dir.mkdir(parents=True)
+    new_file = new_dir / "replacement.vcf"
+    new_file.write_text("clone")
+    clone_config = manager._load_config(store.get_job(clone_id), resolve=False)
+    clone_config.endpoints["contacts"]["source"].files = [str(new_file)]
+    manager.edit_job(clone_id, clone_config)
+
+    assert old_file.exists()
+    assert new_file.exists()
+    assert manager.delete(clone_id)
+    assert old_file.exists()
+    assert not new_dir.exists()
+
+
 def test_run_for_real_flips_dry_run_and_queues_job(tmp_path):
     _settings, store, manager = make_manager(tmp_path)
     job_id = completed_job(manager, store, mail_config())
