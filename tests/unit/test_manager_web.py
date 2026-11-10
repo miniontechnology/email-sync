@@ -380,6 +380,37 @@ def test_web_dashboard_detail_validation_and_secret_redaction(tmp_path):
         assert client.get("/healthz").json() == {"ok": True}
 
 
+def test_completed_dry_run_fragment_includes_status_and_actions(tmp_path):
+    settings, store, manager = make_manager(tmp_path)
+    config = mail_config()
+    config.options.dry_run = True
+    job_id = completed_job(manager, store, config)
+
+    with TestClient(create_app(settings, store, manager)) as client:
+        response = client.get(f"/jobs/{job_id}/fragment")
+
+    assert response.status_code == 200
+    assert "badge-completed" in response.text
+    assert "Dry run" in response.text
+    assert f'href="/jobs/{job_id}/edit">Edit</a>' in response.text
+    assert "Run for real" in response.text
+
+
+def test_running_job_fragment_includes_pause_but_not_edit(tmp_path):
+    settings, store, manager = make_manager(tmp_path)
+    job_id = manager.create_job(mail_config())
+    manager._scheduler_loop = lambda: None
+
+    with TestClient(create_app(settings, store, manager)) as client:
+        store.update_job(job_id, status="running")
+        response = client.get(f"/jobs/{job_id}/fragment")
+
+    assert response.status_code == 200
+    assert "badge-running" in response.text
+    assert "Pause" in response.text
+    assert "Edit" not in response.text
+
+
 def test_contacts_jmap_destination_inherits_mail_jmap_url_and_token(tmp_path):
     class CapturingManager:
         config = None

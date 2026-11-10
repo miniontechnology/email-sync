@@ -18,10 +18,9 @@ document.addEventListener("DOMContentLoaded", () => {
   const detail = document.querySelector("#job-content");
   if (detail) setInterval(() => refresh(detail), 2000);
 
-  document.querySelectorAll("form[data-confirm]").forEach(form => {
-    form.addEventListener("submit", event => {
-      if (!window.confirm(form.dataset.confirm)) event.preventDefault();
-    });
+  document.addEventListener("submit", event => {
+    const form = event.target.closest("form[data-confirm]");
+    if (form && !window.confirm(form.dataset.confirm)) event.preventDefault();
   });
 
   const updateEndpoint = (prefix) => {
