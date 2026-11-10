@@ -1,10 +1,12 @@
 """FastAPI application and browser UI."""
 
 import re
+import secrets
 import shutil
 import time
 import uuid
 from contextlib import asynccontextmanager, nullcontext
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -21,9 +23,9 @@ from emailsync.crypto import SecretBox
 from emailsync.dav.jmap_dest import JmapDavDestination
 from emailsync.dav.source import DavSource
 from emailsync.db import Store
-from emailsync.jobs.manager import JobManager
+from emailsync.jobs.manager import JobManager, ResetConfirmationRequired, merge_saved_settings
 from emailsync.mail.dest import make_dest
-from emailsync.mail.folders import parse_folder_map
+from emailsync.mail.folders import format_folder_map, parse_folder_map
 from emailsync.mail.source import make_source
 from emailsync.oauth import OAuthService, TokenManager
 from emailsync.options import Endpoint, JobConfig, Options
@@ -31,16 +33,86 @@ from emailsync.providers import GOOGLE_CLIENT_REQUIRED, PROVIDER_PRESETS
 
 PACKAGE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(PACKAGE_DIR / "templates"))
+PENDING_EDIT_TTL_SECONDS = 30 * 60
+
+
+@dataclass
+class PendingEdit:
+    job_id: int
+    config: JobConfig
+    upload_dirs: set[Path]
+    then_run: bool
+    created: float
 
 
 def _format_job(job):
     config = job["config"]
+    options = config.get("options") or {}
     summaries = []
     for kind, pair in config.get("endpoints", {}).items():
         source, dest = pair.get("source"), pair.get("dest")
         if source and dest:
             summaries.append(f"{kind}: {source.get('type', '?')} → {dest.get('type', '?')}")
-    return {**job, "summary": " · ".join(summaries) or "No configured migrations"}
+    return {
+        **job,
+        "summary": " · ".join(summaries) or "No configured migrations",
+        "dry_run": bool(options.get("dry_run")),
+        "editable": job["status"] not in ("running", "queued"),
+    }
+
+
+def _config_to_values(public_config):
+    values = {"name": public_config.get("name", "")}
+    endpoints = public_config.get("endpoints") or {}
+    endpoint_fields = ("type", "account_id", "host", "port", "security", "url", "username")
+    for kind in ("mail", "contacts", "calendars"):
+        pair = endpoints.get(kind) or {}
+        for side in ("source", "dest"):
+            prefix = f"{kind}_{side}_"
+            endpoint = pair.get(side) or {}
+            values[prefix + "type"] = endpoint.get("type") or "none"
+            for field in endpoint_fields[1:]:
+                value = endpoint.get(field, "")
+                values[prefix + field] = "" if value is None else value
+            values[prefix + "insecure_tls"] = "on" if endpoint.get("insecure_tls") else ""
+            values[prefix + "files_existing"] = ", ".join(
+                Path(filename).name for filename in endpoint.get("files") or []
+            )
+
+    options = Options.from_dict(public_config.get("options"))
+    values.update(
+        {
+            "workers": options.workers,
+            "dedup_scope": options.dedup_scope,
+            "archive_target": options.archive_target,
+            "since": options.since,
+            "sync_interval_minutes": options.sync_interval_minutes,
+            "folder_map": format_folder_map(options.folder_map),
+            "exclude_folders": "\n".join(options.exclude_folders),
+        }
+    )
+    for field in (
+        "include_spam",
+        "include_trash",
+        "skip_deleted",
+        "gmail_important_as_folder",
+        "dry_run",
+        "verify",
+        "sync_flags_labels",
+        "remove_stale_labels",
+    ):
+        if getattr(options, field):
+            values[field] = "on"
+    return values
+
+
+def _safe_form_values(form):
+    return {
+        key: value
+        for key, value in form.items()
+        if not key.endswith(("_password", "_token", "_client_secret"))
+        and not isinstance(value, StarletteUploadFile)
+    }
 
 
 def _reauth_account_id(job, store):
@@ -68,7 +140,9 @@ def _progress(tasks):
     return tasks
 
 
-def _endpoint_from_form(form, kind, side, uploads_dir, mail_endpoint=None, upload_dirs=None):
+def _endpoint_from_form(
+    form, kind, side, uploads_dir, mail_endpoint=None, upload_dirs=None, inherit_mail_credentials=True
+):
     prefix = f"{kind}_{side}_"
     endpoint_type = str(form.get(prefix + "type") or "").strip()
     if endpoint_type in ("", "none"):
@@ -91,7 +165,11 @@ def _endpoint_from_form(form, kind, side, uploads_dir, mail_endpoint=None, uploa
         files.append(str(path))
     username = str(form.get(prefix + "username") or "").strip()
     password = str(form.get(prefix + "password") or "")
-    if endpoint_type in ("carddav", "caldav", "jmap") and (not username or not password):
+    if (
+        inherit_mail_credentials
+        and endpoint_type in ("carddav", "caldav", "jmap")
+        and (not username or not password)
+    ):
         username = username or (mail_endpoint.username if mail_endpoint else "")
         password = password or (mail_endpoint.password if mail_endpoint else "")
     token = str(form.get(prefix + "token") or "")
@@ -102,7 +180,7 @@ def _endpoint_from_form(form, kind, side, uploads_dir, mail_endpoint=None, uploa
         username = password = token = ""
     if endpoint_type == "jmap" and mail_endpoint and mail_endpoint.type == "jmap":
         url = url or mail_endpoint.url
-        if not password:
+        if inherit_mail_credentials and not password:
             token = token or mail_endpoint.token
     return Endpoint(
         type=endpoint_type,
@@ -119,16 +197,22 @@ def _endpoint_from_form(form, kind, side, uploads_dir, mail_endpoint=None, uploa
     )
 
 
-async def _build_config(request, settings):
+async def _build_config(request, settings, upload_dirs=None, inherit_mail_credentials=True):
     form = await request.form()
     upload_dir = settings.uploads_dir
-    upload_dirs = set()
+    upload_dirs = upload_dirs if upload_dirs is not None else set()
     endpoints = {kind: {"source": None, "dest": None} for kind in ("mail", "contacts", "calendars")}
     for kind in endpoints:
         for side in ("source", "dest"):
             mail_endpoint = endpoints["mail"][side] if kind != "mail" else None
             endpoints[kind][side] = _endpoint_from_form(
-                form, kind, side, upload_dir, mail_endpoint, upload_dirs
+                form,
+                kind,
+                side,
+                upload_dir,
+                mail_endpoint,
+                upload_dirs,
+                inherit_mail_credentials=inherit_mail_credentials,
             )
     options = Options(
         workers=int(form.get("workers") or 4),
@@ -136,6 +220,7 @@ async def _build_config(request, settings):
         include_spam=bool(form.get("include_spam")),
         include_trash=bool(form.get("include_trash")),
         skip_deleted=bool(form.get("skip_deleted")),
+        gmail_important_as_folder=bool(form.get("gmail_important_as_folder")),
         archive_target=str(form.get("archive_target") or ""),
         folder_map=parse_folder_map(str(form.get("folder_map") or "")),
         exclude_folders=[
@@ -153,11 +238,7 @@ async def _build_config(request, settings):
         endpoints=endpoints,
         options=options,
     )
-    values = {
-        key: value
-        for key, value in form.items()
-        if not key.endswith(("_password", "_token")) and not isinstance(value, StarletteUploadFile)
-    }
+    values = _safe_form_values(form)
     return config, values, upload_dirs
 
 
@@ -183,7 +264,19 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
     app.state.manager = manager
     app.state.secretbox = secretbox
     app.state.oauth = oauth
+    app.state.pending_edits = {}
     app.mount("/static", StaticFiles(directory=str(PACKAGE_DIR / "static")), name="static")
+
+    def _remove_upload_dirs(upload_dirs):
+        for directory in upload_dirs:
+            shutil.rmtree(directory, ignore_errors=True)
+
+    def _purge_pending_edits():
+        now = time.time()
+        for token, pending in list(app.state.pending_edits.items()):
+            if now - pending.created >= PENDING_EDIT_TTL_SECONDS:
+                app.state.pending_edits.pop(token, None)
+                _remove_upload_dirs(pending.upload_dirs)
 
     def _render_jobs(request):
         jobs = [_format_job(job) for job in store.list_jobs()]
@@ -207,14 +300,22 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
         return templates.TemplateResponse(
             request=request,
             name="new_job.html",
-            context={"errors": [], "values": {}, "accounts": store.list_accounts()},
+            context={
+                "errors": [],
+                "values": {},
+                "accounts": store.list_accounts(),
+                "editing": False,
+                "form_action": "/jobs",
+            },
         )
 
     @app.post("/jobs", response_class=HTMLResponse)
     async def create_job(request: Request):
         upload_dirs = set()
+        values = {}
         try:
-            config, values, upload_dirs = await _build_config(request, settings)
+            values = _safe_form_values(await request.form())
+            config, values, _upload_dirs = await _build_config(request, settings, upload_dirs)
             if errors := config.validate():
                 for directory in upload_dirs:
                     shutil.rmtree(directory, ignore_errors=True)
@@ -231,9 +332,139 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             return templates.TemplateResponse(
                 request=request,
                 name="new_job.html",
-                context={"errors": [str(exc)], "values": {}, "accounts": store.list_accounts()},
+                context={
+                    "errors": [str(exc)],
+                    "values": values,
+                    "accounts": store.list_accounts(),
+                    "editing": False,
+                    "form_action": "/jobs",
+                },
                 status_code=422,
             )
+        return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
+    @app.get("/jobs/{job_id}/edit", response_class=HTMLResponse)
+    async def edit_job_form(request: Request, job_id: int):
+        _purge_pending_edits()
+        for token, pending in list(app.state.pending_edits.items()):
+            if pending.job_id == job_id:
+                app.state.pending_edits.pop(token, None)
+                _remove_upload_dirs(pending.upload_dirs)
+        job = store.get_job(job_id)
+        if not job:
+            return HTMLResponse("Job not found", status_code=404)
+        formatted = _format_job(job)
+        if not formatted["editable"]:
+            return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+        return templates.TemplateResponse(
+            request=request,
+            name="new_job.html",
+            context={
+                "errors": [],
+                "values": _config_to_values(job["config"]),
+                "accounts": store.list_accounts(),
+                "editing": True,
+                "form_action": f"/jobs/{job_id}/edit",
+                "job_id": job_id,
+            },
+        )
+
+    @app.post("/jobs/{job_id}/edit", response_class=HTMLResponse)
+    async def edit_job_form_post(request: Request, job_id: int):
+        _purge_pending_edits()
+        upload_dirs = set()
+        values = {}
+        form = await request.form()
+        values = _safe_form_values(form)
+        context = {
+            "accounts": store.list_accounts(),
+            "editing": True,
+            "form_action": f"/jobs/{job_id}/edit",
+            "job_id": job_id,
+        }
+        try:
+            config, values, _upload_dirs = await _build_config(
+                request, settings, upload_dirs, inherit_mail_credentials=False
+            )
+            form = await request.form()
+            then_run = bool(form.get("then_run"))
+            manager.edit_job(job_id, config)
+        except ResetConfirmationRequired as exc:
+            _purge_pending_edits()
+            token = secrets.token_urlsafe(16)
+            app.state.pending_edits[token] = PendingEdit(
+                job_id, config, set(upload_dirs), then_run, time.time()
+            )
+            return templates.TemplateResponse(
+                request=request,
+                name="confirm_edit.html",
+                context={
+                    "job_id": job_id,
+                    "token": token,
+                    "kinds": exc.kinds,
+                },
+            )
+        except KeyError:
+            _remove_upload_dirs(upload_dirs)
+            return HTMLResponse("Job not found", status_code=404)
+        except (ValueError, OSError) as exc:
+            _remove_upload_dirs(upload_dirs)
+            return templates.TemplateResponse(
+                request=request,
+                name="new_job.html",
+                context={
+                    **context,
+                    "errors": [str(exc)],
+                    "values": values,
+                },
+                status_code=422,
+            )
+        except Exception:
+            _remove_upload_dirs(upload_dirs)
+            raise
+        if then_run:
+            manager.resume(job_id)
+        return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
+    @app.post("/jobs/{job_id}/edit/confirm", response_class=HTMLResponse)
+    async def confirm_edit(request: Request, job_id: int):
+        _purge_pending_edits()
+        form = await request.form()
+        token = str(form.get("token") or "")
+        pending = app.state.pending_edits.pop(token, None)
+        if pending is None:
+            return RedirectResponse(f"/jobs/{job_id}/edit", status_code=303)
+        if pending.job_id != job_id:
+            _remove_upload_dirs(pending.upload_dirs)
+            return RedirectResponse(f"/jobs/{job_id}/edit", status_code=303)
+        try:
+            manager.edit_job(job_id, pending.config, confirm_reset=True)
+        except KeyError:
+            _remove_upload_dirs(pending.upload_dirs)
+            return HTMLResponse("Job not found", status_code=404)
+        except (ValueError, OSError) as exc:
+            _remove_upload_dirs(pending.upload_dirs)
+            job = store.get_job(job_id)
+            if not job:
+                return HTMLResponse("Job not found", status_code=404)
+            return templates.TemplateResponse(
+                request=request,
+                name="new_job.html",
+                context={
+                    "errors": [str(exc)],
+                    "values": _config_to_values(pending.config.split()[0]),
+                    "accounts": store.list_accounts(),
+                    "editing": True,
+                    "form_action": f"/jobs/{job_id}/edit",
+                    "job_id": job_id,
+                },
+                status_code=422,
+            )
+        except Exception:
+            _remove_upload_dirs(pending.upload_dirs)
+            raise
+        if pending.then_run:
+            manager.resume(job_id)
         return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
     @app.get("/jobs/{job_id}", response_class=HTMLResponse)
@@ -272,6 +503,16 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             },
         )
 
+    @app.post("/jobs/{job_id}/run-real")
+    async def run_for_real(job_id: int):
+        try:
+            manager.run_for_real(job_id)
+        except KeyError:
+            return HTMLResponse("Job not found", status_code=404)
+        except ValueError as exc:
+            return HTMLResponse(str(exc), status_code=400)
+        return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
     @app.post("/jobs/{job_id}/{action}")
     async def job_action(job_id: int, action: str):
         try:
@@ -304,6 +545,25 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
         if not endpoint:
             return JSONResponse({"ok": False, "detail": "Endpoint is not configured.", "folders": []}, 422)
         options = Options.from_dict(body.get("options"))
+        if body.get("job_id") is not None:
+            try:
+                job = store.get_job(int(body["job_id"]))
+                if not job:
+                    return JSONResponse({"ok": False, "detail": "Job not found.", "folders": []}, 404)
+                endpoints = {
+                    configured_kind: {"source": None, "dest": None}
+                    for configured_kind in ("mail", "contacts", "calendars")
+                }
+                if kind not in endpoints or side not in ("source", "dest"):
+                    return JSONResponse(
+                        {"ok": False, "detail": "Invalid migration endpoint.", "folders": []}, 422
+                    )
+                endpoints[kind][side] = endpoint
+                test_config = JobConfig("", endpoints, options)
+                merge_saved_settings(test_config, manager._load_config(job, resolve=False))
+                endpoint = test_config.endpoints[kind][side]
+            except (TypeError, ValueError) as exc:
+                return JSONResponse({"ok": False, "detail": str(exc), "folders": []}, 400)
         try:
             endpoint = resolve_endpoint(endpoint, load_accounts(store, secretbox), token_manager)
         except Exception as exc:

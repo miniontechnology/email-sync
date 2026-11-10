@@ -26,6 +26,94 @@ _RESUMABLE = {
 }
 
 
+class ResetConfirmationRequired(ValueError):
+    def __init__(self, kinds):
+        self.kinds = list(kinds)
+        super().__init__(
+            "Changing the source or destination clears copy records for: " + ", ".join(self.kinds)
+        )
+
+
+def _same_server(new, old):
+    return (
+        new.type == old.type
+        and new.host.lower() == old.host.lower()
+        and new.url.rstrip("/").lower() == old.url.rstrip("/").lower()
+        and new.username.lower() == old.username.lower()
+    )
+
+
+def _same_server_ignoring_username(new, old):
+    return (
+        new.type == old.type
+        and new.host.lower() == old.host.lower()
+        and new.url.rstrip("/").lower() == old.url.rstrip("/").lower()
+    )
+
+
+def merge_saved_settings(config: JobConfig, old: JobConfig) -> list[str]:
+    errors = []
+    ordered_kinds = sorted(config.endpoints, key=lambda kind: kind != "mail")
+    for kind in ordered_kinds:
+        pair = config.endpoints[kind]
+        old_pair = old.endpoints.get(kind) or {}
+        for side, endpoint in pair.items():
+            previous = old_pair.get(side)
+            if endpoint is None or previous is None or endpoint.account_id is not None:
+                continue
+            if endpoint.type == "file":
+                if not endpoint.files:
+                    endpoint.files = list(previous.files)
+                continue
+            if kind != "mail" and (endpoint.password or endpoint.token):
+                continue
+            if kind != "mail":
+                previous_mail = (old.endpoints.get("mail") or {}).get(side)
+                current_mail = (config.endpoints.get("mail") or {}).get(side)
+                inherited_credentials = (
+                    previous_mail is not None
+                    and previous.password == previous_mail.password
+                    and previous.token == previous_mail.token
+                    and previous.username == previous_mail.username
+                )
+                current_mail_has_credentials = current_mail and (current_mail.password or current_mail.token)
+                if (
+                    inherited_credentials
+                    and current_mail_has_credentials
+                    and _same_server_ignoring_username(endpoint, previous)
+                    and (not endpoint.username or endpoint.username == previous.username)
+                ):
+                    endpoint.username = current_mail.username
+                    endpoint.password = current_mail.password
+                    endpoint.token = current_mail.token
+                    continue
+            if endpoint.password or endpoint.token or not (previous.password or previous.token):
+                continue
+            if _same_server(endpoint, previous):
+                endpoint.password = previous.password
+                endpoint.token = previous.token
+            else:
+                errors.append(
+                    f"{kind.capitalize()} {side}: enter the password again because the server or username changed."
+                )
+    return errors
+
+
+def _identity(endpoint):
+    if endpoint is None:
+        return None
+    if endpoint.type == "file":
+        return ("file",)
+    return (
+        endpoint.type,
+        endpoint.account_id,
+        endpoint.host.lower(),
+        endpoint.effective_port() if endpoint.type in ("imap", "gmail") else 0,
+        endpoint.username.lower(),
+        endpoint.url.rstrip("/").lower(),
+    )
+
+
 class JobManager:
     def __init__(
         self, store, secretbox, settings: Settings, mail_factory=MailMigration, dav_factory=DavMigration
@@ -47,6 +135,7 @@ class JobManager:
             if self._scheduler and self._scheduler.is_alive():
                 return
             self._stop.clear()
+            self._sweep_unreferenced_upload_dirs()
             for job in self.store.list_jobs():
                 if job["status"] in _ACTIVE:
                     if self.settings.auto_resume:
@@ -73,6 +162,16 @@ class JobManager:
                 thread.join(timeout=30)
 
     def create_job(self, config: JobConfig) -> int:
+        errors = self._validate(config)
+        if errors:
+            raise ValueError(" ".join(errors))
+        public, secrets = config.split()
+        encrypted = self.secretbox.encrypt(secrets) if secrets else None
+        job_id = self.store.create_job(config.name.strip(), public, encrypted)
+        self.store.add_event(job_id, "info", "Job created")
+        return job_id
+
+    def _validate(self, config: JobConfig) -> list[str]:
         errors = config.validate()
         accounts = {int(account["id"]): account for account in self.store.list_accounts()}
         for pair in config.endpoints.values():
@@ -83,13 +182,103 @@ class JobManager:
                         errors.append(f"Saved account {endpoint.account_id} no longer exists.")
                     elif error := check_account_compat(endpoint, account):
                         errors.append(error)
-        if errors:
-            raise ValueError(" ".join(errors))
-        public, secrets = config.split()
-        encrypted = self.secretbox.encrypt(secrets) if secrets else None
-        job_id = self.store.create_job(config.name.strip(), public, encrypted)
-        self.store.add_event(job_id, "info", "Job created")
-        return job_id
+        return errors
+
+    def _upload_dirs(self, config):
+        upload_dirs = set()
+        upload_root = self.settings.uploads_dir.resolve()
+        for pair in config.endpoints.values():
+            for endpoint in pair.values():
+                if endpoint:
+                    for filename in endpoint.files:
+                        parent = Path(filename).resolve().parent
+                        try:
+                            parent.relative_to(upload_root)
+                        except ValueError:
+                            continue
+                        upload_dirs.add(parent)
+        return upload_dirs
+
+    def _sweep_unreferenced_upload_dirs(self):
+        upload_root = self.settings.uploads_dir.resolve()
+        if not upload_root.is_dir():
+            return
+        referenced = set()
+        for job in self.store.list_jobs():
+            referenced.update(self._upload_dirs(JobConfig.from_dict(job["config"])))
+        referenced_children = set()
+        for directory in referenced:
+            try:
+                relative = directory.resolve().relative_to(upload_root)
+            except (OSError, RuntimeError, ValueError):
+                continue
+            if relative.parts:
+                referenced_children.add(upload_root / relative.parts[0])
+        try:
+            children = list(upload_root.iterdir())
+        except OSError:
+            return
+        for child in children:
+            try:
+                resolved = child.resolve()
+                if resolved.parent != upload_root or not resolved.is_dir():
+                    continue
+                if resolved not in referenced_children:
+                    shutil.rmtree(resolved, ignore_errors=True)
+            except (OSError, RuntimeError):
+                continue
+
+    def _other_job_upload_dirs(self, job_id):
+        upload_dirs = set()
+        for other in self.store.list_jobs():
+            if other["id"] != job_id:
+                upload_dirs.update(self._upload_dirs(JobConfig.from_dict(other["config"])))
+        return upload_dirs
+
+    def edit_job(self, job_id: int, config: JobConfig, *, confirm_reset: bool = False) -> list[str]:
+        with self._lock:
+            job = self.store.get_job(job_id)
+            if not job:
+                raise KeyError(job_id)
+            thread = self._threads.get(job_id)
+            if job["status"] in _ACTIVE or (thread and thread.is_alive()):
+                raise ValueError("Pause the migration or wait for it to finish before editing it.")
+
+            old = self._load_config(job, resolve=False)
+            config.options.dav_match_fingerprint = old.options.dav_match_fingerprint
+            errors = [*merge_saved_settings(config, old), *self._validate(config)]
+            if errors:
+                raise ValueError(" ".join(errors))
+
+            changed_kinds = [
+                kind
+                for kind, pair in config.endpoints.items()
+                if any(
+                    _identity(pair.get(side)) != _identity(old.endpoints[kind].get(side))
+                    for side in ("source", "dest")
+                )
+                and self.store.ledger_counts(job_id, kind)
+            ]
+            if changed_kinds and not confirm_reset:
+                raise ResetConfirmationRequired(changed_kinds)
+
+            public, secrets = config.split()
+            encrypted = self.secretbox.encrypt(secrets) if secrets else None
+            self.store.update_job(job_id, name=config.name.strip(), config=public, secrets_enc=encrypted)
+            for kind in changed_kinds:
+                self.store.ledger_reset(job_id, kind)
+                self.store.add_event(
+                    job_id,
+                    "info",
+                    f"Copy records for {kind} cleared because its source or destination changed",
+                )
+            unused_upload_dirs = (
+                self._upload_dirs(old) - self._upload_dirs(config) - self._other_job_upload_dirs(job_id)
+            )
+            for directory in unused_upload_dirs:
+                shutil.rmtree(directory, ignore_errors=True)
+            self.store.add_event(job_id, "info", "Settings updated")
+            return changed_kinds
 
     def resume(self, job_id: int):
         job = self.store.get_job(job_id)
@@ -102,6 +291,23 @@ class JobManager:
         )
         self.store.add_event(job_id, "info", "Job queued")
         return True
+
+    def run_for_real(self, job_id: int):
+        with self._lock:
+            job = self.store.get_job(job_id)
+            if not job:
+                raise KeyError(job_id)
+            thread = self._threads.get(job_id)
+            if job["status"] in _ACTIVE or (thread and thread.is_alive()):
+                raise ValueError("Pause the migration or wait for it to finish before editing it.")
+            config = job["config"]
+            options = config.setdefault("options", {})
+            if not options.get("dry_run"):
+                raise ValueError("This migration is not a dry run.")
+            options["dry_run"] = False
+            self.store.update_job(job_id, config=config)
+            self.store.add_event(job_id, "info", "Dry run turned off")
+            return self.resume(job_id)
 
     def pause(self, job_id: int):
         job = self.store.get_job(job_id)
@@ -146,17 +352,7 @@ class JobManager:
             if thread and thread is not threading.current_thread():
                 thread.join()
         config = self._load_config(job, resolve=False)
-        upload_dirs = set()
-        for pair in config.endpoints.values():
-            for endpoint in pair.values():
-                if endpoint:
-                    for filename in endpoint.files:
-                        parent = Path(filename).resolve().parent
-                        try:
-                            parent.relative_to(self.settings.uploads_dir.resolve())
-                        except ValueError:
-                            continue
-                        upload_dirs.add(parent)
+        upload_dirs = self._upload_dirs(config) - self._other_job_upload_dirs(job_id)
         self.store.delete_job(job_id)
         for directory in upload_dirs:
             shutil.rmtree(directory, ignore_errors=True)

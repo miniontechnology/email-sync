@@ -29,7 +29,6 @@ Roughly in priority order; open an issue/PR to reprioritise.
 
 ## App
 - Authentication / multi-user access control for the web UI.
-- Editing an existing migration (today: clone it and change the copy).
 - Per-folder selection checkboxes in the UI (today: exclude list + mapping text box).
 - Notifications (email/webhook) on completion or failure.
 - Export of the ledger / migration report as CSV.
