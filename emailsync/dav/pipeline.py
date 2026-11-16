@@ -193,18 +193,34 @@ class DavMigration:
     def _get_fingerprint(self, item):
         return self._items_fingerprint(item)
 
+    def _add_fingerprint(self, indexed, uid, fingerprint):
+        indexed["fingerprints"].add(fingerprint)
+        indexed["fingerprint_uids"].setdefault(fingerprint, set()).add(uid)
+
+    def _remove_fingerprint(self, indexed, uid, fingerprint):
+        uids = indexed["fingerprint_uids"].get(fingerprint)
+        if uids:
+            uids.discard(uid)
+            if not uids:
+                indexed["fingerprint_uids"].pop(fingerprint)
+                indexed["fingerprints"].discard(fingerprint)
+
     def _index_collection(self, dest, collection):
         uid_index = set()
         fingerprint_index = set()
+        fingerprint_uids = {}
         refs = {}
         for item in self._retry(lambda: dest.items(collection), dest) or []:
             uid_index.add(item.uid)
-            fingerprint_index.add(self._get_fingerprint(item))
+            fingerprint = self._get_fingerprint(item)
+            fingerprint_index.add(fingerprint)
+            fingerprint_uids.setdefault(fingerprint, set()).add(item.uid)
             refs[item.uid] = (item.ref, item.etag)
         return {
             "collection": collection,
             "uids": uid_index,
             "fingerprints": fingerprint_index,
+            "fingerprint_uids": fingerprint_uids,
             "refs": refs,
         }
 
@@ -326,7 +342,17 @@ class DavMigration:
                 )
                 self.progress.update(scope.name, "updated")
                 indexed["uids"].add(item.uid)
-                indexed["fingerprints"].add(fingerprint)
+                baseline_fp = _read_baseline(settled_row.get("info"))["fp"]
+                old_fingerprints = {
+                    old_fp
+                    for old_fp, uids in indexed["fingerprint_uids"].items()
+                    if item.uid in uids
+                }
+                if baseline_fp:
+                    old_fingerprints.add(baseline_fp)
+                for old_fp in old_fingerprints:
+                    self._remove_fingerprint(indexed, item.uid, old_fp)
+                self._add_fingerprint(indexed, item.uid, fingerprint)
                 return
             exists = item.uid in indexed["uids"] or (
                 self.options.dav_match_fingerprint and fingerprint in indexed["fingerprints"]
@@ -343,12 +369,12 @@ class DavMigration:
                         info=_write_baseline(fingerprint, digest),
                     )
                 indexed["uids"].add(item.uid)
-                indexed["fingerprints"].add(fingerprint)
+                self._add_fingerprint(indexed, item.uid, fingerprint)
                 self.progress.update(scope.name, "skipped")
                 return
             if self.options.dry_run:
                 indexed["uids"].add(item.uid)
-                indexed["fingerprints"].add(fingerprint)
+                self._add_fingerprint(indexed, item.uid, fingerprint)
                 self.progress.update(scope.name, "copied")
                 return
             extension = ".vcf" if self.kind == "contacts" else ".ics"
@@ -383,7 +409,7 @@ class DavMigration:
                 info=_write_baseline(fingerprint, digest),
             )
             indexed["uids"].add(item.uid)
-            indexed["fingerprints"].add(fingerprint)
+            self._add_fingerprint(indexed, item.uid, fingerprint)
 
     def run(self) -> TaskResult:
         self.store.reset_task(self.job_id, self.kind, "running")
@@ -413,7 +439,13 @@ class DavMigration:
                     None,
                 )
                 if indexed is None:
-                    indexed = {"collection": target, "uids": set(), "fingerprints": set(), "refs": {}}
+                    indexed = {
+                        "collection": target,
+                        "uids": set(),
+                        "fingerprints": set(),
+                        "fingerprint_uids": {},
+                        "refs": {},
+                    }
                     indexed_collections.append(indexed)
                 self.progress.status(scope.name, "running")
                 for item in items:

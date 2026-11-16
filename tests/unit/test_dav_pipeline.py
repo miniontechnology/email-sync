@@ -217,6 +217,29 @@ def test_changed_source_contact_is_updated_once_with_new_baseline(tmp_path):
     assert len(state.update_calls) == 1
 
 
+def test_updated_contact_releases_old_fingerprint_for_later_source_item(tmp_path):
+    store = db.Store(tmp_path / "contacts.db")
+    job_id = store.create_job("contacts", {}, None)
+    original = _contact("person-1", "Alice")
+    changed = _contact("person-1", "Bob")
+    new_item = _contact("person-2", "Alice")
+    state = State({"Takeout": [original]}, {})
+    single_worker = Options(workers=1)
+
+    assert migrate(store, job_id, "contacts", state, single_worker).status == "completed"
+    state.destination["default"][0].fingerprint = original.fingerprint
+    state.items_by_scope["Takeout"] = [changed, new_item]
+
+    result = migrate(store, job_id, "contacts", state, single_worker)
+
+    assert result.status == "completed"
+    task = store.get_tasks(job_id)[0]
+    assert task["updated"] == 1
+    assert task["copied"] == 1
+    assert state.put_calls == 2
+    assert {item.uid for item in state.destination["default"]} == {"person-1", "person-2"}
+
+
 def test_legacy_ledger_info_is_upgraded_before_later_source_change(tmp_path):
     store = db.Store(tmp_path / "contacts.db")
     job_id = store.create_job("contacts", {}, None)
