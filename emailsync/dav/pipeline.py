@@ -272,10 +272,10 @@ class DavMigration:
             fingerprint = self._get_fingerprint(item)
             digest = source_hash or content_hash(item.data)
             if settled_row:
+                self.progress.update(scope.name, "already")
                 ref, etag = indexed.get("refs", {}).get(item.uid, ("", None))
                 if not ref:
                     self._not_found += 1
-                    self.progress.update(scope.name, "already")
                     return
                 if self.options.dry_run:
                     self.progress.update(scope.name, "updated")

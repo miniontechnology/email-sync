@@ -205,6 +205,10 @@ def test_changed_source_contact_is_updated_once_with_new_baseline(tmp_path):
     assert state.put_calls == 1
     assert len(state.update_calls) == 1
     assert second_task["updated"] == 1
+    assert (
+        second_task["already"] + second_task["copied"] + second_task["skipped"] + second_task["failed"]
+        == second_task["total"]
+    )
     assert state.destination["default"][0].data == changed.data
     assert _baseline(second_row)["hash"] != old_hash
 
