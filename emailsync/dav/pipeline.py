@@ -344,9 +344,7 @@ class DavMigration:
                 indexed["uids"].add(item.uid)
                 baseline_fp = _read_baseline(settled_row.get("info"))["fp"]
                 old_fingerprints = {
-                    old_fp
-                    for old_fp, uids in indexed["fingerprint_uids"].items()
-                    if item.uid in uids
+                    old_fp for old_fp, uids in indexed["fingerprint_uids"].items() if item.uid in uids
                 }
                 if baseline_fp:
                     old_fingerprints.add(baseline_fp)
