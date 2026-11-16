@@ -295,6 +295,7 @@ def test_contact_update_nulls_removed_properties_not_server_managed_ones(monkeyp
     parsed = {
         "id": None,
         "uid": "contact-1",
+        "addressBookIds": {"other-book": True},
         "name": {"full": "Updated Person"},
         "emails": {"e1": {"address": "new@example.org"}},
     }
@@ -354,6 +355,7 @@ def test_calendar_update_sends_full_recurrence_and_disables_scheduling(monkeypat
                                 {
                                     "id": None,
                                     "uid": "event-1",
+                                    "calendarIds": {"other-calendar": True},
                                     "title": "Updated series",
                                     "recurrenceOverrides": overrides,
                                 }

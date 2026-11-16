@@ -272,6 +272,8 @@ class JmapDavDestination:
             parsed_objects = parsed
 
         object_data = {key: value for key, value in parsed_objects[0].items() if key != "id"}
+        object_data.pop("addressBookIds", None)
+        object_data.pop("calendarIds", None)
         current_response = self.client.call(
             [
                 [
