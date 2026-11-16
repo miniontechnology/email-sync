@@ -73,7 +73,7 @@ BEGIN:VEVENT
 UID:series-1
 RECURRENCE-ID;TZID=Europe/Paris:20240108T100000
 SUMMARY:Planning moved
-DTSTART;TZID=Europe/Paris:20240108T110000
+DTSTART;TZID=America/New_York:20240108T110000
 END:VEVENT
 BEGIN:VEVENT
 SUMMARY:Generated
@@ -87,7 +87,8 @@ END:VCALENDAR
     series = groups["series-1"]
     assert len([c for c in series.subcomponents if c.name == "VEVENT"]) == 2
     zones = [c for c in series.subcomponents if c.name == "VTIMEZONE"]
-    assert [str(c.get("tzid")) for c in zones] == ["Europe/Paris"]
+    assert [str(c.get("tzid")) for c in zones] == ["America/New_York", "Europe/Paris"]
+    assert split_ics(text) == objects
     generated_uid, generated = next((uid, cal) for uid, cal in groups.items() if uid != "series-1")
     assert generated_uid.startswith("email-sync-")
     assert str(next(c for c in generated.subcomponents if c.name == "VEVENT").get("uid")) == generated_uid

@@ -109,7 +109,7 @@ def split_ics(text: str | bytes) -> list[tuple[str, bytes]]:
         out = Calendar()
         out.add("version", calendar.get("version", "2.0"))
         out.add("prodid", calendar.get("prodid", "-//email-sync//v1//EN"))
-        for tzid in _timezone_ids(components):
+        for tzid in sorted(_timezone_ids(components)):
             if tzid in zones:
                 out.add_component(zones[tzid])
         for component in components:
