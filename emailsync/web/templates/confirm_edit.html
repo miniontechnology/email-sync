@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Confirm migration edit{% endblock %}
+{% block content %}
+<div class="page-heading compact">
+  <div><p class="eyebrow">CONFIRM SETTINGS CHANGE</p><h1>Confirm migration edit</h1></div>
+  <a class="button secondary" href="/jobs/{{ job_id }}/edit">Go back</a>
+</div>
+<div class="alert warning">
+  <p>Changing the source or destination clears the copy records for: {{ kinds|join(", ") }}. Already-copied items will be matched against the destination again; nothing is deleted.</p>
+</div>
+<div class="form-actions">
+  <form method="post" action="/jobs/{{ job_id }}/edit/confirm">
+    <input type="hidden" name="token" value="{{ token }}">
+    <button class="button primary" type="submit">Confirm and save</button>
+  </form>
+  <a class="button secondary" href="/jobs/{{ job_id }}/edit">Go back</a>
+</div>
+{% endblock %}

@@ -81,6 +81,14 @@ contacts and calendar sources.
 4. Run a dry run first. Review folder mappings, selected source scopes, and progress before
    running a real copy.
 
+## Editing migrations
+
+Paused and completed migrations can be edited from their job page. Leave a saved password blank
+to keep it when the server and username are unchanged. Dry runs can be edited until the settings
+are ready, then use **Run for real** to disable dry-run and copy, or uncheck **Dry run** before
+choosing **Save and run**. Changing a source or destination clears that type's copy records so
+already-copied items are matched against the new endpoint. This does not delete destination data.
+
 Gmail's IMAP bandwidth limits can temporarily throttle large migrations. Email Sync honors
 server throttling, waits, and continues without counting a throttle wait as a failed item.
 
