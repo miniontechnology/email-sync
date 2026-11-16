@@ -81,6 +81,7 @@ def edit_form_data(**overrides):
         "skip_deleted": "on",
         "verify": "on",
         "sync_flags_labels": "on",
+        "update_changed_items": "on",
     }
     data.update(overrides)
     return data
@@ -91,6 +92,7 @@ def test_options_default_state_sync_enabled_and_stale_removal_disabled():
 
     assert options.sync_flags_labels is True
     assert options.remove_stale_labels is False
+    assert options.update_changed_items is True
 
 
 def test_job_manager_encrypts_credentials_and_runs_queued_jobs(tmp_path):
@@ -341,6 +343,7 @@ def test_web_dashboard_detail_validation_and_secret_redaction(tmp_path):
         form = client.get("/jobs/new")
         assert form.status_code == 200
         assert 'name="sync_flags_labels" checked' in form.text
+        assert 'name="update_changed_items" checked' in form.text
         assert 'name="remove_stale_labels" checked' not in form.text
 
         invalid = client.post("/jobs", data={"name": ""})
@@ -363,6 +366,7 @@ def test_web_dashboard_detail_validation_and_secret_redaction(tmp_path):
                 "skip_deleted": "on",
                 "verify": "on",
                 "sync_flags_labels": "on",
+                "update_changed_items": "on",
             },
             follow_redirects=False,
         )
@@ -370,6 +374,7 @@ def test_web_dashboard_detail_validation_and_secret_redaction(tmp_path):
         job_id = int(response.headers["location"].split("/")[-1])
         options = store.get_job(job_id)["config"]["options"]
         assert options["sync_flags_labels"] is True
+        assert options["update_changed_items"] is True
         assert options["remove_stale_labels"] is False
         for url in ("/", f"/jobs/{job_id}", f"/jobs/{job_id}/fragment", "/jobs/fragment"):
             page = client.get(url)

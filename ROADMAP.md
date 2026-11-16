@@ -18,7 +18,7 @@ Roughly in priority order; open an issue/PR to reprioritise.
 - **Propagating deletions** (source → destination), with a safety threshold.
 - Generic IMAP sources: a message moved to another source folder is copied again into the new
   destination folder; the old destination copy remains.
-- Updating contacts/events that changed on the source after they were copied (currently "skip existing").
+- Fingerprint-only matches (different UID) aren't updated.
 - CONDSTORE/QRESYNC-based change detection to make large incremental syncs cheaper.
 
 ## Performance
