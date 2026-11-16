@@ -12,6 +12,27 @@ from emailsync.dav.source import DavItem
 from emailsync.dav.vobjects import contact_fingerprint
 from emailsync.errors import PermanentError
 
+SERVER_MANAGED = frozenset(
+    {
+        "id",
+        "uid",
+        "created",
+        "updated",
+        "sequence",
+        "blobId",
+        "addressBookIds",
+        "calendarIds",
+        "utcStart",
+        "utcEnd",
+        "baseEventId",
+        "isDraft",
+        "isOrigin",
+        "mayInviteSelf",
+        "mayInviteOthers",
+        "hideAttendees",
+    }
+)
+
 
 class JmapDavDestination:
     def __init__(self, endpoint, kind):
@@ -158,7 +179,7 @@ class JmapDavDestination:
                         for value in values
                     ]
                     fingerprint = contact_fingerprint(full_name, addresses)
-                items.append(DavItem(str(uid), b"", fingerprint))
+                items.append(DavItem(str(uid), b"", fingerprint, ref=str(row.get("id") or "")))
             if len(ids) < page_size:
                 return items
             position += len(ids)
@@ -223,3 +244,75 @@ class JmapDavDestination:
         if errors:
             return False
         raise PermanentError(f"{self.object_name}/set rejected: missing created result")
+
+    def update(self, collection, ref, etag, data):
+        content_type = "text/vcard" if self.kind == "contacts" else "text/calendar"
+        blob_id = self.client.upload(data, content_type)
+        parsed_response = self.client.call(
+            [
+                [
+                    f"{self.object_name}/parse",
+                    {"accountId": self.client.account_id, "blobIds": [blob_id]},
+                    "p",
+                ]
+            ],
+            using=self._using(),
+        )
+        parsed_args = parsed_response[0][1]
+        parsed = (parsed_args.get("parsed") or {}).get(blob_id)
+        if parsed is None or blob_id in (parsed_args.get("notParsable") or {}):
+            raise PermanentError("Destination could not parse this contact/event")
+        if self.kind == "contacts":
+            if not isinstance(parsed, dict):
+                raise PermanentError("JMAP contacts update requires exactly one parsed contact")
+            parsed_objects = [parsed]
+        else:
+            if not isinstance(parsed, list) or len(parsed) != 1:
+                raise PermanentError("JMAP calendars update requires exactly one parsed event")
+            parsed_objects = parsed
+
+        collection_id = collection.get("id") or collection["href"]
+        object_data = {key: value for key, value in parsed_objects[0].items() if key != "id"}
+        object_data["addressBookIds" if self.kind == "contacts" else "calendarIds"] = {collection_id: True}
+        current_response = self.client.call(
+            [
+                [
+                    f"{self.object_name}/get",
+                    {"accountId": self.client.account_id, "ids": [ref]},
+                    "g",
+                ]
+            ],
+            using=self._using(),
+        )
+        current_args = current_response[0][1]
+        current = next((row for row in current_args.get("list", []) if row.get("id") == ref), None)
+        if current is None:
+            if ref in (current_args.get("notFound") or []):
+                return False
+            raise PermanentError(f"{self.object_name}/get returned no object for {ref}")
+        for key in current:
+            if key not in object_data and key not in SERVER_MANAGED:
+                object_data[key] = None
+
+        method_args = {
+            "accountId": self.client.account_id,
+            "update": {ref: object_data},
+        }
+        if self.kind == "calendars":
+            method_args["sendSchedulingMessages"] = False
+        response = self.client.call(
+            [[f"{self.object_name}/set", method_args, "u"]],
+            using=self._using(),
+        )
+        args = response[0][1]
+        if ref in (args.get("updated") or {}):
+            return True
+        not_updated = (args.get("notUpdated") or {}).get(ref, {})
+        if ref in (args.get("notFound") or []) or not_updated.get("type") == "notFound":
+            return False
+        if not_updated:
+            raise PermanentError(
+                f"{self.object_name}/set update rejected: "
+                f"{not_updated.get('type')} {not_updated.get('description', '')}".strip()
+            )
+        raise PermanentError(f"{self.object_name}/set update returned no result for {ref}")

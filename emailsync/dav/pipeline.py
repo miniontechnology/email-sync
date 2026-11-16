@@ -1,5 +1,6 @@
 """Contacts and calendar migration over CardDAV, CalDAV, and local Takeout files."""
 
+import json
 import re
 import threading
 import time
@@ -9,10 +10,28 @@ from emailsync import db
 from emailsync.connectors.dav import DavClient
 from emailsync.dav.jmap_dest import JmapDavDestination
 from emailsync.dav.source import DavSource
+from emailsync.dav.vobjects import content_hash
 from emailsync.errors import AuthError, FatalError, ReauthRequired, wrap
 from emailsync.jobs.control import TaskResult
 from emailsync.jobs.retry import retry_call
 from emailsync.options import JobConfig
+
+
+def _read_baseline(info):
+    try:
+        value = json.loads(info)
+    except (TypeError, json.JSONDecodeError):
+        value = None
+    if isinstance(value, dict):
+        return {
+            "fp": value.get("fp") if isinstance(value.get("fp"), str) else None,
+            "hash": value.get("hash") if isinstance(value.get("hash"), str) else None,
+        }
+    return {"fp": info if isinstance(info, str) else None, "hash": None}
+
+
+def _write_baseline(fingerprint, digest):
+    return json.dumps({"fp": fingerprint, "hash": digest}, sort_keys=True)
 
 
 def _make_source(endpoint, kind):
@@ -56,12 +75,18 @@ class DavDestination:
         from emailsync.dav.source import _decode_objects
 
         out = []
-        for _href, _etag, data in self.client.list_objects(collection):
-            out.extend(_decode_objects(data, self.kind))
+        for href, etag, data in self.client.list_objects(collection):
+            for item in _decode_objects(data, self.kind):
+                item.ref = href
+                item.etag = etag
+                out.append(item)
         return out
 
     def put(self, collection, filename, data):
         return self.client.put(collection, filename, data)
+
+    def update(self, collection, ref, etag, data):
+        return self.client.update(ref, data, etag)
 
 
 class _DavProgress:
@@ -70,7 +95,7 @@ class _DavProgress:
         self.job_id = job_id
         self.kind = kind
         self.lock = threading.Lock()
-        self.values = dict(total=0, already=0, copied=0, skipped=0, failed=0)
+        self.values = dict(total=0, already=0, copied=0, skipped=0, updated=0, failed=0)
         self.scopes = {}
         self.message = "Connecting"
         self.last_flush = 0
@@ -83,7 +108,7 @@ class _DavProgress:
     def set_scopes(self, names):
         with self.lock:
             self.scopes = {
-                name: dict(total=0, already=0, copied=0, skipped=0, failed=0, status="pending")
+                name: dict(total=0, already=0, copied=0, skipped=0, updated=0, failed=0, status="pending")
                 for name in names
             }
         self.flush(force=True)
@@ -148,6 +173,8 @@ class DavMigration:
         self.failed = 0
         self._failed_lock = threading.Lock()
         self._destination_lock = threading.Lock()
+        self._not_found = 0
+        self._update_warning_count = 0
 
     def _retry(self, operation, connection=None):
         return retry_call(
@@ -169,10 +196,35 @@ class DavMigration:
     def _index_collection(self, dest, collection):
         uid_index = set()
         fingerprint_index = set()
+        refs = {}
         for item in self._retry(lambda: dest.items(collection), dest) or []:
             uid_index.add(item.uid)
             fingerprint_index.add(self._get_fingerprint(item))
-        return {"collection": collection, "uids": uid_index, "fingerprints": fingerprint_index}
+            refs[item.uid] = (item.ref, item.etag)
+        return {
+            "collection": collection,
+            "uids": uid_index,
+            "fingerprints": fingerprint_index,
+            "refs": refs,
+        }
+
+    def _update_warning(self, message):
+        self._update_warning_count += 1
+        if self._update_warning_count <= 20:
+            self.log("warning", message)
+
+    def _emit_update_summaries(self):
+        if self._not_found:
+            self.log(
+                "warning",
+                f"{self._not_found} changed item(s) weren't found in the destination by UID; "
+                "they weren't updated",
+            )
+        if self._update_warning_count > 20:
+            self.log(
+                "warning",
+                f"{self._update_warning_count - 20} additional changed-item update warning(s) were suppressed",
+            )
 
     def _target_for(self, dest, scope):
         collections = dest.collections
@@ -209,13 +261,73 @@ class DavMigration:
         with self._failed_lock:
             self.failed += 1
 
-    def _process(self, scope, item, target, indexed, source_key, collection_name):
+    def _process(
+        self, scope, item, target, indexed, source_key, collection_name, settled_row=None, source_hash=None
+    ):
         if self.control.stopped or self.control.aborted:
             return
         with self._destination_lock:
             if self.control.stopped or self.control.aborted:
                 return
             fingerprint = self._get_fingerprint(item)
+            digest = source_hash or content_hash(item.data)
+            if settled_row:
+                ref, etag = indexed.get("refs", {}).get(item.uid, ("", None))
+                if not ref:
+                    self._not_found += 1
+                    self.progress.update(scope.name, "already")
+                    return
+                if self.options.dry_run:
+                    self.progress.update(scope.name, "updated")
+                    return
+                try:
+                    updated = self._retry(lambda: self.dest.update(target, ref, etag, item.data), self.dest)
+                except (AuthError, FatalError):
+                    raise
+                except Exception as exc:
+                    error = str(wrap(exc))[:1000]
+                    self.store.ledger_mark(
+                        self.job_id,
+                        self.kind,
+                        source_key,
+                        settled_row["status"],
+                        match_key=item.uid,
+                        targets=settled_row.get("targets") or [collection_name],
+                        error=error,
+                    )
+                    self._update_warning(f"Changed item update failed for {source_key}: {error}")
+                    with self._failed_lock:
+                        self.failed += 1
+                    return
+                if self.control.stopped or self.control.aborted:
+                    return
+                if not updated:
+                    self.store.ledger_mark(
+                        self.job_id,
+                        self.kind,
+                        source_key,
+                        settled_row["status"],
+                        match_key=item.uid,
+                        targets=settled_row.get("targets") or [collection_name],
+                        error="destination changed during the run; will retry",
+                    )
+                    self._update_warning(
+                        f"Destination changed during the run while updating {source_key}; will retry"
+                    )
+                    return
+                self.store.ledger_mark(
+                    self.job_id,
+                    self.kind,
+                    source_key,
+                    settled_row["status"],
+                    match_key=item.uid,
+                    targets=settled_row.get("targets") or [collection_name],
+                    info=_write_baseline(fingerprint, digest),
+                )
+                self.progress.update(scope.name, "updated")
+                indexed["uids"].add(item.uid)
+                indexed["fingerprints"].add(fingerprint)
+                return
             exists = item.uid in indexed["uids"] or (
                 self.options.dav_match_fingerprint and fingerprint in indexed["fingerprints"]
             )
@@ -228,7 +340,7 @@ class DavMigration:
                         db.SKIPPED,
                         match_key=item.uid,
                         targets=[collection_name],
-                        info=fingerprint,
+                        info=_write_baseline(fingerprint, digest),
                     )
                 indexed["uids"].add(item.uid)
                 indexed["fingerprints"].add(fingerprint)
@@ -249,7 +361,7 @@ class DavMigration:
                 db.UPLOADING,
                 match_key=item.uid,
                 targets=[collection_name],
-                info=fingerprint,
+                info=_write_baseline(fingerprint, digest),
                 count_attempt=True,
             )
             created = self._retry(lambda: self.dest.put(target, filename, item.data), self.dest)
@@ -268,7 +380,7 @@ class DavMigration:
                 status,
                 match_key=item.uid,
                 targets=[collection_name],
-                info=fingerprint,
+                info=_write_baseline(fingerprint, digest),
             )
             indexed["uids"].add(item.uid)
             indexed["fingerprints"].add(fingerprint)
@@ -301,7 +413,7 @@ class DavMigration:
                     None,
                 )
                 if indexed is None:
-                    indexed = {"collection": target, "uids": set(), "fingerprints": set()}
+                    indexed = {"collection": target, "uids": set(), "fingerprints": set(), "refs": {}}
                     indexed_collections.append(indexed)
                 self.progress.status(scope.name, "running")
                 for item in items:
@@ -310,9 +422,42 @@ class DavMigration:
                     source_key = f"{scope.name}|{item.uid}"
                     row = self.store.ledger_get_many(self.job_id, self.kind, [source_key]).get(source_key)
                     if row and row["status"] in db.SETTLED:
-                        self.progress.update(scope.name, "already")
+                        if self.options.update_changed_items:
+                            digest = content_hash(item.data)
+                            baseline = _read_baseline(row.get("info"))
+                            if baseline["hash"] is None:
+                                if not self.options.dry_run:
+                                    self.store.ledger_mark(
+                                        self.job_id,
+                                        self.kind,
+                                        source_key,
+                                        row["status"],
+                                        match_key=item.uid,
+                                        targets=row.get("targets") or [target["displayname"]],
+                                        info=_write_baseline(self._get_fingerprint(item), digest),
+                                    )
+                                self.progress.update(scope.name, "already")
+                            elif baseline["hash"] == digest:
+                                self.progress.update(scope.name, "already")
+                            else:
+                                work.append(
+                                    (
+                                        scope,
+                                        item,
+                                        target,
+                                        indexed,
+                                        source_key,
+                                        target["displayname"],
+                                        row,
+                                        digest,
+                                    )
+                                )
+                        else:
+                            self.progress.update(scope.name, "already")
                     else:
-                        work.append((scope, item, target, indexed, source_key, target["displayname"]))
+                        work.append(
+                            (scope, item, target, indexed, source_key, target["displayname"], None, None)
+                        )
                 self.progress.status(scope.name, "done")
             if not self.control.stopped and not self.control.aborted:
                 self.progress.set_message("Copying")
@@ -320,10 +465,29 @@ class DavMigration:
                     max_workers=self.options.workers, thread_name_prefix=f"dav-{self.kind}"
                 )
                 futures = [
-                    executor.submit(self._process, scope, item, target, indexed, source_key, collection_name)
-                    for scope, item, target, indexed, source_key, collection_name in work
+                    executor.submit(
+                        self._process,
+                        scope,
+                        item,
+                        target,
+                        indexed,
+                        source_key,
+                        collection_name,
+                        settled_row,
+                        source_hash,
+                    )
+                    for (
+                        scope,
+                        item,
+                        target,
+                        indexed,
+                        source_key,
+                        collection_name,
+                        settled_row,
+                        source_hash,
+                    ) in work
                 ]
-                for (scope, item, target, _indexed, source_key, _collection_name), future in zip(
+                for (scope, item, target, _indexed, source_key, _collection_name, *_rest), future in zip(
                     work, futures, strict=False
                 ):
                     try:
@@ -333,6 +497,7 @@ class DavMigration:
                     except BaseException as exc:
                         self.log("error", str(wrap(exc)))
                         self._record_failure(scope.name, source_key, item.uid, target, exc)
+            self._emit_update_summaries()
             if self.control.aborted:
                 error = str(self.control.error or "Task aborted")
                 status = "paused" if isinstance(self.control.error, ReauthRequired) else "failed"

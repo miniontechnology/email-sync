@@ -124,3 +124,18 @@ def event_fingerprint(summary: str, dtstart) -> str:
     )
     material = "\x1f".join((summary.strip().casefold(), value))
     return "event:" + hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()
+
+
+def content_hash(data: bytes | str) -> str:
+    text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+    lines = []
+    for line in _unfold(text).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name = line.split(":", 1)[0].split(";", 1)[0]
+        if name.upper() in {"DTSTAMP", "PRODID", "REV"}:
+            continue
+        lines.append(line)
+    material = "\n".join(lines).encode("utf-8", "replace")
+    return "sha256:" + hashlib.sha256(material).hexdigest()

@@ -321,6 +321,15 @@ class DavClient:
             response.raise_for_status()
         return True
 
+    def update(self, href: str, data: bytes, etag: str | None) -> bool:
+        headers = {"If-Match": etag} if etag else None
+        response = self._request("PUT", href, headers=headers, content=data)
+        if response.status_code == 412:
+            return False
+        if 200 <= response.status_code < 300:
+            return True
+        raise PermanentError(f"DAV update returned HTTP {response.status_code}")
+
     def create_collection(self, name: str) -> dict:
         base, collections = self.discover()
         if self.kind == "carddav":
