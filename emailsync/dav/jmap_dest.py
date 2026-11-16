@@ -271,9 +271,7 @@ class JmapDavDestination:
                 raise PermanentError("JMAP calendars update requires exactly one parsed event")
             parsed_objects = parsed
 
-        collection_id = collection.get("id") or collection["href"]
         object_data = {key: value for key, value in parsed_objects[0].items() if key != "id"}
-        object_data["addressBookIds" if self.kind == "contacts" else "calendarIds"] = {collection_id: True}
         current_response = self.client.call(
             [
                 [

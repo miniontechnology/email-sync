@@ -329,7 +329,8 @@ def test_contact_update_nulls_removed_properties_not_server_managed_ones(monkeyp
     assert get_call == {"accountId": "contacts-account", "ids": ["destination-id"]}
     update = client.calls[-1][0][0][1]["update"]["destination-id"]
     assert update["uid"] == "contact-1"
-    assert update["addressBookIds"] == {"book-1": True}
+    assert "addressBookIds" not in update
+    assert "calendarIds" not in update
     assert update["phones"] is None
     assert update["notes"] is None
     assert not {"id", "created", "updated", "sequence", "mayInviteOthers"} & update.keys()
@@ -380,6 +381,8 @@ def test_calendar_update_sends_full_recurrence_and_disables_scheduling(monkeypat
     assert args["sendSchedulingMessages"] is False
     update = args["update"]["event-id"]
     assert update["recurrenceOverrides"] == overrides
+    assert "calendarIds" not in update
+    assert "addressBookIds" not in update
     assert "created" not in update
 
 
