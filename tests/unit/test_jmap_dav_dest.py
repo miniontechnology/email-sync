@@ -291,6 +291,139 @@ def test_calendar_put_disables_scheduling_and_sets_calendar(monkeypatch):
     assert client.calls[-1][1] == (CORE, CALENDARS, CALENDARS_PARSE)
 
 
+def test_contact_update_nulls_removed_properties_not_server_managed_ones(monkeypatch):
+    parsed = {
+        "id": None,
+        "uid": "contact-1",
+        "addressBookIds": {"other-book": True},
+        "name": {"full": "Updated Person"},
+        "emails": {"e1": {"address": "new@example.org"}},
+    }
+    current = {
+        "id": "destination-id",
+        "uid": "contact-1",
+        "created": "2025-01-01T00:00:00Z",
+        "updated": "2025-01-01T00:00:00Z",
+        "sequence": 4,
+        "addressBookIds": {"book-1": True},
+        "name": {"full": "Old Person"},
+        "emails": {"e0": {"address": "old@example.org"}},
+        "phones": {"p1": {"number": "+1-555-0100"}},
+        "notes": {"n1": {"note": "old note"}},
+        "mayInviteOthers": False,
+    }
+    destination, client = _destination(
+        monkeypatch,
+        "contacts",
+        [
+            [["ContactCard/parse", {"parsed": {"blob-1": parsed}}, "p"]],
+            [["ContactCard/get", {"list": [current], "notFound": []}, "g"]],
+            [["ContactCard/set", {"updated": {"destination-id": None}}, "u"]],
+        ],
+    )
+    destination.connect()
+
+    assert destination.update({"id": "book-1", "href": "book-1"}, "destination-id", '"etag"', b"VCARD")
+
+    assert client.uploads == [(b"VCARD", "text/vcard")]
+    get_call = client.calls[-2][0][0][1]
+    assert get_call == {"accountId": "contacts-account", "ids": ["destination-id"]}
+    update = client.calls[-1][0][0][1]["update"]["destination-id"]
+    assert update["uid"] == "contact-1"
+    assert "addressBookIds" not in update
+    assert "calendarIds" not in update
+    assert update["phones"] is None
+    assert update["notes"] is None
+    assert not {"id", "created", "updated", "sequence", "mayInviteOthers"} & update.keys()
+
+
+def test_calendar_update_sends_full_recurrence_and_disables_scheduling(monkeypatch):
+    overrides = {
+        "2030-01-14T09:00:00": {"start": "2030-01-14T11:00:00", "title": "Moved"},
+        "2030-01-21T09:00:00": {"excluded": True},
+    }
+    destination, client = _destination(
+        monkeypatch,
+        "calendars",
+        [
+            [
+                [
+                    "CalendarEvent/parse",
+                    {
+                        "parsed": {
+                            "blob-1": [
+                                {
+                                    "id": None,
+                                    "uid": "event-1",
+                                    "calendarIds": {"other-calendar": True},
+                                    "title": "Updated series",
+                                    "recurrenceOverrides": overrides,
+                                }
+                            ]
+                        }
+                    },
+                    "p",
+                ]
+            ],
+            [
+                [
+                    "CalendarEvent/get",
+                    {"list": [{"id": "event-id", "uid": "event-1", "created": "timestamp"}]},
+                    "g",
+                ]
+            ],
+            [["CalendarEvent/set", {"updated": {"event-id": {"sequence": 1}}}, "u"]],
+        ],
+    )
+    destination.connect()
+
+    assert destination.update({"id": "calendar-1", "href": "calendar-1"}, "event-id", None, b"ICAL")
+
+    args = client.calls[-1][0][0][1]
+    assert args["sendSchedulingMessages"] is False
+    update = args["update"]["event-id"]
+    assert update["recurrenceOverrides"] == overrides
+    assert "calendarIds" not in update
+    assert "addressBookIds" not in update
+    assert "created" not in update
+
+
+def test_calendar_update_requires_exactly_one_parsed_event(monkeypatch):
+    destination, client = _destination(
+        monkeypatch,
+        "calendars",
+        [
+            [
+                [
+                    "CalendarEvent/parse",
+                    {"parsed": {"blob-1": [{"uid": "event-1"}, {"uid": "event-2"}]}},
+                    "p",
+                ]
+            ],
+        ],
+    )
+    destination.connect()
+
+    with pytest.raises(PermanentError, match="requires exactly one parsed event"):
+        destination.update({"id": "calendar-1"}, "event-id", None, b"ICAL")
+    assert len(client.calls) == 2
+
+
+def test_jmap_update_returns_false_when_object_is_not_found(monkeypatch):
+    destination, client = _destination(
+        monkeypatch,
+        "contacts",
+        [
+            [["ContactCard/parse", {"parsed": {"blob-1": {"uid": "contact-1"}}}, "p"]],
+            [["ContactCard/get", {"list": [], "notFound": ["missing-id"]}, "g"]],
+        ],
+    )
+    destination.connect()
+
+    assert destination.update({"id": "book-1"}, "missing-id", None, b"VCARD") is False
+    assert client.calls[-1][0][0][0] == "ContactCard/get"
+
+
 def test_empty_calendar_parse_result_raises_permanent_error(monkeypatch):
     destination, _client = _destination(
         monkeypatch,
@@ -311,11 +444,12 @@ def test_items_pages_and_computes_contact_fingerprint(monkeypatch):
                 {
                     "list": [
                         {
+                            "id": "a",
                             "uid": "person-1",
                             "name": {"full": "Person"},
                             "emails": {"a": {"address": "p@example.org"}},
                         },
-                        {"name": {"full": "No UID"}, "emails": {}},
+                        {"id": "b", "name": {"full": "No UID"}, "emails": {}},
                     ]
                 },
                 "g",
@@ -327,7 +461,7 @@ def test_items_pages_and_computes_contact_fingerprint(monkeypatch):
                 "ContactCard/get",
                 {
                     "list": [
-                        {"uid": "person-2", "name": {"full": "Second"}, "emails": []},
+                        {"id": "c", "uid": "person-2", "name": {"full": "Second"}, "emails": []},
                     ]
                 },
                 "g",
@@ -341,6 +475,7 @@ def test_items_pages_and_computes_contact_fingerprint(monkeypatch):
         ("person-1", b""),
         ("person-2", b""),
     ]
+    assert [item.ref for item in items] == ["a", "c"]
     assert items[0].fingerprint == contact_fingerprint("Person", ["p@example.org"])
     assert [entry[0][0][1]["position"] for entry in client.calls[1:]] == [0, 2]
     assert all(entry[0][0][1]["filter"] == {"inAddressBook": "book-1"} for entry in client.calls[1:])

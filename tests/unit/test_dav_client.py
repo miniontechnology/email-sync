@@ -1,3 +1,5 @@
+import httpx
+
 from emailsync.connectors.dav import DavClient, _auth_for, _safe_url
 from emailsync.options import Endpoint
 
@@ -17,5 +19,25 @@ def test_dav_client_accepts_endpoint_base_with_user_credentials():
     try:
         assert client.auth == ("alice", "secret")
         assert client.base == "https://dav.example.test/"
+    finally:
+        client.close()
+
+
+def test_dav_client_update_uses_if_match_and_returns_false_for_stale_etag():
+    requests = []
+    statuses = iter((204, 412))
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(next(statuses), request=request)
+
+    client = DavClient(Endpoint("carddav", url="https://dav.example.test"))
+    client.http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    try:
+        href = "https://dav.example.test/addressbook/person.vcf"
+        assert client.update(href, b"updated card", '"old-etag"') is True
+        assert client.update(href, b"stale card", '"old-etag"') is False
+        assert [request.headers["If-Match"] for request in requests] == ['"old-etag"', '"old-etag"']
+        assert [request.content for request in requests] == [b"updated card", b"stale card"]
     finally:
         client.close()

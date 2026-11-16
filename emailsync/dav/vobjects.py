@@ -109,7 +109,7 @@ def split_ics(text: str | bytes) -> list[tuple[str, bytes]]:
         out = Calendar()
         out.add("version", calendar.get("version", "2.0"))
         out.add("prodid", calendar.get("prodid", "-//email-sync//v1//EN"))
-        for tzid in _timezone_ids(components):
+        for tzid in sorted(_timezone_ids(components)):
             if tzid in zones:
                 out.add_component(zones[tzid])
         for component in components:
@@ -124,3 +124,18 @@ def event_fingerprint(summary: str, dtstart) -> str:
     )
     material = "\x1f".join((summary.strip().casefold(), value))
     return "event:" + hashlib.sha256(material.encode("utf-8", "replace")).hexdigest()
+
+
+def content_hash(data: bytes | str) -> str:
+    text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+    lines = []
+    for line in _unfold(text).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        name = line.split(":", 1)[0].split(";", 1)[0]
+        if name.upper() in {"DTSTAMP", "PRODID", "REV"}:
+            continue
+        lines.append(line)
+    material = "\n".join(lines).encode("utf-8", "replace")
+    return "sha256:" + hashlib.sha256(material).hexdigest()

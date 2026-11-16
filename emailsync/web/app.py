@@ -100,6 +100,7 @@ def _config_to_values(public_config):
         "verify",
         "sync_flags_labels",
         "remove_stale_labels",
+        "update_changed_items",
     ):
         if getattr(options, field):
             values[field] = "on"
@@ -231,6 +232,7 @@ async def _build_config(request, settings, upload_dirs=None, inherit_mail_creden
         verify=bool(form.get("verify")),
         sync_flags_labels=bool(form.get("sync_flags_labels")),
         remove_stale_labels=bool(form.get("remove_stale_labels")),
+        update_changed_items=bool(form.get("update_changed_items")),
         sync_interval_minutes=int(form.get("sync_interval_minutes") or 0),
     )
     config = JobConfig(

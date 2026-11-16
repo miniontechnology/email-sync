@@ -1,6 +1,6 @@
 from icalendar import Calendar
 
-from emailsync.dav.vobjects import ensure_vcard_uid, split_ics, split_vcards, vcard_info
+from emailsync.dav.vobjects import content_hash, ensure_vcard_uid, split_ics, split_vcards, vcard_info
 
 
 def test_split_vcards_unfolds_and_parses_properties():
@@ -19,6 +19,27 @@ def test_generated_vcard_uid_is_deterministic():
     assert uid.startswith("email-sync-")
     assert ensure_vcard_uid(card) == (uid, updated)
     assert vcard_info(updated)[0] == uid
+
+
+def test_content_hash_ignores_volatile_properties():
+    original = (
+        b"BEGIN:VCARD\r\nVERSION:3.0\r\nPRODID:first\r\nDTSTAMP:20240101T000000Z\r\n"
+        b"REV:20240101T000000Z\r\nFN:Example Person\r\nEND:VCARD\r\n"
+    )
+    changed_metadata = (
+        b"BEGIN:VCARD\r\nVERSION:3.0\r\nPRODID:second\r\nDTSTAMP:20250101T000000Z\r\n"
+        b"REV:20250101T000000Z\r\nFN:Example Person\r\nEND:VCARD\r\n"
+    )
+
+    assert content_hash(original) == content_hash(changed_metadata)
+
+
+def test_content_hash_changes_for_contact_name_and_event_summary():
+    contact = b"BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Example Person\r\nEND:VCARD\r\n"
+    event = b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Planning\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+
+    assert content_hash(contact) != content_hash(contact.replace(b"Example Person", b"Changed Person"))
+    assert content_hash(event) != content_hash(event.replace(b"Planning", b"Planning changed"))
 
 
 def test_split_ics_groups_recurrence_and_keeps_only_referenced_timezone():
@@ -52,7 +73,7 @@ BEGIN:VEVENT
 UID:series-1
 RECURRENCE-ID;TZID=Europe/Paris:20240108T100000
 SUMMARY:Planning moved
-DTSTART;TZID=Europe/Paris:20240108T110000
+DTSTART;TZID=America/New_York:20240108T110000
 END:VEVENT
 BEGIN:VEVENT
 SUMMARY:Generated
@@ -66,7 +87,8 @@ END:VCALENDAR
     series = groups["series-1"]
     assert len([c for c in series.subcomponents if c.name == "VEVENT"]) == 2
     zones = [c for c in series.subcomponents if c.name == "VTIMEZONE"]
-    assert [str(c.get("tzid")) for c in zones] == ["Europe/Paris"]
+    assert [str(c.get("tzid")) for c in zones] == ["America/New_York", "Europe/Paris"]
+    assert split_ics(text) == objects
     generated_uid, generated = next((uid, cal) for uid, cal in groups.items() if uid != "series-1")
     assert generated_uid.startswith("email-sync-")
     assert str(next(c for c in generated.subcomponents if c.name == "VEVENT").get("uid")) == generated_uid

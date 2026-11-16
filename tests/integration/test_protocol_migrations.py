@@ -11,7 +11,7 @@ from emailsync.connectors.dav import DavClient
 from emailsync.connectors.imap import ssl_context
 from emailsync.connectors.jmap import MAIL, JmapClient, keywords_to_flags
 from emailsync.dav.jmap_dest import JmapDavDestination
-from emailsync.dav.pipeline import DavMigration
+from emailsync.dav.pipeline import DavDestination, DavMigration
 from emailsync.dav.vobjects import ensure_vcard_uid
 from emailsync.jobs.control import RunControl
 from emailsync.mail.dest import make_dest
@@ -362,6 +362,17 @@ def _seed_radicale(kind, collection, filename, data):
     ],
 )
 def test_radicale_dav_and_file_sources_to_stalwart(tmp_path, kind, collection, filename, data):
+    if kind == "contacts":
+        _cleanup_dav_uid_prefix(
+            Endpoint(
+                "carddav",
+                url="http://127.0.0.1:15232/alice/contacts/",
+                username="alice",
+                password="radicalepass",
+            ),
+            "contacts",
+            "changed-",
+        )
     source_url = _seed_radicale(kind, collection, filename, data)
     endpoint_type = "carddav" if kind == "contacts" else "caldav"
     source = Endpoint(endpoint_type, url=source_url, username="alice", password="radicalepass")
@@ -439,6 +450,177 @@ def _query_jmap_items(kind, displayname):
         return destination.items(collection)
     finally:
         destination.close()
+
+
+def _jmap_object(kind, displayname, uid):
+    destination = JmapDavDestination(_jmap_destination(), kind).connect()
+    try:
+        collection = next(
+            (
+                item
+                for item in destination.collections
+                if item["displayname"].casefold() == displayname.casefold()
+            ),
+            destination.collections[0],
+        )
+        item = next(item for item in destination.items(collection) if item.uid == uid)
+        response = destination.client.call(
+            [
+                [
+                    f"{destination.object_name}/get",
+                    {"accountId": destination.client.account_id, "ids": [item.ref]},
+                    "g",
+                ]
+            ],
+            using=destination._using(),
+        )
+        return item, response[0][1]["list"][0], collection
+    finally:
+        destination.close()
+
+
+def _dav_items(endpoint, kind, displayname=None):
+    destination = DavDestination(endpoint, kind).connect()
+    try:
+        collection = next(
+            (
+                item
+                for item in destination.collections
+                if displayname and item["displayname"].casefold() == displayname.casefold()
+            ),
+            destination.collections[0],
+        )
+        return destination.items(collection), collection
+    finally:
+        destination.close()
+
+
+def _cleanup_dav_uid_prefix(endpoint, kind, prefix):
+    destination = DavDestination(endpoint, kind).connect()
+    try:
+        for collection in destination.collections:
+            for item in destination.items(collection):
+                if item.uid.startswith(prefix):
+                    destination.client._request("DELETE", item.ref)
+    finally:
+        destination.close()
+
+
+def _cleanup_jmap_uid_prefix(kind, displayname, prefix):
+    destination = JmapDavDestination(_jmap_destination(), kind).connect()
+    try:
+        collection = next(
+            (
+                item
+                for item in destination.collections
+                if item["displayname"].casefold() == displayname.casefold()
+            ),
+            destination.collections[0],
+        )
+        refs = [item.ref for item in destination.items(collection) if item.uid.startswith(prefix)]
+        if refs:
+            args = {"accountId": destination.client.account_id, "destroy": refs}
+            if kind == "calendars":
+                args["sendSchedulingMessages"] = False
+            destination.client.call(
+                [[f"{destination.object_name}/set", args, "d"]],
+                using=destination._using(),
+            )
+    finally:
+        destination.close()
+
+
+def _destroy_jmap_object(kind, displayname, uid, delete_collection=False):
+    destination = JmapDavDestination(_jmap_destination(), kind).connect()
+    try:
+        collection = next(
+            (
+                item
+                for item in destination.collections
+                if item["displayname"].casefold() == displayname.casefold()
+            ),
+            destination.collections[0],
+        )
+        item = next((item for item in destination.items(collection) if item.uid == uid), None)
+        if item:
+            destination.client.call(
+                [
+                    [
+                        f"{destination.object_name}/set",
+                        {
+                            "accountId": destination.client.account_id,
+                            "destroy": [item.ref],
+                            **({"sendSchedulingMessages": False} if kind == "calendars" else {}),
+                        },
+                        "d",
+                    ]
+                ],
+                using=destination._using(),
+            )
+        if delete_collection:
+            destination.client.call(
+                [
+                    [
+                        f"{destination.collection_name}/set",
+                        {"accountId": destination.client.account_id, "destroy": [collection["id"]]},
+                        "c",
+                    ]
+                ],
+                using=destination._using(),
+            )
+    finally:
+        destination.close()
+
+
+def _dav_config(kind, source, destination):
+    return JobConfig(
+        f"{kind} update integration",
+        {
+            kind: {"source": source, "dest": destination},
+            **{
+                other: {"source": None, "dest": None}
+                for other in ("mail", "contacts", "calendars")
+                if other != kind
+            },
+        },
+        Options(workers=1, verify=False),
+    )
+
+
+def _contact_vcard(uid, name, phone=True):
+    lines = ["BEGIN:VCARD", "VERSION:3.0", f"UID:{uid}", f"FN:{name}", f"EMAIL:{uid}@example.org"]
+    if phone:
+        lines.append("TEL;TYPE=WORK:+1-555-0100")
+    lines.append("END:VCARD")
+    return ("\r\n".join(lines) + "\r\n").encode()
+
+
+def _recurring_calendar(uid, changed=False):
+    summary = "Weekly planning changed" if changed else "Weekly planning"
+    exdate = "EXDATE:20300121T090000Z\r\n" if changed else ""
+    return (
+        "BEGIN:VCALENDAR\r\n"
+        "VERSION:2.0\r\n"
+        "PRODID:-//Email Sync Integration Tests//EN\r\n"
+        "BEGIN:VEVENT\r\n"
+        f"UID:{uid}\r\n"
+        "DTSTAMP:20261116T120000Z\r\n"
+        "DTSTART:20300107T090000Z\r\n"
+        "DTEND:20300107T100000Z\r\n"
+        "RRULE:FREQ=WEEKLY;COUNT=4\r\n"
+        f"SUMMARY:{summary}\r\n"
+        f"{exdate}"
+        "END:VEVENT\r\n"
+        "BEGIN:VEVENT\r\n"
+        f"UID:{uid}\r\n"
+        "RECURRENCE-ID:20300114T090000Z\r\n"
+        "DTSTAMP:20261116T120000Z\r\n"
+        "DTSTART:20300114T103000Z\r\n"
+        "DTEND:20300114T113000Z\r\n"
+        "SUMMARY:Rescheduled planning\r\n"
+        "END:VEVENT\r\n"
+        "END:VCALENDAR\r\n"
+    ).encode()
 
 
 def test_file_contacts_to_stalwart_jmap_is_idempotent(tmp_path):
@@ -545,3 +727,150 @@ def test_carddav_preseeded_contact_is_skipped_by_jmap_destination(tmp_path):
     assert result.status == "completed", result.error
     assert store.get_tasks(job_id)[0]["copied"] == 0
     assert store.get_tasks(job_id)[0]["skipped"] == 1
+
+
+def test_radicale_contacts_update_stalwart_carddav(tmp_path):
+    uid = f"changed-carddav-{uuid4().hex}"
+    filename = f"{uid}.vcf"
+    source_endpoint = Endpoint(
+        "carddav",
+        url="http://127.0.0.1:15232/alice/contacts/",
+        username="alice",
+        password="radicalepass",
+    )
+    destination_endpoint = Endpoint(
+        "carddav",
+        url="http://127.0.0.1:18080",
+        username=STALWART_USER,
+        password=STALWART_PASSWORD,
+    )
+    _cleanup_dav_uid_prefix(source_endpoint, "contacts", "changed-carddav-")
+    _cleanup_dav_uid_prefix(destination_endpoint, "contacts", "changed-carddav-")
+    source_url = _seed_radicale("contacts", "contacts", filename, _contact_vcard(uid, "Before"))
+    source = Endpoint("carddav", url=source_url, username="alice", password="radicalepass")
+    destination = Endpoint(
+        "carddav",
+        url="http://127.0.0.1:18080",
+        username=STALWART_USER,
+        password=STALWART_PASSWORD,
+    )
+    config = _dav_config("contacts", source, destination)
+    store = db.Store(tmp_path / "update-carddav.db")
+    job_id = store.create_job("Update CardDAV contact", {}, None)
+
+    result = DavMigration(store, job_id, "contacts", config, RunControl()).run()
+    assert result.status == "completed", result.error
+    before = [item for item in _dav_items(destination, "contacts")[0] if item.uid == uid]
+    assert len(before) == 1
+
+    changed = _contact_vcard(uid, "After", phone=False)
+    response = httpx.put(source_url + filename, auth=("alice", "radicalepass"), content=changed)
+    assert response.status_code in (200, 201, 204)
+    result = DavMigration(store, job_id, "contacts", config, RunControl()).run()
+    assert result.status == "completed", result.error
+    after = [item for item in _dav_items(destination, "contacts")[0] if item.uid == uid]
+    assert store.get_tasks(job_id)[0]["updated"] == 1
+    assert len(after) == len(before) == 1
+    assert b"FN:After" in after[0].data
+    assert b"TEL:" not in after[0].data
+    _cleanup_dav_uid_prefix(source_endpoint, "contacts", "changed-carddav-")
+    _cleanup_dav_uid_prefix(destination_endpoint, "contacts", "changed-carddav-")
+
+
+@pytest.mark.parametrize("source_type", ("file", "radicale"))
+def test_changed_contacts_update_stalwart_jmap(tmp_path, source_type):
+    uid = f"changed-jmap-{uuid4().hex}"
+    filename = f"{uid}.vcf"
+    _cleanup_jmap_uid_prefix("contacts", "Default", "changed-jmap-")
+    radicale_endpoint = Endpoint(
+        "carddav",
+        url="http://127.0.0.1:15232/alice/contacts/",
+        username="alice",
+        password="radicalepass",
+    )
+    if source_type == "radicale":
+        _cleanup_dav_uid_prefix(radicale_endpoint, "contacts", "changed-jmap-")
+    original = _contact_vcard(uid, "Before")
+    changed = _contact_vcard(uid, "After", phone=False)
+    if source_type == "file":
+        file_path = tmp_path / filename
+        file_path.write_bytes(original)
+        source = Endpoint("file", files=[str(file_path)])
+    else:
+        source_url = _seed_radicale("contacts", "contacts", filename, original)
+        source = Endpoint("carddav", url=source_url, username="alice", password="radicalepass")
+    config = _file_dav_config("contacts", tmp_path / filename, _jmap_destination())
+    config.endpoints["contacts"]["source"] = source
+    store = db.Store(tmp_path / f"update-jmap-{source_type}.db")
+    job_id = store.create_job("Update JMAP contact", {}, None)
+
+    result = DavMigration(store, job_id, "contacts", config, RunControl()).run()
+    assert result.status == "completed", result.error
+    before_items = [item for item in _query_jmap_items("contacts", "Default") if item.uid == uid]
+    assert len(before_items) == 1
+
+    if source_type == "file":
+        file_path.write_bytes(changed)
+    else:
+        response = httpx.put(source_url + filename, auth=("alice", "radicalepass"), content=changed)
+        assert response.status_code in (200, 201, 204)
+    result = DavMigration(store, job_id, "contacts", config, RunControl()).run()
+    assert result.status == "completed", result.error
+    after_items = [item for item in _query_jmap_items("contacts", "Default") if item.uid == uid]
+    _item, contact, _collection = _jmap_object("contacts", "Default", uid)
+    assert store.get_tasks(job_id)[0]["updated"] == 1
+    assert len(after_items) == len(before_items) == 1
+    assert contact["name"]["full"] == "After"
+    assert not contact.get("phones")
+    _destroy_jmap_object("contacts", "Default", uid)
+    if source_type == "radicale":
+        _cleanup_dav_uid_prefix(radicale_endpoint, "contacts", "changed-jmap-")
+
+
+@pytest.mark.parametrize("destination_type", ("caldav", "jmap"))
+def test_changed_recurring_event_updates_stalwart_destination(tmp_path, destination_type):
+    uid = f"changed-event-{uuid4().hex}"
+    file_path = tmp_path / f"event-update-{uuid4().hex}.ics"
+    file_path.write_bytes(_recurring_calendar(uid))
+    if destination_type == "jmap":
+        destination = _jmap_destination()
+    else:
+        destination = Endpoint(
+            "caldav",
+            url="http://127.0.0.1:18080",
+            username=STALWART_USER,
+            password=STALWART_PASSWORD,
+        )
+    config = _file_dav_config("calendars", file_path, destination)
+    store = db.Store(tmp_path / f"update-event-{destination_type}.db")
+    job_id = store.create_job("Update recurring event", {}, None)
+
+    result = DavMigration(store, job_id, "calendars", config, RunControl()).run()
+    assert result.status == "completed", result.error
+    if destination_type == "jmap":
+        before_items = [item for item in _query_jmap_items("calendars", file_path.stem) if item.uid == uid]
+    else:
+        before_items = [
+            item for item in _dav_items(destination, "calendars", file_path.stem)[0] if item.uid == uid
+        ]
+    assert len(before_items) == 1
+
+    file_path.write_bytes(_recurring_calendar(uid, changed=True))
+    result = DavMigration(store, job_id, "calendars", config, RunControl()).run()
+    assert result.status == "completed", result.error
+    if destination_type == "jmap":
+        after_items = [item for item in _query_jmap_items("calendars", file_path.stem) if item.uid == uid]
+        _item, event, _collection = _jmap_object("calendars", file_path.stem, uid)
+        overrides = event["recurrenceOverrides"]
+        assert event["title"] == "Weekly planning changed"
+        assert any(value.get("excluded") for value in overrides.values())
+    else:
+        after_items = [
+            item for item in _dav_items(destination, "calendars", file_path.stem)[0] if item.uid == uid
+        ]
+        assert b"SUMMARY:Weekly planning changed" in after_items[0].data
+        assert b"EXDATE:" in after_items[0].data
+    assert store.get_tasks(job_id)[0]["updated"] == 1
+    assert len(after_items) == len(before_items) == 1
+    if destination_type == "jmap":
+        _destroy_jmap_object("calendars", file_path.stem, uid, delete_collection=True)

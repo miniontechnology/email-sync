@@ -42,6 +42,15 @@ The named `email-sync-data` volume stores the SQLite database, encryption key wh
 configured, and any uploaded Takeout files. Back this volume up before upgrading or moving hosts.
 Changing `EMAIL_SYNC_SECRET_KEY` after creating jobs makes their saved credentials unreadable.
 
+## Updating changed contacts and events
+
+By default, contacts and events already copied are updated when their source content changes.
+Destination-only edits are left alone; when both sides changed, the source wins. The first run
+records a baseline for items already present at the destination, so those items are updated only
+after a later source change. Turn off **Update contacts and events that changed on the source**
+to keep the previous skip-existing behavior. Items matched only by fingerprint with a different
+UID are not updated, and items are never deleted.
+
 ## Google sign-in (OAuth)
 
 The Google preset uses an OAuth client that you create in your own Google Cloud project:

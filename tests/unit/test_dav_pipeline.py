@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 
 from emailsync import db
 from emailsync.dav.jmap_dest import JmapDavDestination
-from emailsync.dav.pipeline import DavMigration
+from emailsync.dav.pipeline import DavDestination, DavMigration
 from emailsync.dav.source import DavItem, DavScope
 from emailsync.jobs.control import RunControl
 from emailsync.options import Endpoint, JobConfig, Options
@@ -14,6 +14,8 @@ class State:
     destination: dict
     fail_after_put: bool = False
     put_calls: int = 0
+    update_calls: list = field(default_factory=list)
+    update_results: list = field(default_factory=list)
     create_calls: int = 0
     item_requests: list = field(default_factory=list)
     collections: list | None = None
@@ -74,13 +76,32 @@ class Destination:
         destination = self.state.destination.setdefault(collection["href"], [])
         if any(item.data == data for item in destination):
             return False
-        item = DavItem(filename.rsplit(".", 1)[0], data, "fingerprint:" + data.decode("utf-8", "replace"))
+        item = DavItem(
+            filename.rsplit(".", 1)[0],
+            data,
+            "fingerprint:" + data.decode("utf-8", "replace"),
+            ref=f"{collection['href']}/{filename}",
+            etag='"etag-1"',
+        )
         destination.append(item)
         if self.state.fail_after_put:
             self.state.fail_after_put = False
             from emailsync.errors import PermanentError
 
             raise PermanentError("simulated lost response after PUT")
+        return True
+
+    def update(self, _collection, ref, etag, data):
+        self.state.update_calls.append((ref, etag, data))
+        result = self.state.update_results.pop(0) if self.state.update_results else True
+        if isinstance(result, Exception):
+            raise result
+        if not result:
+            return False
+        item = next(item for items in self.state.destination.values() for item in items if item.ref == ref)
+        item.data = data
+        item.fingerprint = "fingerprint:" + data.decode("utf-8", "replace")
+        item.etag = f'"etag-{len(self.state.update_calls) + 1}"'
         return True
 
 
@@ -104,7 +125,7 @@ def config(kind="contacts", options=None):
     )
 
 
-def migrate(store, job_id, kind, state, options=None):
+def migrate(store, job_id, kind, state, options=None, log=None):
     return DavMigration(
         store,
         job_id,
@@ -113,7 +134,27 @@ def migrate(store, job_id, kind, state, options=None):
         RunControl(),
         source_factory=lambda ep, k: Source(state, ep, k),
         dest_factory=lambda ep, k: Destination(state, ep, k),
+        log=log,
     ).run()
+
+
+def test_dav_destination_items_carry_href_and_etag():
+    href = "https://dav.example.test/addressbook/person.vcf"
+    etag = '"etag-1"'
+    data = b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:person-1\r\nFN:Person\r\nEND:VCARD\r\n"
+
+    class Client:
+        def list_objects(self, _collection):
+            return [(href, etag, data)]
+
+    destination = DavDestination(Endpoint("carddav", url="https://dav.example.test"), "contacts")
+    destination.client = Client()
+
+    [item] = destination.items({"href": "https://dav.example.test/addressbook/"})
+
+    assert item.uid == "person-1"
+    assert item.ref == href
+    assert item.etag == etag
 
 
 def test_contact_copy_and_rerun_skip_by_uid(tmp_path):
@@ -127,6 +168,234 @@ def test_contact_copy_and_rerun_skip_by_uid(tmp_path):
     assert migrate(store, job_id, "contacts", state).status == "completed"
     assert len(state.destination["default"]) == 1
     assert store.get_tasks(job_id)[0]["already"] == 1
+
+
+def _contact(uid, name, phone=True, note=""):
+    lines = ["BEGIN:VCARD", "VERSION:3.0", f"UID:{uid}", f"FN:{name}"]
+    if phone:
+        lines.append("TEL;TYPE=WORK:+1-555-0100")
+    if note:
+        lines.append(f"NOTE:{note}")
+    lines.append("END:VCARD")
+    data = ("\r\n".join(lines) + "\r\n").encode()
+    return DavItem(uid, data, f"fp:{name}")
+
+
+def _baseline(row):
+    import json
+
+    return json.loads(row["info"])
+
+
+def test_changed_source_contact_is_updated_once_with_new_baseline(tmp_path):
+    store = db.Store(tmp_path / "contacts.db")
+    job_id = store.create_job("contacts", {}, None)
+    original = _contact("person-1", "One")
+    changed = _contact("person-1", "One Changed", phone=False, note="Updated")
+    state = State({"Takeout": [original]}, {})
+
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    first_row = store.ledger_items(job_id, "contacts", limit=None)[0]
+    old_hash = _baseline(first_row)["hash"]
+
+    state.items_by_scope["Takeout"] = [changed]
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    second_task = store.get_tasks(job_id)[0]
+    second_row = store.ledger_items(job_id, "contacts", limit=None)[0]
+    assert state.put_calls == 1
+    assert len(state.update_calls) == 1
+    assert second_task["updated"] == 1
+    assert (
+        second_task["already"] + second_task["copied"] + second_task["skipped"] + second_task["failed"]
+        == second_task["total"]
+    )
+    assert state.destination["default"][0].data == changed.data
+    assert _baseline(second_row)["hash"] != old_hash
+
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    assert store.get_tasks(job_id)[0]["updated"] == 0
+    assert len(state.update_calls) == 1
+
+
+def test_updated_contact_releases_old_fingerprint_for_later_source_item(tmp_path):
+    store = db.Store(tmp_path / "contacts.db")
+    job_id = store.create_job("contacts", {}, None)
+    original = _contact("person-1", "Alice")
+    changed = _contact("person-1", "Bob")
+    new_item = _contact("person-2", "Alice")
+    state = State({"Takeout": [original]}, {})
+    single_worker = Options(workers=1)
+
+    assert migrate(store, job_id, "contacts", state, single_worker).status == "completed"
+    state.destination["default"][0].fingerprint = original.fingerprint
+    state.items_by_scope["Takeout"] = [changed, new_item]
+
+    result = migrate(store, job_id, "contacts", state, single_worker)
+
+    assert result.status == "completed"
+    task = store.get_tasks(job_id)[0]
+    assert task["updated"] == 1
+    assert task["copied"] == 1
+    assert state.put_calls == 2
+    assert {item.uid for item in state.destination["default"]} == {"person-1", "person-2"}
+
+
+def test_legacy_ledger_info_is_upgraded_before_later_source_change(tmp_path):
+    store = db.Store(tmp_path / "contacts.db")
+    job_id = store.create_job("contacts", {}, None)
+    original = _contact("person-1", "One")
+    changed = _contact("person-1", "One Changed")
+    state = State({"Takeout": [original]}, {})
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+
+    row = store.ledger_items(job_id, "contacts", limit=None)[0]
+    legacy_fp = _baseline(row)["fp"]
+    store.ledger_mark(job_id, "contacts", row["source_key"], row["status"], info=legacy_fp)
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    upgraded = store.ledger_items(job_id, "contacts", limit=None)[0]
+    assert store.get_tasks(job_id)[0]["already"] == 1
+    assert _baseline(upgraded)["hash"]
+    assert state.update_calls == []
+
+    state.items_by_scope["Takeout"] = [changed]
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    assert len(state.update_calls) == 1
+    assert store.get_tasks(job_id)[0]["updated"] == 1
+
+
+def test_preseeded_item_gets_baseline_then_updates_on_later_change(tmp_path):
+    store = db.Store(tmp_path / "contacts.db")
+    job_id = store.create_job("contacts", {}, None)
+    original = _contact("person-1", "One")
+    changed = _contact("person-1", "One Changed", phone=False)
+    state = State(
+        {"Takeout": [original]},
+        {
+            "default": [
+                DavItem(
+                    original.uid,
+                    original.data,
+                    original.fingerprint,
+                    ref="default/person-1.vcf",
+                    etag='"preseed"',
+                )
+            ]
+        },
+    )
+
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    row = store.ledger_items(job_id, "contacts", limit=None)[0]
+    assert row["status"] == db.SKIPPED
+    assert _baseline(row)["hash"]
+    assert state.update_calls == []
+
+    state.items_by_scope["Takeout"] = [changed]
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    assert len(state.update_calls) == 1
+    assert store.get_tasks(job_id)[0]["updated"] == 1
+
+
+def test_dtstamp_only_change_does_not_update_destination(tmp_path):
+    store = db.Store(tmp_path / "contacts.db")
+    job_id = store.create_job("contacts", {}, None)
+    original_data = (
+        b"BEGIN:VCARD\r\nVERSION:3.0\r\nUID:person-1\r\nDTSTAMP:20240101T000000Z\r\nFN:One\r\nEND:VCARD\r\n"
+    )
+    changed_data = original_data.replace(b"20240101", b"20250101")
+    state = State(
+        {"Takeout": [DavItem("person-1", original_data, "fp:one")]},
+        {},
+    )
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    state.items_by_scope["Takeout"] = [DavItem("person-1", changed_data, "fp:one")]
+
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    assert state.update_calls == []
+    assert store.get_tasks(job_id)[0]["already"] == 1
+
+
+def test_changed_item_missing_by_uid_warns_without_recreating(tmp_path):
+    store = db.Store(tmp_path / "contacts.db")
+    job_id = store.create_job("contacts", {}, None)
+    original = _contact("person-1", "One")
+    state = State({"Takeout": [original]}, {})
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    state.destination["default"].clear()
+    state.items_by_scope["Takeout"] = [_contact("person-1", "Changed")]
+    logs = []
+
+    assert (
+        migrate(
+            store, job_id, "contacts", state, log=lambda level, message: logs.append((level, message))
+        ).status
+        == "completed"
+    )
+    task = store.get_tasks(job_id)[0]
+    assert task["already"] == 1
+    assert task["updated"] == 0
+    assert state.put_calls == 1
+    assert state.update_calls == []
+    assert (
+        "warning",
+        "1 changed item(s) weren't found in the destination by UID; they weren't updated",
+    ) in logs
+
+
+def test_update_conflict_keeps_baseline_and_retries_on_next_run(tmp_path):
+    from emailsync.errors import PermanentError
+
+    store = db.Store(tmp_path / "contacts.db")
+    job_id = store.create_job("contacts", {}, None)
+    original = _contact("person-1", "One")
+    changed = _contact("person-1", "Changed")
+    state = State({"Takeout": [original]}, {})
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    row = store.ledger_items(job_id, "contacts", limit=None)[0]
+    old_hash = _baseline(row)["hash"]
+    state.items_by_scope["Takeout"] = [changed]
+    state.update_results = [False]
+
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    conflicted = store.ledger_items(job_id, "contacts", limit=None)[0]
+    assert _baseline(conflicted)["hash"] == old_hash
+    assert conflicted["error"] == "destination changed during the run; will retry"
+    assert store.get_tasks(job_id)[0]["updated"] == 0
+
+    state.update_results = [PermanentError("temporary update failure"), True]
+    result = migrate(store, job_id, "contacts", state)
+    assert result.status == "completed_with_errors"
+    failed = store.ledger_items(job_id, "contacts", limit=None)[0]
+    assert _baseline(failed)["hash"] == old_hash
+    assert store.get_tasks(job_id)[0]["failed"] == 0
+    assert store.get_tasks(job_id)[0]["updated"] == 0
+
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    successful = store.ledger_items(job_id, "contacts", limit=None)[0]
+    assert _baseline(successful)["hash"] != old_hash
+    assert store.get_tasks(job_id)[0]["updated"] == 1
+
+
+def test_update_option_off_and_dry_run_do_not_write_destination_or_ledger(tmp_path):
+    store = db.Store(tmp_path / "contacts.db")
+    job_id = store.create_job("contacts", {}, None)
+    original = _contact("person-1", "One")
+    changed = _contact("person-1", "Changed")
+    state = State({"Takeout": [original]}, {})
+    assert migrate(store, job_id, "contacts", state).status == "completed"
+    row = store.ledger_items(job_id, "contacts", limit=None)[0]
+    old_info = row["info"]
+    state.items_by_scope["Takeout"] = [changed]
+
+    assert (
+        migrate(store, job_id, "contacts", state, Options(update_changed_items=False)).status == "completed"
+    )
+    assert store.get_tasks(job_id)[0]["updated"] == 0
+    assert state.update_calls == []
+
+    assert migrate(store, job_id, "contacts", state, Options(dry_run=True)).status == "completed"
+    assert store.get_tasks(job_id)[0]["updated"] == 1
+    assert store.ledger_items(job_id, "contacts", limit=None)[0]["info"] == old_info
+    assert state.update_calls == []
 
 
 def test_upload_response_loss_is_safe_to_resume(tmp_path):

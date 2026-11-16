@@ -26,6 +26,8 @@ class DavItem:
     uid: str
     data: bytes
     fingerprint: str
+    ref: str = ""
+    etag: str | None = None
 
 
 class DavSource:
