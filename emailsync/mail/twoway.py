@@ -304,6 +304,8 @@ class TwoWayReconciler:
             return
         if remove_folders and not getattr(self.dest, "can_remove", True):
             raise PermanentError("Destination lacks UIDPLUS; folder removals were skipped")
+        for folder in add_folders:
+            self.retry(lambda folder=folder: self.dest.resolve(folder, create=True), self.dest)
         flag_ops = []
         for copy in entry.copies:
             add = normalize_flags(add_flags)

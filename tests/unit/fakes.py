@@ -366,7 +366,10 @@ class FakeDest:
                     source_folder, _uid, key = self._key_for_ref(source_copy.ref)
                     flags = self.state.dest_flags.get((source_folder, key), source_copy.flags)
                     for folder in change.add_folders:
-                        self.state.destination.setdefault(folder, []).append(key)
+                        if folder not in self.state.destination:
+                            errors[change.source_key] = f"destination folder {folder!r} does not exist"
+                            break
+                        self.state.destination[folder].append(key)
                         self.state.dest_flags[(folder, key)] = flags
                 for copy in change.copies:
                     for folder in change.remove_folders:
