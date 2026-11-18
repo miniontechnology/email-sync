@@ -462,8 +462,9 @@ class TwoWayReconciler:
         desired_src_flags = (src_flags | source_add_flags) - source_remove_flags
         desired_dst_flags = (dst_flags | dest_add_flags) - dest_remove_flags
         desired_dst_flags -= unsupported_dst_flags
+        applied_dst_flags = (dest_add_flags | dest_remove_flags) - set(unsupported_dst_flags)
         remaining_dst_mixed = destination.mixed_flags - (
-            destination.normalize_copy_flags - set(unsupported_dst_flags)
+            destination.normalize_copy_flags - set(unsupported_dst_flags) | applied_dst_flags
         )
         self._put_pair(
             key,

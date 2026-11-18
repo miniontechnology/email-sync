@@ -418,6 +418,35 @@ def test_destination_mixed_flag_baseline_is_stable_until_copies_agree(tmp_path):
     assert store.pairs_get_all(job_id)["mid:mixed-baseline"]["dst_mixed"] == []
 
 
+def test_source_flag_changes_clear_mixed_destination_baseline(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:mixed-source-flags", b"mixed flags", ["INBOX"])
+    state = FakeMailState({"INBOX": [message], "Work": []})
+    state.destination["INBOX"] = ["mid:mixed-source-flags"]
+    state.destination["Work"] = ["mid:mixed-source-flags"]
+    state.dest_flags[("INBOX", "mid:mixed-source-flags")] = frozenset({"\\seen"})
+    state.dest_flags[("Work", "mid:mixed-source-flags")] = frozenset()
+
+    assert run_migration(store, job_id, state).status == "completed"
+    assert store.pairs_get_all(job_id)["mid:mixed-source-flags"]["dst_mixed"] == ["\\seen"]
+
+    message.flags = ("\\seen",)
+    marked_read = run_migration(store, job_id, state)
+
+    assert marked_read.status == "completed"
+    assert state.dest_flags[("INBOX", "mid:mixed-source-flags")] == frozenset({"\\seen"})
+    assert state.dest_flags[("Work", "mid:mixed-source-flags")] == frozenset({"\\seen"})
+    assert store.pairs_get_all(job_id)["mid:mixed-source-flags"]["dst_mixed"] == []
+
+    message.flags = ()
+    marked_unread = run_migration(store, job_id, state)
+
+    assert marked_unread.status == "completed"
+    assert message.flags == ()
+    assert state.dest_flags[("INBOX", "mid:mixed-source-flags")] == frozenset()
+    assert state.dest_flags[("Work", "mid:mixed-source-flags")] == frozenset()
+
+
 def test_destination_mixed_flag_column_migrates_legacy_pair_table(tmp_path):
     path = tmp_path / "legacy.db"
     connection = sqlite3.connect(path)
