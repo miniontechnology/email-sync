@@ -4,7 +4,7 @@ from copy import copy
 from dataclasses import dataclass
 
 from emailsync.mail.dest import StateApplyResult
-from emailsync.mail.folders import Folder
+from emailsync.mail.folders import Folder, gmail_real_targets
 from emailsync.mail.source import MessageMeta, Scope, SourceState
 from emailsync.mail.state import normalize_flags
 
@@ -119,12 +119,19 @@ class FakeSource:
     def _message(self, scope, uid):
         return next(message for message in self.state.messages[scope] if message.uid == uid)
 
+    def _targets(self, targets):
+        if self.gmail and self.options:
+            return gmail_real_targets(targets, self.options)[0]
+        return list(targets)
+
     def fetch_meta(self, scope, uids):
         result = {}
         for uid in uids:
             message = self._message(scope.name, uid)
             meta = message.meta(uid)
-            if self.options and self.options.two_way and not self.gmail:
+            if self.gmail:
+                meta.targets = self._targets(meta.targets)
+            elif self.options and self.options.two_way:
                 meta.targets = ["@trash"] if scope.target == "@trash" else [scope.target]
             result[uid] = meta
         return result
@@ -133,7 +140,7 @@ class FakeSource:
         states = {}
         for uid in uids:
             message = self._message(scope.name, uid)
-            targets = list(message.targets)
+            targets = self._targets(message.targets)
             if self.options and self.options.two_way and not self.gmail:
                 targets = ["@trash"] if scope.target == "@trash" else [scope.target]
             states[uid] = SourceState(tuple(message.flags), targets, message.archived)

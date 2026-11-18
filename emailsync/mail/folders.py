@@ -112,7 +112,7 @@ def map_source_folder(folder: Folder, options: Options) -> str | None:
     return "/".join(parts)
 
 
-def gmail_real_targets(labels, options: Options) -> tuple[list[str], bool]:
+def gmail_real_targets(labels, options: Options, ignore_exclusions: bool = False) -> tuple[list[str], bool]:
     """Return explicit Gmail targets and whether the message is starred."""
     targets: list[str] = []
     starred = False
@@ -121,7 +121,7 @@ def gmail_real_targets(labels, options: Options) -> tuple[list[str], bool]:
         if lowered == "\\starred":
             starred = True
             continue
-        if label in options.exclude_folders:
+        if label in options.exclude_folders and not ignore_exclusions:
             continue
         if label in options.folder_map:
             mapped = options.folder_map[label].strip()

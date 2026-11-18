@@ -476,6 +476,16 @@ class TwoWayReconciler:
         destination, dest_counts, dest_empty = self._destination_snapshot(pairs)
         reverse = self._reverse_map()
         scanned_source_targets = {target for targets in scope_targets.values() for target in targets}
+        excluded_source_targets = (
+            {
+                self._resolve(target)
+                for label in self.options.exclude_folders
+                for target in gmail_real_targets([label], self.options, ignore_exclusions=True)[0]
+            }
+            - {None}
+            if self.source.gmail
+            else set()
+        )
         ambiguous_keys = set()
         all_keys = set(source) | set(destination) | set(pairs)
         for key in all_keys:
@@ -588,7 +598,12 @@ class TwoWayReconciler:
                     )
                 )
             elif dst and dst.folders and not (src and src.folders) and pair.get("src_folders"):
-                if not (set(pair.get("src_folders") or ()) & scanned_source_targets):
+                pair_source_folders = set(pair.get("src_folders") or ())
+                if self.source.gmail:
+                    out_of_scope = pair_source_folders <= excluded_source_targets
+                else:
+                    out_of_scope = not (pair_source_folders & scanned_source_targets)
+                if out_of_scope:
                     self.store.pairs_delete(self.job_id, [key])
                     out_of_scope_pairs += 1
                 else:

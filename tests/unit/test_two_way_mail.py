@@ -317,6 +317,47 @@ def test_excluding_synced_source_folder_drops_pair_without_trashing(tmp_path):
     ]
 
 
+def test_gmail_deleting_last_message_with_label_trashes_destination_copy(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:gmail-last-work", b"work", ["Work"])
+    remaining = FakeMail("mid:gmail-other", b"other", ["INBOX"])
+    state = FakeMailState({"All Mail": [message, remaining]}, gmail=True)
+    assert run_migration(store, job_id, state).status == "completed"
+    assert state.destination["Work"] == ["mid:gmail-last-work"]
+
+    state.messages["All Mail"].remove(message)
+    result = run_migration(store, job_id, state)
+
+    assert result.status == "completed"
+    assert state.destination.get("Work", []) == []
+    assert state.destination["Trash"] == ["mid:gmail-last-work"]
+    assert "mid:gmail-last-work" not in store.pairs_get_all(job_id)
+    assert not any(message.key == "mid:gmail-last-work" for message in state.messages["All Mail"])
+
+
+def test_excluding_gmail_label_drops_pair_without_trashing(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:gmail-excluded-work", b"work", ["Work"])
+    remaining = FakeMail("mid:gmail-excluded-other", b"other", ["INBOX"])
+    state = FakeMailState({"All Mail": [message, remaining]}, gmail=True)
+    assert run_migration(store, job_id, state).status == "completed"
+    options = Options(
+        two_way=True,
+        sync_interval_minutes=15,
+        verify=False,
+        workers=1,
+        max_deletion_percent=100,
+        exclude_folders=["Work"],
+    )
+
+    result = run_migration(store, job_id, state, options)
+
+    assert result.status == "completed"
+    assert "mid:gmail-excluded-work" not in store.pairs_get_all(job_id)
+    assert state.destination["Work"] == ["mid:gmail-excluded-work"]
+    assert state.destination.get("Trash") is None
+
+
 def test_flag_conflict_sets_the_flag_on_both_sides(tmp_path):
     store, job_id = make_store(tmp_path)
     message = FakeMail("mid:flag-conflict", b"flags", ["INBOX"])
