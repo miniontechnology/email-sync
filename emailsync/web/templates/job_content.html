@@ -9,7 +9,7 @@
   </tbody></table></div>
   <div class="form-actions">
     <form action="/jobs/{{ job.id }}/deletions/apply" method="post" data-confirm="Move these messages to Trash and resume the job?"><button class="button primary" type="submit">Apply and resume</button></form>
-    <form action="/jobs/{{ job.id }}/deletions/discard" method="post" data-confirm="Discard this deletion plan? Discarded destination deletions may be copied back."><button class="button secondary" type="submit">Discard</button></form>
+    <form action="/jobs/{{ job.id }}/deletions/discard" method="post" data-confirm="Keep these messages where they are now? They won't be deleted on the other side."><button class="button secondary" type="submit">Keep messages where they are</button></form>
   </div>
 </section>
 {% endif %}

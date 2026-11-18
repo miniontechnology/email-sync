@@ -177,6 +177,9 @@ def test_deletion_review_apply_and_discard_routes(tmp_path):
 
     with TestClient(create_app(_settings, store, manager)) as client:
         assert "Deletions waiting for review" in client.get(f"/jobs/{apply_id}/fragment").text
+        discard_fragment = client.get(f"/jobs/{discard_id}/fragment").text
+        assert "Keep messages where they are" in discard_fragment
+        assert "They won't be deleted on the other side." in discard_fragment
         applied = client.post(f"/jobs/{apply_id}/deletions/apply", follow_redirects=False)
         discarded = client.post(f"/jobs/{discard_id}/deletions/discard", follow_redirects=False)
 
