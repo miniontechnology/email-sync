@@ -1,6 +1,6 @@
 """Minimal JMAP client for importing messages, contacts, and calendar events."""
 
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
@@ -88,6 +88,7 @@ class JmapClient:
         self.account_id = ""
         self.api_url = ""
         self.upload_url = ""
+        self.download_url = ""
         self.max_objects_in_get = 500
         self.max_calls = 16
 
@@ -114,6 +115,8 @@ class JmapClient:
         self.account_id = accounts[capability]
         self.api_url = _rebase(self.session["apiUrl"], self.base)
         self.upload_url = _rebase(self.session["uploadUrl"], self.base)
+        download_url = self.session.get("downloadUrl")
+        self.download_url = _rebase(download_url, self.base) if download_url else ""
         core = self.session.get("capabilities", {}).get(CORE, {})
         self.max_objects_in_get = int(core.get("maxObjectsInGet", 500) or 500)
         self.max_calls = int(core.get("maxCallsInRequest", 16) or 16)
@@ -151,6 +154,26 @@ class JmapClient:
             r = self.http.post(url, content=data, headers={"Content-Type": content_type})
             r.raise_for_status()
             return r.json()["blobId"]
+        except Exception as exc:
+            raise wrap(exc) from exc
+
+    def download(
+        self, blob_id: str, content_type: str = "message/rfc822", name: str = "message.eml"
+    ) -> bytes:
+        url = self.download_url
+        if not url:
+            raise PermanentError("JMAP session did not provide a download URL")
+        for key, value in (
+            ("accountId", self.account_id),
+            ("blobId", blob_id),
+            ("type", content_type),
+            ("name", name),
+        ):
+            url = url.replace("{" + key + "}", quote(str(value), safe=""))
+        try:
+            response = self.http.get(url)
+            response.raise_for_status()
+            return response.content
         except Exception as exc:
             raise wrap(exc) from exc
 

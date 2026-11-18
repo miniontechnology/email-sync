@@ -1,5 +1,6 @@
 """FastAPI application and browser UI."""
 
+import json
 import re
 import secrets
 import shutil
@@ -87,6 +88,8 @@ def _config_to_values(public_config):
             "archive_target": options.archive_target,
             "since": options.since,
             "sync_interval_minutes": options.sync_interval_minutes,
+            "max_deletions": options.max_deletions,
+            "max_deletion_percent": options.max_deletion_percent,
             "folder_map": format_folder_map(options.folder_map),
             "exclude_folders": "\n".join(options.exclude_folders),
         }
@@ -101,6 +104,7 @@ def _config_to_values(public_config):
         "sync_flags_labels",
         "remove_stale_labels",
         "update_changed_items",
+        "two_way",
     ):
         if getattr(options, field):
             values[field] = "on"
@@ -234,6 +238,9 @@ async def _build_config(request, settings, upload_dirs=None, inherit_mail_creden
         remove_stale_labels=bool(form.get("remove_stale_labels")),
         update_changed_items=bool(form.get("update_changed_items")),
         sync_interval_minutes=int(form.get("sync_interval_minutes") or 0),
+        two_way=bool(form.get("two_way")),
+        max_deletions=int(form.get("max_deletions") or 50),
+        max_deletion_percent=int(form.get("max_deletion_percent") or 10),
     )
     config = JobConfig(
         name=str(form.get("name") or ""),
@@ -513,6 +520,60 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             return HTMLResponse("Job not found", status_code=404)
         except ValueError as exc:
             return HTMLResponse(str(exc), status_code=400)
+        return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
+    @app.post("/jobs/{job_id}/deletions/apply")
+    async def apply_deletions(job_id: int):
+        job = store.get_job(job_id)
+        if not job:
+            return HTMLResponse("Job not found", status_code=404)
+        pending = job.get("pending_deletions") or []
+        if not pending:
+            return HTMLResponse("No deletions are waiting for review", status_code=400)
+        approved = sorted({item["key"] for item in pending if item.get("key")})
+        store.update_job(
+            job_id,
+            approved_deletions=json.dumps(approved),
+            pending_deletions=None,
+        )
+        manager.resume(job_id)
+        return RedirectResponse(f"/jobs/{job_id}", status_code=303)
+
+    @app.post("/jobs/{job_id}/deletions/discard")
+    async def discard_deletions(job_id: int):
+        job = store.get_job(job_id)
+        if not job:
+            return HTMLResponse("Job not found", status_code=404)
+        pending = job.get("pending_deletions") or []
+        if not pending:
+            return HTMLResponse("No deletions are waiting for review", status_code=400)
+        pairs = store.pairs_get_all(job_id)
+        updates = []
+        remove = []
+        for item in pending:
+            key = item.get("key")
+            pair = pairs.get(key)
+            if not key or not pair:
+                continue
+            if item.get("side") == "destination":
+                updates.append(
+                    {
+                        "key": key,
+                        "state": "ignored",
+                        "src_folders": [],
+                        "src_flags": [],
+                        "dst_folders": pair.get("dst_folders") or [],
+                        "dst_flags": pair.get("dst_flags") or [],
+                    }
+                )
+            else:
+                remove.append(key)
+        if updates:
+            store.pairs_put_many(job_id, updates)
+        if remove:
+            store.pairs_delete(job_id, remove)
+        store.update_job(job_id, pending_deletions=None, approved_deletions=None)
+        manager.resume(job_id)
         return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
     @app.post("/jobs/{job_id}/{action}")

@@ -44,6 +44,10 @@ class DestIndex:
         with self._lock:
             return list(self._refs.get(key, ()))
 
+    def entries(self) -> dict[str, list[DestCopy]]:
+        with self._lock:
+            return {key: list(copies) for key, copies in self._refs.items()}
+
     def count(self, folder: str, key: str) -> int:
         return self._counts[folder][key]
 

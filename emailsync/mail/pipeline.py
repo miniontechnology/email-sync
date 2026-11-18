@@ -14,6 +14,7 @@ from emailsync.mail.dest import make_dest
 from emailsync.mail.index import DestIndex
 from emailsync.mail.source import SourceState, make_source
 from emailsync.mail.state import normalize_flags, plan_change
+from emailsync.mail.twoway import TwoWayReconciler
 from emailsync.options import JobConfig
 
 MAX_BATCH_MESSAGES = 25
@@ -41,7 +42,17 @@ class _Progress:
         self.job_id = job_id
         self.kind = kind
         self.lock = threading.Lock()
-        self.values = dict(total=0, already=0, copied=0, skipped=0, updated=0, failed=0, bytes=0)
+        self.values = dict(
+            total=0,
+            already=0,
+            copied=0,
+            skipped=0,
+            updated=0,
+            copied_back=0,
+            trashed=0,
+            failed=0,
+            bytes=0,
+        )
         self.scopes = {}
         self.message = "Connecting"
         self.last_flush = 0.0
@@ -71,10 +82,12 @@ class _Progress:
     def increment(self, name, field, amount=1):
         with self.lock:
             self.values[field] += amount
-            row = self.scopes.setdefault(
-                name, dict(total=0, already=0, copied=0, skipped=0, updated=0, failed=0, status="running")
-            )
-            row[field] = row.get(field, 0) + amount
+            if name != "__total__":
+                row = self.scopes.setdefault(
+                    name,
+                    dict(total=0, already=0, copied=0, skipped=0, updated=0, failed=0, status="running"),
+                )
+                row[field] = row.get(field, 0) + amount
         self.flush()
 
     def total(self, name, amount):
@@ -129,9 +142,12 @@ class MailMigration:
         self._state_ambiguous = 0
         self._state_error_count = 0
         self._state_summary_emitted = False
+        self._two_way_paused = False
+        self._two_way_pause_message = None
         self._queue = queue.Queue(maxsize=max(2, self.options.workers * 2))
         self._coordinator_source = None
         self._coordinator_dest = None
+        self._run_started_at = 0.0
 
     def _log(self, level, message):
         self.store.add_event(self.job_id, level, message)
@@ -395,7 +411,7 @@ class MailMigration:
                         self._index_folder(dest, target)
                     self.index.account_for(row.get("match_key") or "", targets)
                     self.progress.increment(scope.name, "already")
-                    if self.options.sync_flags_labels:
+                    if self.options.sync_flags_labels and not self.options.two_way:
                         settled_rows.append((uid, row))
                 else:
                     metadata_uids.append(uid)
@@ -427,7 +443,7 @@ class MailMigration:
                         self.job_id, "mail", source_key, db.SKIPPED, match_key=meta.key, targets=folder_keys
                     )
                     self.progress.increment(scope.name, "skipped")
-                    if self.options.sync_flags_labels:
+                    if self.options.sync_flags_labels and not self.options.two_way:
                         skipped_rows.append(
                             (
                                 {
@@ -463,7 +479,12 @@ class MailMigration:
                     work, work_bytes = [], 0
                 work.append(item)
                 work_bytes += max(0, item.size)
-            if self.options.sync_flags_labels and not self.control.stopped and not self.control.aborted:
+            if (
+                self.options.sync_flags_labels
+                and not self.options.two_way
+                and not self.control.stopped
+                and not self.control.aborted
+            ):
                 state_rows = []
                 if settled_rows:
                     source_states = (
@@ -579,11 +600,29 @@ class MailMigration:
                 )
                 self.progress.increment(item.scope.name, "copied")
                 self.progress.increment(item.scope.name, "bytes", len(raw))
+                if self.options.two_way:
+                    self.store.pairs_put_many(
+                        self.job_id,
+                        [
+                            dict(
+                                key=item.key,
+                                state="synced",
+                                src_folders=item.folders,
+                                src_flags=normalize_flags(item.flags),
+                                dst_folders=item.folders,
+                                dst_flags=normalize_flags(item.flags),
+                            )
+                        ],
+                    )
             except (AuthError, FatalError) as exc:
                 self.control.abort(exc)
                 return
             except BaseException as exc:
                 self._note_failure(item.scope.name, item.source_key, item.key, item.folders, wrap(exc))
+
+    def _note_two_way_failure(self, _message):
+        with self._failure_lock:
+            self._failed += 1
 
     def _verify(self):
         self.progress.set_message("Verifying destination")
@@ -593,17 +632,36 @@ class MailMigration:
             self._connect(dest)
             index = DestIndex(scope=self.options.dedup_scope)
             rows = self.store.ledger_items(self.job_id, "mail", limit=None)
+            pairs = self.store.pairs_get_all(self.job_id) if self.options.two_way else {}
             targets = {target for row in rows if row["status"] in db.SETTLED for target in row["targets"]}
-            if getattr(dest, "index_mode", "lazy") == "all" or self.options.dedup_scope == "account":
+            if (
+                getattr(dest, "index_mode", "lazy") == "all"
+                or self.options.dedup_scope == "account"
+                or self.options.two_way
+            ):
                 self._retry(lambda: dest.index_all(index), dest)
             else:
                 for target in targets:
                     self._retry(lambda target=target: dest.index_folder(target, index), dest)
             missing_count = 0
+            verified_keys = set()
             for row in rows:
                 if row["status"] not in db.SETTLED:
                     continue
-                missing = index.decide(row.get("match_key") or "", row["targets"])
+                key = row.get("match_key") or ""
+                if self.options.two_way:
+                    if key in verified_keys:
+                        continue
+                    verified_keys.add(key)
+                    pair = pairs.get(key)
+                    if not pair or not pair.get("dst_folders"):
+                        continue
+                    if float(pair.get("updated_at") or 0) < self._run_started_at:
+                        continue
+                    row_targets = pair["dst_folders"]
+                else:
+                    row_targets = row["targets"]
+                missing = index.decide(key, row_targets)
                 if missing:
                     self.store.ledger_mark(
                         self.job_id,
@@ -623,6 +681,7 @@ class MailMigration:
             dest.close()
 
     def run(self) -> TaskResult:
+        self._run_started_at = time.time()
         self.store.reset_task(self.job_id, "mail", "running")
         self.progress.flush(force=True)
         self._coordinator_source = self.source_factory(self.config.endpoints["mail"]["source"], self.options)
@@ -633,6 +692,8 @@ class MailMigration:
             self._connect(self._coordinator_source)
             self._connect(self._coordinator_dest)
             scopes = self._retry(self._coordinator_source.scopes, self._coordinator_source) or []
+            if self.options.two_way:
+                scopes = [scope for scope in scopes if scope.target != "@trash"]
             self.progress.set_scopes(
                 {
                     scope.name: dict(
@@ -656,9 +717,39 @@ class MailMigration:
             if (
                 getattr(self._coordinator_dest, "index_mode", "lazy") == "all"
                 or self.options.dedup_scope == "account"
+                or self.options.two_way
             ):
                 self.progress.set_message("Indexing destination…")
                 self._retry(lambda: self._coordinator_dest.index_all(self.index), self._coordinator_dest)
+            reconciler = None
+            baseline_after_copy = False
+            if self.options.two_way:
+                reconciler = TwoWayReconciler(
+                    self.store,
+                    self.job_id,
+                    self._coordinator_source,
+                    self._coordinator_dest,
+                    self.options,
+                    self._retry,
+                    self.progress,
+                    self._say,
+                    self._note_two_way_failure,
+                )
+                job = self.store.get_job(self.job_id)
+                if self.options.dry_run:
+                    if job.get("twoway_baseline_at"):
+                        reconciler.reconcile(plan_only=True)
+                    else:
+                        self._say("Two-way baseline will be recorded on the first real run")
+                elif job.get("twoway_baseline_at"):
+                    if reconciler.reconcile():
+                        self._two_way_paused = True
+                        pending = self.store.get_job(self.job_id).get("pending_deletions") or []
+                        self._two_way_pause_message = f"{len(pending)} messages would be moved to Trash; review and apply on the job page"
+                    self.index = DestIndex(scope=self.options.dedup_scope)
+                    self._retry(lambda: self._coordinator_dest.index_all(self.index), self._coordinator_dest)
+                else:
+                    baseline_after_copy = True
             if not self.options.dry_run:
                 self._producer_done = False
                 for worker_id in range(self.options.workers):
@@ -685,6 +776,9 @@ class MailMigration:
                             continue
                 for thread in workers:
                     thread.join()
+            if baseline_after_copy and not self.control.stopped and not self.control.aborted:
+                reconciler.reconcile(baseline=True)
+                self.store.update_job(self.job_id, twoway_baseline_at=time.time())
             self._emit_state_summaries()
             if self.control.aborted:
                 error = str(self.control.error or "Task aborted")
@@ -697,7 +791,15 @@ class MailMigration:
                 if self.options.verify and not self.options.dry_run:
                     self._verify()
                 with self._failure_lock:
-                    status = "completed_with_errors" if self._failed else "completed"
+                    status = (
+                        "paused"
+                        if self._two_way_paused
+                        else "completed_with_errors"
+                        if self._failed
+                        else "completed"
+                    )
+                if self._two_way_paused:
+                    error = self._two_way_pause_message
             self.progress.set_message(status.replace("_", " ").capitalize())
             self.progress.flush(force=True)
             self.store.update_task(

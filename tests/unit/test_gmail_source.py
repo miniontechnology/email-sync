@@ -6,26 +6,57 @@ from emailsync.options import Endpoint, Options
 
 
 class FakeImap:
-    labels = ["\\Inbox", "Projects/Planning", "\\Starred"]
+    def __init__(self):
+        self.labels = ["\\Inbox", "Projects/Planning", "\\Starred"]
+        self.calls = []
+        self.selected = []
+        self.search_results = [1]
 
-    def ensure_selected(self, _name):
-        pass
+    def ensure_selected(self, name):
+        self.selected.append(name)
 
     def has(self, capability):
-        return capability == "X-GM-EXT-1"
+        return capability in ("X-GM-EXT-1", "MOVE")
 
     def list_folders(self):
         from emailsync.mail.folders import Folder
 
-        return [
+        folders = [
             Folder("[Gmail]/All Mail", "/", ("\\All",)),
             Folder("INBOX", "/", ("\\Inbox",)),
             Folder("[Gmail]/Spam", "/", ("\\Junk",)),
             Folder("[Gmail]/Trash", "/", ("\\Trash",)),
         ]
+        folders.extend(Folder(label, "/", ()) for label in self.labels if not label.startswith("\\"))
+        return folders
 
     def select(self, name, readonly=True):
         return {"uidvalidity": 1}
+
+    def create_folder(self, name):
+        self.calls.append(("create_folder", name))
+        if name not in self.labels:
+            self.labels.append(name)
+
+    def append(self, folder, raw, flags, internaldate):
+        self.calls.append(("append", folder, raw, flags, internaldate))
+        return "uid"
+
+    def ensure_writable(self, name):
+        self.calls.append(("ensure_writable", name))
+
+    def search_header(self, name, value):
+        self.calls.append(("search_header", name, value))
+        return self.search_results
+
+    def add_gmail_labels(self, uids, labels):
+        self.calls.append(("add_gmail_labels", uids, labels))
+
+    def remove_gmail_labels(self, uids, labels):
+        self.calls.append(("remove_gmail_labels", uids, labels))
+
+    def move(self, uids, folder):
+        self.calls.append(("move", uids, folder))
 
     def search_uids(self, since=None):
         return [1]
@@ -91,3 +122,85 @@ def test_gmail_optional_spam_trash_and_modified_utf7_labels():
     source.conn = FakeImap()
     assert [scope.name for scope in source.scopes()] == ["[Gmail]/All Mail", "[Gmail]/Spam", "[Gmail]/Trash"]
     assert decode_label(encode("Projet été")) == "Projet été"
+
+
+def test_gmail_two_way_folder_labels_archive_and_trash_use_gmail_operations():
+    source = ImapSource(
+        Endpoint("gmail", host="imap.gmail.com"),
+        Options(two_way=True),
+        gmail=True,
+    )
+    connection = FakeImap()
+    source.conn = connection
+
+    source.add_folder(("[Gmail]/All Mail", 7), "Projects")
+    source.remove_folder(("[Gmail]/All Mail", 7), "Old")
+    source.remove_folder(("[Gmail]/All Mail", 7), "@inbox")
+    source.to_trash([("[Gmail]/All Mail", 7), ("[Gmail]/Trash", 8)])
+
+    assert ("add_gmail_labels", [7], ["Projects"]) in connection.calls
+    assert ("remove_gmail_labels", [7], ["Old"]) in connection.calls
+    assert ("remove_gmail_labels", [7], ["\\Inbox"]) in connection.calls
+    assert ("move", [7], "[Gmail]/Trash") in connection.calls
+    assert ("move", [8], "[Gmail]/Trash") not in connection.calls
+
+
+def test_gmail_append_creates_missing_custom_label_but_not_system_folders():
+    source = ImapSource(Endpoint("gmail", host="imap.gmail.com"), Options(two_way=True), gmail=True)
+    connection = FakeImap()
+    source.conn = connection
+
+    source.append("New/Label", b"message")
+    source.append("[Gmail]/Trash", b"trash")
+    source.append("INBOX", b"inbox")
+
+    assert ("create_folder", "New/Label") in connection.calls
+    assert ("append", "New/Label", b"message", (), None) in connection.calls
+    assert ("create_folder", "[Gmail]/Trash") not in connection.calls
+    assert ("create_folder", "INBOX") not in connection.calls
+    assert connection.calls.index(("create_folder", "New/Label")) < connection.calls.index(
+        ("append", "New/Label", b"message", (), None)
+    )
+
+
+def test_has_message_searches_message_id_in_target_or_gmail_all_mail():
+    imap = ImapSource(Endpoint("imap", host="imap.example.test"), Options())
+    imap_connection = FakeImap()
+    imap.conn = imap_connection
+    assert imap.has_message("Work", "mid:one@example.test") is True
+    assert imap_connection.selected == ["Work"]
+    assert ("search_header", "Message-ID", "<one@example.test>") in imap_connection.calls
+
+    gmail = ImapSource(
+        Endpoint("gmail", host="imap.gmail.com"),
+        Options(),
+        gmail=True,
+    )
+    gmail_connection = FakeImap()
+    gmail.conn = gmail_connection
+    assert gmail.has_message("Projects", "mid:two@example.test") is True
+    assert gmail_connection.selected == ["[Gmail]/All Mail"]
+    assert ("search_header", "Message-ID", "<two@example.test>") in gmail_connection.calls
+
+
+def test_imap_source_uses_move_for_a_folder_move_when_supported():
+    source = ImapSource(Endpoint("imap", host="imap.example.test"), Options())
+    connection = FakeImap()
+    source.conn = connection
+
+    assert source.move_folder(("INBOX", 9), "Work") is True
+
+    assert ("create_folder", "Work") in connection.calls
+    assert ("ensure_writable", "INBOX") in connection.calls
+    assert ("move", [9], "Work") in connection.calls
+
+
+def test_imap_source_to_trash_skips_locations_already_in_trash():
+    source = ImapSource(Endpoint("imap", host="imap.example.test"), Options(two_way=True))
+    connection = FakeImap()
+    source.conn = connection
+
+    source.to_trash([("INBOX", 3), ("[Gmail]/Trash", 4)])
+
+    assert ("move", [3], "[Gmail]/Trash") in connection.calls
+    assert ("move", [4], "[Gmail]/Trash") not in connection.calls
