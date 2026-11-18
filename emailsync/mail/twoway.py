@@ -133,7 +133,7 @@ class TwoWayReconciler:
             ):
                 empty = True
                 self.log(f"Source folder {scope} looks empty; skipped deletions this run", "warning")
-        return entries, source_counts, empty, scope_counts
+        return entries, source_counts, empty, scope_counts, scope_targets
 
     def _destination_snapshot(self):
         index = DestIndex(scope="account")
@@ -442,9 +442,10 @@ class TwoWayReconciler:
 
     def reconcile(self, baseline=False, plan_only=False):
         pairs = self.store.pairs_get_all(self.job_id)
-        source, source_counts, source_empty, _ = self._source_snapshot(pairs)
+        source, source_counts, source_empty, _, scope_targets = self._source_snapshot(pairs)
         destination, dest_counts, dest_empty = self._destination_snapshot()
         reverse = self._reverse_map()
+        scanned_source_targets = {target for targets in scope_targets.values() for target in targets}
         ambiguous_keys = set()
         all_keys = set(source) | set(destination) | set(pairs)
         for key in all_keys:
@@ -509,6 +510,7 @@ class TwoWayReconciler:
             return False
 
         deletions = []
+        out_of_scope_pairs = 0
         for key in sorted(all_keys):
             if key in ambiguous_keys:
                 continue
@@ -549,13 +551,28 @@ class TwoWayReconciler:
                     dict(key=key, side="source", folder=folder, locations=src.locations, copies=[])
                 )
             elif dst and dst.folders and not (src and src.folders) and pair.get("src_folders"):
-                folder = sorted(dst.folders)[0]
-                deletions.append(
-                    dict(key=key, side="destination", folder=folder, locations=[], copies=dst.copies)
-                )
+                if not (set(pair.get("src_folders") or ()) & scanned_source_targets):
+                    self.store.pairs_delete(self.job_id, [key])
+                    out_of_scope_pairs += 1
+                else:
+                    folder = sorted(dst.folders)[0]
+                    deletions.append(
+                        dict(
+                            key=key,
+                            side="destination",
+                            folder=folder,
+                            locations=[],
+                            copies=dst.copies,
+                        )
+                    )
             elif not (src and src.folders) and not (dst and dst.folders):
                 self.store.pairs_delete(self.job_id, [key])
 
+        if out_of_scope_pairs:
+            self.log(
+                f"{out_of_scope_pairs} message(s) left out of the current source scope; tracking dropped without trashing",
+                "info",
+            )
         if (source_empty or dest_empty) and pairs:
             self._log_copyback_summaries()
             self.log(

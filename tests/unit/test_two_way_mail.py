@@ -277,6 +277,44 @@ def test_copyback_unscanned_or_junk_target_is_left_alone_with_summary(tmp_path, 
     assert state.destination.get("Trash") is None
 
 
+def test_excluding_synced_source_folder_drops_pair_without_trashing(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:excluded-work", b"work", ["Work"])
+    state = FakeMailState(
+        {
+            "INBOX": [FakeMail("mid:seed", b"seed", ["INBOX"])],
+            "Work": [message],
+        }
+    )
+    assert run_migration(store, job_id, state).status == "completed"
+    assert "mid:excluded-work" in store.pairs_get_all(job_id)
+    options = Options(
+        two_way=True,
+        sync_interval_minutes=15,
+        verify=False,
+        workers=1,
+        max_deletion_percent=100,
+        exclude_folders=["Work"],
+    )
+
+    result = run_migration(store, job_id, state, options)
+
+    assert result.status == "completed"
+    assert "mid:excluded-work" not in store.pairs_get_all(job_id)
+    assert state.destination["Work"] == ["mid:excluded-work"]
+    assert state.messages["Work"] == [message]
+    assert state.destination.get("Trash") is None
+    assert state.messages.get("Trash") is None
+    summaries = [
+        event["message"]
+        for event in store.get_events(job_id)
+        if "left out of the current source scope" in event["message"]
+    ]
+    assert summaries == [
+        "1 message(s) left out of the current source scope; tracking dropped without trashing"
+    ]
+
+
 def test_flag_conflict_sets_the_flag_on_both_sides(tmp_path):
     store, job_id = make_store(tmp_path)
     message = FakeMail("mid:flag-conflict", b"flags", ["INBOX"])
