@@ -375,24 +375,41 @@ class TwoWayReconciler:
                 self.retry(lambda flag=flag: self.source.set_flags(source.locations, [flag], []), self.source)
             for flag in source_remove_flags:
                 self.retry(lambda flag=flag: self.source.set_flags(source.locations, [], [flag]), self.source)
-            for folder in sorted(source_add):
-                source_folder = reverse.get(folder, folder)
-                self.retry(
-                    lambda source_folder=source_folder: self.source.add_folder(
-                        source.locations[0], source_folder
-                    ),
-                    self.source,
-                )
-            for folder in sorted(source_remove):
-                mapped = reverse.get(folder, folder)
-                locations = source.folder_locations.get(folder, source.locations)
-                for location in locations:
-                    removed = self.retry(
-                        lambda location=location, mapped=mapped: self.source.remove_folder(location, mapped),
+            moved_source = False
+            if not self.source.gmail and len(source_add) == len(source_remove) == 1:
+                removed_folder = next(iter(source_remove))
+                added_folder = next(iter(source_add))
+                locations = source.folder_locations.get(removed_folder, [])
+                source_target = reverse.get(added_folder, added_folder)
+                if not locations:
+                    raise PermanentError(f"Source message is missing from {removed_folder}")
+                move_results = [self.source.move_folder(location, source_target) for location in locations]
+                if any(move_results) and not all(move_results):
+                    raise PermanentError("Source MOVE only completed for part of a folder move")
+                moved_source = bool(move_results) and all(move_results)
+            if not moved_source:
+                for folder in sorted(source_add):
+                    source_folder = reverse.get(folder, folder)
+                    self.retry(
+                        lambda source_folder=source_folder: self.source.add_folder(
+                            source.locations[0], source_folder
+                        ),
                         self.source,
                     )
-                    if not removed:
-                        raise PermanentError("Source lacks UIDPLUS; folder removal was skipped")
+                for folder in sorted(source_remove):
+                    mapped = reverse.get(folder, folder)
+                    locations = source.folder_locations.get(folder, [])
+                    if not locations:
+                        raise PermanentError(f"Source message is missing from {folder}")
+                    for location in locations:
+                        removed = self.retry(
+                            lambda location=location, mapped=mapped: self.source.remove_folder(
+                                location, mapped
+                            ),
+                            self.source,
+                        )
+                        if not removed:
+                            raise PermanentError("Source lacks UIDPLUS; folder removal was skipped")
         except Exception as exc:
             self.warning_count += 1
             if self.warning_count <= 20:

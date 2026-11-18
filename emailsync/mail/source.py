@@ -214,6 +214,15 @@ class ImapSource:
         self.conn.copy([uid], folder)
         return True
 
+    def move_folder(self, location, folder):
+        if self.gmail or not self.conn.has("MOVE"):
+            return False
+        scope, uid = location
+        self.ensure_folder(folder)
+        self.conn.ensure_writable(scope)
+        self.conn.move([uid], folder)
+        return True
+
     def remove_folder(self, location, folder):
         scope, uid = location
         self.conn.ensure_writable(scope)
