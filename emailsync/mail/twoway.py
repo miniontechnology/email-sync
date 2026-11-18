@@ -548,7 +548,14 @@ class TwoWayReconciler:
             elif src and src.folders and not (dst and dst.folders) and pair.get("dst_folders"):
                 folder = sorted(src.folders)[0] if src.folders else "unknown"
                 deletions.append(
-                    dict(key=key, side="source", folder=folder, locations=src.locations, copies=[])
+                    dict(
+                        key=key,
+                        side="source",
+                        folder=folder,
+                        folders=set(src.folders),
+                        locations=src.locations,
+                        copies=[],
+                    )
                 )
             elif dst and dst.folders and not (src and src.folders) and pair.get("src_folders"):
                 if not (set(pair.get("src_folders") or ()) & scanned_source_targets):
@@ -561,6 +568,7 @@ class TwoWayReconciler:
                             key=key,
                             side="destination",
                             folder=folder,
+                            folders=set(dst.folders),
                             locations=[],
                             copies=dst.copies,
                         )
@@ -585,7 +593,8 @@ class TwoWayReconciler:
             return False
         total_by_folder = defaultdict(int)
         for item in deletions:
-            total_by_folder[(item["side"], item["folder"])] += 1
+            for folder in item["folders"]:
+                total_by_folder[(item["side"], folder)] += 1
         over_percent = any(
             count >= 20 and total_by_folder[(side, folder)] * 100 > count * self.options.max_deletion_percent
             for side, counts in (("source", source_counts), ("destination", dest_counts))

@@ -409,6 +409,33 @@ def test_percent_threshold_pauses_for_deletion_in_folder_with_twenty_messages(tm
     assert state.destination.get("Trash") is None
 
 
+def test_percent_threshold_counts_every_folder_for_multifolder_deletion(tmp_path):
+    store, job_id = make_store(tmp_path)
+    shared_inbox_copy = FakeMail("mid:multi-folder", b"shared", ["INBOX", "Work"])
+    shared_work_copy = FakeMail("mid:multi-folder", b"shared", ["INBOX", "Work"])
+    work_messages = [shared_work_copy] + [
+        FakeMail(f"mid:work-{number}", str(number).encode(), ["Work"]) for number in range(19)
+    ]
+    state = FakeMailState({"INBOX": [shared_inbox_copy], "Work": work_messages})
+    assert run_migration(store, job_id, state).status == "completed"
+    state.destination["INBOX"].remove("mid:multi-folder")
+    state.destination["Work"].remove("mid:multi-folder")
+    options = Options(
+        two_way=True,
+        sync_interval_minutes=15,
+        verify=False,
+        workers=1,
+        max_deletions=100,
+        max_deletion_percent=1,
+    )
+
+    result = run_migration(store, job_id, state, options)
+
+    assert result.status == "paused"
+    assert [item["key"] for item in store.get_job(job_id)["pending_deletions"]] == ["mid:multi-folder"]
+    assert state.destination.get("Trash") is None
+
+
 def test_missing_source_trash_keeps_pair_and_does_not_expunge(tmp_path):
     store, job_id = make_store(tmp_path)
     message = FakeMail("mid:no-source-trash", b"keep", ["INBOX"])
