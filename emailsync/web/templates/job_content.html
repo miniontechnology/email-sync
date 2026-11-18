@@ -1,6 +1,18 @@
 {% include "job_header.html" %}
 {% if job.last_error %}<div class="alert error"><strong>Last error</strong><p>{{ job.last_error }}</p>
 {% if reauth_account_id %}<a href="/accounts/{{ reauth_account_id }}">Open the saved account to sign in again</a>{% endif %}</div>{% endif %}
+{% if job.pending_deletions %}
+<section class="panel alert warning">
+  <div class="section-heading"><div><h2>Deletions waiting for review</h2><p>{{ job.pending_deletions|length }} message(s) would be moved to Trash. Nothing has been deleted.</p></div></div>
+  <div class="table-wrap"><table><thead><tr><th>Side</th><th>Folder</th><th>Message</th></tr></thead><tbody>
+  {% for item in job.pending_deletions[:200] %}<tr><td>{{ item.side }}</td><td>{{ item.folder }}</td><td class="scope-name">{{ item.subject or item.key }}</td></tr>{% endfor %}
+  </tbody></table></div>
+  <div class="form-actions">
+    <form action="/jobs/{{ job.id }}/deletions/apply" method="post" data-confirm="Move these messages to Trash and resume the job?"><button class="button primary" type="submit">Apply and resume</button></form>
+    <form action="/jobs/{{ job.id }}/deletions/discard" method="post" data-confirm="Discard this deletion plan? Discarded destination deletions may be copied back."><button class="button secondary" type="submit">Discard</button></form>
+  </div>
+</section>
+{% endif %}
 <div class="task-grid">
   {% for task in tasks %}
   <section class="panel task-card">

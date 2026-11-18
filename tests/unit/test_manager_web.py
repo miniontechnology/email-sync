@@ -1,3 +1,4 @@
+import json
 import time
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from emailsync.db import Store
 from emailsync.jobs.control import TaskResult
 from emailsync.jobs.manager import JobManager, ResetConfirmationRequired, merge_saved_settings
 from emailsync.options import Endpoint, JobConfig, Options
-from emailsync.web.app import create_app
+from emailsync.web.app import _config_to_values, create_app
 
 
 class CompletedMigration:
@@ -93,6 +94,98 @@ def test_options_default_state_sync_enabled_and_stale_removal_disabled():
     assert options.sync_flags_labels is True
     assert options.remove_stale_labels is False
     assert options.update_changed_items is True
+    assert options.two_way is False
+    assert options.max_deletions == 50
+    assert options.max_deletion_percent == 10
+
+
+def test_two_way_option_validation_and_edit_values(tmp_path):
+    config = mail_config()
+    config.options.two_way = True
+    assert any("sync interval greater than zero" in error for error in config.validate())
+    config.options.sync_interval_minutes = 15
+    config.endpoints["mail"]["source"] = Endpoint("file", files=["messages.mbox"])
+    assert any("IMAP or Gmail mail source" in error for error in config.validate())
+
+    config = mail_config()
+    config.options.two_way = True
+    config.options.sync_interval_minutes = 15
+    config.options.max_deletions = 7
+    config.options.max_deletion_percent = 25
+    values = _config_to_values(config.split()[0])
+    assert values["two_way"] == "on"
+    assert values["max_deletions"] == 7
+    assert values["max_deletion_percent"] == 25
+
+
+def test_turning_off_two_way_clears_pairs_and_baseline(tmp_path):
+    _settings, store, manager = make_manager(tmp_path)
+    config = mail_config()
+    config.options.two_way = True
+    config.options.sync_interval_minutes = 15
+    job_id = completed_job(manager, store, config)
+    store.pairs_put_many(
+        job_id,
+        [
+            {
+                "key": "mid:a",
+                "state": "synced",
+                "src_folders": ["INBOX"],
+                "src_flags": [],
+                "dst_folders": ["INBOX"],
+                "dst_flags": [],
+            }
+        ],
+    )
+    store.update_job(job_id, twoway_baseline_at=time.time())
+
+    edited = manager._load_config(store.get_job(job_id), resolve=False)
+    edited.options.two_way = False
+    manager.edit_job(job_id, edited)
+
+    assert store.pairs_get_all(job_id) == {}
+    assert store.get_job(job_id)["twoway_baseline_at"] is None
+
+
+def test_deletion_review_apply_and_discard_routes(tmp_path):
+    _settings, store, manager = make_manager(tmp_path)
+    apply_id = completed_job(manager, store, mail_config())
+    store.update_job(
+        apply_id,
+        status="paused",
+        pending_deletions=json.dumps([{"key": "mid:apply", "side": "destination", "folder": "INBOX"}]),
+    )
+    discard_id = completed_job(manager, store, mail_config())
+    store.update_job(
+        discard_id,
+        status="paused",
+        pending_deletions=json.dumps([{"key": "mid:discard", "side": "destination", "folder": "INBOX"}]),
+    )
+    store.pairs_put_many(
+        discard_id,
+        [
+            {
+                "key": "mid:discard",
+                "state": "synced",
+                "src_folders": ["INBOX"],
+                "src_flags": [],
+                "dst_folders": ["INBOX"],
+                "dst_flags": [],
+            }
+        ],
+    )
+
+    with TestClient(create_app(_settings, store, manager)) as client:
+        assert "Deletions waiting for review" in client.get(f"/jobs/{apply_id}/fragment").text
+        applied = client.post(f"/jobs/{apply_id}/deletions/apply", follow_redirects=False)
+        discarded = client.post(f"/jobs/{discard_id}/deletions/discard", follow_redirects=False)
+
+    assert applied.status_code == 303
+    assert store.get_job(apply_id)["approved_deletions"] == ["mid:apply"]
+    assert store.get_job(apply_id)["pending_deletions"] == []
+    assert discarded.status_code == 303
+    assert store.pairs_get_all(discard_id)["mid:discard"]["state"] == "ignored"
+    assert store.get_job(discard_id)["pending_deletions"] == []
 
 
 def test_job_manager_encrypts_credentials_and_runs_queued_jobs(tmp_path):
@@ -345,6 +438,7 @@ def test_web_dashboard_detail_validation_and_secret_redaction(tmp_path):
         assert 'name="sync_flags_labels" checked' in form.text
         assert 'name="update_changed_items" checked' in form.text
         assert 'name="remove_stale_labels" checked' not in form.text
+        assert 'name="two_way" checked' not in form.text
 
         invalid = client.post("/jobs", data={"name": ""})
         assert invalid.status_code == 422

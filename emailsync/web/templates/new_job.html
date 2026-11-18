@@ -86,6 +86,8 @@
       <label class="field"><span>Archive target</span><input name="archive_target" value="{{ values.get('archive_target','@archive') }}"></label>
       <label class="field"><span>Only messages since</span><input type="date" name="since" value="{{ values.get('since','') }}"></label>
       <label class="field"><span>Sync interval (minutes)</span><input type="number" name="sync_interval_minutes" min="0" value="{{ values.get('sync_interval_minutes','0') }}"></label>
+      <label class="field"><span>Pause if more than this many messages move to Trash</span><input type="number" name="max_deletions" min="0" value="{{ values.get('max_deletions','50') }}"></label>
+      <label class="field"><span>Pause if more than this percent of a folder moves to Trash</span><input type="number" name="max_deletion_percent" min="0" max="100" value="{{ values.get('max_deletion_percent','10') }}"></label>
       <label class="field full"><span>Folder mapping (one source =&gt; destination per line)</span><textarea name="folder_map" rows="4" placeholder="[Gmail]/Work => Work">{{ values.get('folder_map','') }}</textarea></label>
       <label class="field full"><span>Exclude source folders (one per line)</span><textarea name="exclude_folders" rows="3">{{ values.get('exclude_folders','') }}</textarea></label>
     </div>
@@ -99,6 +101,8 @@
       <label class="check-field"><input type="checkbox" name="sync_flags_labels" {% if not values or values.get('sync_flags_labels') %}checked{% endif %}><span>Update flags and labels on copied mail</span></label>
       <label class="check-field"><input type="checkbox" name="remove_stale_labels" {% if values.get('remove_stale_labels') %}checked{% endif %}><span>Also remove from folders whose label was removed</span></label>
       <label class="check-field"><input type="checkbox" name="update_changed_items" {% if not values or values.get('update_changed_items') %}checked{% endif %}><span>Update contacts and events that changed on the source</span></label>
+      <label class="check-field"><input type="checkbox" name="two_way" {% if values.get('two_way') %}checked{% endif %}><span>Two-way sync (keep both accounts in sync)</span></label>
+      <p class="muted">Two-way sync requires a recurring mail migration. Deletions are moved to Trash, never permanently deleted; large deletion runs pause for review. Contacts and calendars stay one-way for now.</p>
     </div>
   </section>
   <div class="form-actions"><a class="button secondary" href="{{ '/jobs/' ~ job_id if editing else '/' }}">Cancel</a>{% if editing %}<button class="button secondary" type="submit">Save</button><button class="button primary" type="submit" name="then_run" value="1">Save and run</button>{% else %}<button class="button primary" type="submit">Create migration</button>{% endif %}</div>

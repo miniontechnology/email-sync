@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -9,7 +10,7 @@ from imapclient import IMAPClient
 from emailsync import db
 from emailsync.connectors.dav import DavClient
 from emailsync.connectors.imap import ssl_context
-from emailsync.connectors.jmap import MAIL, JmapClient, keywords_to_flags
+from emailsync.connectors.jmap import MAIL, JmapClient, flags_to_keywords, keywords_to_flags
 from emailsync.dav.jmap_dest import JmapDavDestination
 from emailsync.dav.pipeline import DavDestination, DavMigration
 from emailsync.dav.vobjects import ensure_vcard_uid
@@ -120,6 +121,39 @@ def _clear_stalwart():
         conn.logout()
 
 
+def _prepare_stalwart_trash():
+    conn = _imap(_destination_imap())
+    try:
+        folders = []
+        trash = None
+        for flags, _delimiter, folder in conn.list_folders():
+            name = folder.decode() if isinstance(folder, bytes) else str(folder)
+            flag_names = {
+                flag.decode().casefold() if isinstance(flag, bytes) else str(flag).casefold()
+                for flag in flags
+            }
+            folders.append((name, flag_names))
+            if "\\trash" in flag_names:
+                trash = name
+        for name, flags in folders:
+            if name == "Trash" and "\\trash" not in flags:
+                conn.select_folder(name, readonly=False)
+                uids = conn.search(["ALL"])
+                if uids:
+                    conn.delete_messages(uids)
+                    conn.expunge()
+                conn.delete_folder(name)
+        if trash:
+            conn.select_folder(trash, readonly=False)
+            uids = conn.search(["ALL"])
+            if uids:
+                conn.delete_messages(uids)
+                conn.expunge()
+        return trash
+    finally:
+        conn.logout()
+
+
 def _destination_imap():
     return Endpoint(
         "imap",
@@ -148,6 +182,330 @@ def _assert_destination_count(folder, count):
         assert len(conn.search(["ALL"])) == count
     finally:
         conn.logout()
+
+
+def _imap_keys(endpoint, folder):
+    conn = _imap(endpoint)
+    try:
+        conn.select_folder(folder, readonly=True)
+        uids = conn.search(["ALL"])
+        response = conn.fetch(uids, [b"BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"])
+        keys = set()
+        for data in response.values():
+            header = next(
+                (
+                    value
+                    for field, value in data.items()
+                    if isinstance(field, bytes) and field.upper().startswith(b"BODY[HEADER")
+                ),
+                b"",
+            )
+            keys.add(summary_from_headers(header)["key"])
+        return keys
+    finally:
+        conn.logout()
+
+
+def _jmap_item(client, key):
+    return next((item for item in client.iter_email_index() if key_from_jmap(item) == key), None)
+
+
+def _jmap_update_folder(endpoint, key, add=(), remove=()):
+    client = JmapClient(endpoint)
+    try:
+        client.connect(MAIL)
+        item = _jmap_item(client, key)
+        assert item
+        boxes = client.mailboxes()
+        mailboxes = {box["name"]: box["id"] for box in boxes}
+        inbox = next((box for box in boxes if box.get("role") == "inbox"), None)
+        if inbox:
+            mailboxes["INBOX"] = inbox["id"]
+        for name in add:
+            if name not in mailboxes:
+                mailboxes[name] = client.create_mailbox(name, None)
+        patch = {f"mailboxIds/{mailboxes[name]}": True for name in add}
+        patch.update({f"mailboxIds/{mailboxes[name]}": None for name in remove})
+        assert client.update_emails({item["id"]: patch}) == {}
+    finally:
+        client.close()
+
+
+def _jmap_update_flag(endpoint, key, flag, value):
+    client = JmapClient(endpoint)
+    try:
+        client.connect(MAIL)
+        item = _jmap_item(client, key)
+        assert item
+        keyword = next(iter(flags_to_keywords([flag])))
+        assert client.update_emails({item["id"]: {f"keywords/{keyword}": value}}) == {}
+    finally:
+        client.close()
+
+
+def _jmap_append(endpoint, raw):
+    client = JmapClient(endpoint)
+    try:
+        client.connect(MAIL)
+        inbox = next(box for box in client.mailboxes() if box.get("role") == "inbox")
+        blob_id = client.upload(raw)
+        client.import_email(blob_id, [inbox["id"]], {}, datetime.now(UTC).isoformat())
+    finally:
+        client.close()
+
+
+def _jmap_move_to_trash(endpoint, key):
+    client = JmapClient(endpoint)
+    try:
+        client.connect(MAIL)
+        item = _jmap_item(client, key)
+        assert item
+        mailboxes = client.mailboxes()
+        trash = next((box for box in mailboxes if box.get("role") == "trash"), None)
+        if trash is None:
+            trash_id = client.create_mailbox("Trash", None)
+        else:
+            trash_id = trash["id"]
+        patch = {f"mailboxIds/{trash_id}": True}
+        for mailbox_id in item.get("mailboxIds") or {}:
+            patch[f"mailboxIds/{mailbox_id}"] = None
+        assert client.update_emails({item["id"]: patch}) == {}
+    finally:
+        client.close()
+
+
+def _find_uid(conn, folder, key):
+    conn.select_folder(folder, readonly=False)
+    uids = conn.search(["ALL"])
+    headers = conn.fetch(uids, [b"BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)]"])
+    for uid, data in headers.items():
+        header = next(
+            (
+                value
+                for field, value in data.items()
+                if isinstance(field, bytes) and field.upper().startswith(b"BODY[HEADER")
+            ),
+            b"",
+        )
+        if summary_from_headers(header)["key"] == key:
+            return uid
+    return None
+
+
+def _imap_flags_for(endpoint, folder, key):
+    conn = _imap(endpoint)
+    try:
+        uid = _find_uid(conn, folder, key)
+        if not uid:
+            return set()
+        return {
+            flag.decode().lower() if isinstance(flag, bytes) else str(flag).lower()
+            for flag in conn.fetch([uid], [b"FLAGS"])[uid][b"FLAGS"]
+        }
+    finally:
+        conn.logout()
+
+
+def _move_imap_message(endpoint, source_folder, destination_folder, key):
+    conn = _imap(endpoint)
+    try:
+        uid = _find_uid(conn, source_folder, key)
+        if not uid:
+            raise AssertionError(f"Message {key} not found in {source_folder}")
+        capabilities = {
+            capability.decode().upper() if isinstance(capability, bytes) else str(capability).upper()
+            for capability in conn.capabilities()
+        }
+        if "MOVE" in capabilities:
+            conn.move([uid], destination_folder)
+            return capabilities
+        conn.copy([uid], destination_folder)
+        conn.add_flags([uid], ["\\Deleted"], silent=True)
+        conn.expunge([uid] if "UIDPLUS" in capabilities else None)
+        return capabilities
+    finally:
+        conn.logout()
+
+
+@pytest.mark.parametrize("destination_kind", ["imap", "jmap"])
+def test_greenmail_stalwart_two_way_sync_and_trash_safety(tmp_path, destination_kind):
+    _clear_stalwart()
+    destination_trash = _prepare_stalwart_trash()
+    work_folder = f"TwoWay-{uuid4().hex[:8]}"
+    seed_raw = [
+        _raw(f"twoway-read-{uuid4()}", "read"),
+        _raw(f"twoway-flag-{uuid4()}", "flag"),
+        _raw(f"twoway-move-{uuid4()}", "move"),
+        _raw(f"twoway-source-delete-{uuid4()}", "source delete"),
+        _raw(f"twoway-dest-delete-{uuid4()}", "dest delete"),
+    ]
+    source = _seed_greenmail([("INBOX", raw) for raw in seed_raw])
+    source_conn = _imap(source)
+    try:
+        try:
+            source_conn.create_folder("Trash")
+        except Exception:
+            pass
+    finally:
+        source_conn.logout()
+    destination = _destination_imap() if destination_kind == "imap" else _destination_jmap()
+    config = _mail_config(source, destination, workers=1)
+    config.options.two_way = True
+    config.options.sync_interval_minutes = 15
+    config.options.max_deletion_percent = 100
+    result, store, job_id = _run_mail(tmp_path, source, destination, config=config)
+    assert result.status == "completed", result.error
+    assert store.get_job(job_id)["twoway_baseline_at"]
+
+    read_key, flag_key, move_key, source_delete_key, dest_delete_key = [
+        summary_from_headers(raw)["key"] for raw in seed_raw
+    ]
+
+    if destination_kind == "imap":
+        dest_conn = _imap(destination)
+        try:
+            dest_conn.select_folder("INBOX", readonly=False)
+            uid = _find_uid(dest_conn, "INBOX", read_key)
+            dest_conn.add_flags([uid], ["\\Seen"], silent=True)
+            new_raw = _raw(f"twoway-copyback-{uuid4()}", "copy back")
+            dest_conn.append("INBOX", new_raw, msg_time=datetime.now(UTC))
+            try:
+                dest_conn.create_folder(work_folder)
+            except Exception:
+                pass
+        finally:
+            dest_conn.logout()
+        _move_imap_message(destination, "INBOX", work_folder, move_key)
+    else:
+        _jmap_update_flag(destination, read_key, "\\Seen", True)
+        new_raw = _raw(f"twoway-copyback-{uuid4()}", "copy back")
+        _jmap_append(destination, new_raw)
+        _jmap_update_folder(destination, move_key, add=[work_folder], remove=["INBOX"])
+
+    source_conn = _imap(source)
+    try:
+        source_conn.select_folder("INBOX", readonly=False)
+        uid = _find_uid(source_conn, "INBOX", flag_key)
+        source_conn.add_flags([uid], ["\\Flagged"], silent=True)
+    finally:
+        source_conn.logout()
+    result, _store, _job = _run_mail(tmp_path, source, destination, config=config, store=store, job_id=job_id)
+    assert result.status == "completed", result.error
+    assert "\\seen" in _imap_flags_for(source, "INBOX", read_key)
+    if destination_kind == "imap":
+        assert "\\flagged" in _imap_flags_for(destination, "INBOX", flag_key)
+        assert summary_from_headers(new_raw)["key"] in _imap_keys(source, "INBOX")
+    else:
+        client = JmapClient(destination)
+        try:
+            client.connect(MAIL)
+            flag_item = _jmap_item(client, flag_key)
+            assert flag_item
+            assert "\\flagged" in keywords_to_flags(flag_item.get("keywords") or {})
+        finally:
+            client.close()
+        assert summary_from_headers(new_raw)["key"] in _imap_keys(source, "INBOX")
+    assert move_key in _imap_keys(source, work_folder)
+
+    source_conn = _imap(source)
+    try:
+        source_conn.select_folder("INBOX", readonly=False)
+        uid = _find_uid(source_conn, "INBOX", source_delete_key)
+        source_conn.delete_messages([uid])
+        source_conn.expunge()
+    finally:
+        source_conn.logout()
+    if destination_kind == "imap":
+        assert destination_trash
+        _move_imap_message(destination, "INBOX", destination_trash, dest_delete_key)
+    else:
+        _jmap_move_to_trash(destination, dest_delete_key)
+    result, _store, _job = _run_mail(tmp_path, source, destination, config=config, store=store, job_id=job_id)
+    assert result.status == "completed", result.error
+    if destination_kind == "imap":
+        assert source_delete_key in _imap_keys(destination, destination_trash)
+    else:
+        client = JmapClient(destination)
+        try:
+            client.connect(MAIL)
+            item = _jmap_item(client, source_delete_key)
+            assert item and any(
+                mailbox.get("role") == "trash" and mailbox["id"] in item.get("mailboxIds", {})
+                for mailbox in client.mailboxes()
+            )
+        finally:
+            client.close()
+    task = store.get_tasks(job_id)[0]
+    assert task["trashed"] == 2
+    assert dest_delete_key not in store.pairs_get_all(job_id)
+    assert dest_delete_key in _imap_keys(source, "Trash")
+
+    safety_raw = _raw(f"twoway-safety-{uuid4()}", "safety")
+    source_conn = _imap(source)
+    try:
+        source_conn.select_folder("INBOX", readonly=False)
+        source_conn.append("INBOX", safety_raw, msg_time=datetime.now(UTC))
+    finally:
+        source_conn.logout()
+    result, _store, _job = _run_mail(tmp_path, source, destination, config=config, store=store, job_id=job_id)
+    assert result.status == "completed", result.error
+    safety_key = summary_from_headers(safety_raw)["key"]
+    source_conn = _imap(source)
+    try:
+        source_conn.select_folder("INBOX", readonly=False)
+        safety_uid = _find_uid(source_conn, "INBOX", safety_key)
+        source_conn.delete_messages([safety_uid])
+        source_conn.expunge()
+    finally:
+        source_conn.logout()
+    config.options.max_deletions = 0
+    paused, _store, _job = _run_mail(tmp_path, source, destination, config=config, store=store, job_id=job_id)
+    assert paused.status == "paused", paused.error
+    pending = store.get_job(job_id)["pending_deletions"]
+    assert safety_key in {item["key"] for item in pending}
+    store.update_job(
+        job_id,
+        approved_deletions=json.dumps([safety_key]),
+        pending_deletions=None,
+    )
+    applied, _store, _job = _run_mail(
+        tmp_path, source, destination, config=config, store=store, job_id=job_id
+    )
+    assert applied.status == "completed", applied.error
+    if destination_kind == "imap":
+        assert safety_key in _imap_keys(destination, destination_trash)
+    else:
+        client = JmapClient(destination)
+        try:
+            client.connect(MAIL)
+            item = _jmap_item(client, safety_key)
+            assert item and any(
+                mailbox.get("role") == "trash" and mailbox["id"] in item.get("mailboxIds", {})
+                for mailbox in client.mailboxes()
+            )
+        finally:
+            client.close()
+    _seed_greenmail([])
+    _clear_stalwart()
+    source_conn = _imap(source)
+    try:
+        try:
+            source_conn.delete_folder(work_folder)
+        except Exception:
+            pass
+    finally:
+        try:
+            source_conn.logout()
+        except Exception:
+            pass
+    dest_conn = _imap(_destination_imap())
+    try:
+        try:
+            dest_conn.delete_folder(work_folder)
+        except Exception:
+            pass
+    finally:
+        dest_conn.logout()
 
 
 def test_greenmail_to_stalwart_imap_is_idempotent(tmp_path):
