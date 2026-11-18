@@ -16,6 +16,12 @@ from emailsync.options import Endpoint, Options
 INDEX_BATCH = 500
 
 
+class StateApplyResult(dict):
+    def __init__(self, errors=None, unsupported_flags=None):
+        super().__init__(errors or {})
+        self.unsupported_flags = {key: frozenset(flags) for key, flags in (unsupported_flags or {}).items()}
+
+
 def _utc_iso(value: dt.datetime | None) -> str | None:
     if value is None:
         return None
@@ -166,6 +172,7 @@ class ImapDest:
 
     def apply_state(self, changes: list[StateChange], retry) -> dict[str, str]:
         errors: dict[str, str] = {}
+        unsupported_flags = defaultdict(set)
         flag_groups = defaultdict(list)
         for change in changes:
             for copy, add, remove in change.flag_ops:
@@ -190,6 +197,9 @@ class ImapDest:
                     raise PermanentError("destination folder changed")
                 permanent = selected["permanentflags"]
                 permitted = flags if "\\*" in permanent else flags & permanent
+                unsupported = flags - permitted
+                for change, _uid in entries:
+                    unsupported_flags[change.source_key].update(unsupported)
                 imap_flags = [imap_flag(flag) for flag in sorted(permitted)]
                 if not imap_flags:
                     return
@@ -277,7 +287,7 @@ class ImapDest:
                     raise error from exc
                 for change, _uid in entries:
                     errors[change.source_key] = str(error)
-        return errors
+        return StateApplyResult(errors, unsupported_flags)
 
     def to_trash(self, copies: list) -> int:
         trash, _ = self.resolve("@trash", create=True)

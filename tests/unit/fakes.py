@@ -1,7 +1,9 @@
 import threading
+from collections import defaultdict
 from copy import copy
 from dataclasses import dataclass
 
+from emailsync.mail.dest import StateApplyResult
 from emailsync.mail.folders import Folder
 from emailsync.mail.source import MessageMeta, Scope, SourceState
 from emailsync.mail.state import normalize_flags
@@ -56,6 +58,7 @@ class FakeMailState:
         self.source_move_enabled = True
         self.source_move_count = 0
         self.source_removed_locations = []
+        self.unsupported_destination_flags = set()
 
 
 class FakeSource:
@@ -340,6 +343,7 @@ class FakeDest:
 
     def apply_state(self, changes, retry):
         errors = {}
+        unsupported_flags = defaultdict(set)
         with self.state.lock:
             for change in changes:
                 remaining = self.state.apply_failures.get(change.source_key, 0)
@@ -348,6 +352,10 @@ class FakeDest:
                     errors[change.source_key] = "injected state update failure"
                     continue
                 for copy, add, remove in change.flag_ops:
+                    unsupported = set(add | remove) & self.state.unsupported_destination_flags
+                    unsupported_flags[change.source_key].update(unsupported)
+                    add = set(add) - unsupported
+                    remove = set(remove) - unsupported
                     for folder in copy.folders:
                         _ref_folder, _uid, key = self._key_for_ref(copy.ref)
                         flags = set(self.state.dest_flags.get((folder, key), copy.flags))
@@ -382,7 +390,7 @@ class FakeDest:
                             pass
                         if key not in self.state.destination.get(folder, []):
                             self.state.dest_flags.pop((folder, key), None)
-        return errors
+        return StateApplyResult(errors, unsupported_flags)
 
     def to_trash(self, copies):
         trash = self.resolve("@trash", create=True)[0]

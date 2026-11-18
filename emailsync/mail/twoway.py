@@ -301,7 +301,7 @@ class TwoWayReconciler:
 
     def _apply_destination(self, key, entry, add_flags, remove_flags, add_folders, remove_folders):
         if not (add_flags or remove_flags or add_folders or remove_folders):
-            return
+            return frozenset()
         if remove_folders and not getattr(self.dest, "can_remove", True):
             raise PermanentError("Destination lacks UIDPLUS; folder removals were skipped")
         for folder in add_folders:
@@ -313,17 +313,14 @@ class TwoWayReconciler:
             if add or remove:
                 flag_ops.append((copy, add, remove))
         change = StateChange(key, entry.copies, flag_ops, list(add_folders), list(remove_folders))
-        errors = (
-            self.retry(
-                lambda: self.dest.apply_state(
-                    [change], retry=lambda operation: self.retry(operation, self.dest)
-                ),
-                self.dest,
-            )
-            or {}
+        result = self.retry(
+            lambda: self.dest.apply_state([change], retry=lambda operation: self.retry(operation, self.dest)),
+            self.dest,
         )
+        errors = result if result is not None else {}
         if errors.get(key):
             raise PermanentError(errors[key])
+        return normalize_flags(getattr(result, "unsupported_flags", {}).get(key, ()))
 
     def _merge(self, key, source, destination, pair, reverse):
         old_src_folders = set(pair.get("src_folders") or ())
@@ -365,7 +362,7 @@ class TwoWayReconciler:
             if source_change:
                 (source_add_flags if desired else source_remove_flags).add(flag)
         try:
-            self._apply_destination(
+            unsupported_dst_flags = self._apply_destination(
                 key,
                 destination,
                 dest_add_flags,
@@ -422,6 +419,7 @@ class TwoWayReconciler:
         desired_dst_folders = (dst_folders | dest_add) - dest_remove
         desired_src_flags = (src_flags | source_add_flags) - source_remove_flags
         desired_dst_flags = (dst_flags | dest_add_flags) - dest_remove_flags
+        desired_dst_flags -= unsupported_dst_flags
         self._put_pair(
             key,
             "synced",

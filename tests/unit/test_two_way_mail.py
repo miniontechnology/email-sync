@@ -4,8 +4,10 @@ import pytest
 
 from emailsync import db
 from emailsync.jobs.control import RunControl
+from emailsync.mail.dest import ImapDest
 from emailsync.mail.pipeline import MailMigration
 from emailsync.mail.source import ImapSource, Scope
+from emailsync.mail.state import DestCopy, StateChange
 from emailsync.options import Endpoint, JobConfig, Options
 from tests.unit.fakes import FakeMail, FakeMailState, factories
 
@@ -339,6 +341,61 @@ def test_flag_conflict_sets_the_flag_on_both_sides(tmp_path):
     assert result.status == "completed"
     assert "\\seen" in {flag.lower() for flag in message.flags}
     assert "\\seen" in {flag.lower() for flag in state.dest_flags[("INBOX", "mid:flag-conflict")]}
+
+
+def test_unsupported_destination_keyword_stays_on_source_across_runs(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:unsupported-keyword", b"keyword", ["INBOX"])
+    state = FakeMailState({"INBOX": [message]})
+    assert run_migration(store, job_id, state).status == "completed"
+    state.unsupported_destination_flags = {"project"}
+    message.flags = ("project",)
+
+    first = run_migration(store, job_id, state)
+
+    pair = store.pairs_get_all(job_id)["mid:unsupported-keyword"]
+    assert first.status == "completed"
+    assert "project" in message.flags
+    assert state.dest_flags[("INBOX", "mid:unsupported-keyword")] == frozenset()
+    assert "project" not in pair["dst_flags"]
+
+    second = run_migration(store, job_id, state)
+
+    assert second.status == "completed"
+    assert "project" in message.flags
+    assert state.dest_flags[("INBOX", "mid:unsupported-keyword")] == frozenset()
+
+
+def test_imap_destination_reports_keywords_rejected_by_permanent_flags():
+    class Connection:
+        def __init__(self):
+            self.applied = []
+
+        def ensure_writable(self, _folder):
+            return {"uidvalidity": 1, "permanentflags": {"\\seen"}}
+
+        def add_flags(self, uids, flags):
+            self.applied.append((uids, flags))
+
+        def remove_flags(self, uids, flags):
+            self.applied.append((uids, flags))
+
+    destination = ImapDest(Endpoint("imap", host="destination"), Options())
+    destination.conn = Connection()
+    copy = DestCopy("INBOX:1:7", frozenset({"INBOX"}), frozenset())
+    change = StateChange(
+        "mid:unsupported",
+        [copy],
+        [(copy, frozenset({"project"}), frozenset())],
+        [],
+        [],
+    )
+
+    result = destination.apply_state([change], retry=lambda operation: operation())
+
+    assert result == {}
+    assert result.unsupported_flags == {"mid:unsupported": frozenset({"project"})}
+    assert destination.conn.applied == []
 
 
 def test_folder_conflict_uses_source_folders(tmp_path):
