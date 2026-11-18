@@ -48,6 +48,14 @@ class FakeMailState:
         self.transient_fetches = 0
         self.upload_fail_after = {}
         self.drop_uploads = False
+        self.append_failures = 0
+        self.append_after_write_failures = 0
+        self.has_message_override = None
+        self.has_message_calls = 0
+        self.source_trash_enabled = True
+        self.source_move_enabled = True
+        self.source_move_count = 0
+        self.source_removed_locations = []
 
 
 class FakeSource:
@@ -73,11 +81,31 @@ class FakeSource:
                 gmail_labels=self.gmail and name.lower() == "all mail",
             )
             for name in self.state.messages
+            if not (
+                self.options
+                and self.options.two_way
+                and (
+                    name in self.options.exclude_folders
+                    or name.lower() in ("junk", "spam")
+                    and not self.options.include_spam
+                    or name.lower() == "trash"
+                    and not self.options.include_trash
+                )
+            )
         ]
 
     def folders(self):
         return [
-            Folder(name=name, flags=("\\Trash",) if name.lower() == "trash" else ())
+            Folder(
+                name=name,
+                flags=(
+                    ("\\Trash",)
+                    if name.lower() == "trash"
+                    else ("\\Junk",)
+                    if name.lower() in ("junk", "spam")
+                    else ()
+                ),
+            )
             for name in self.state.messages
         ]
 
@@ -118,6 +146,11 @@ class FakeSource:
             return {uid: self._message(scope.name, uid).raw for uid in uids}
 
     def append(self, folder, raw, flags=(), internaldate=None):
+        if self.state.append_failures:
+            self.state.append_failures -= 1
+            from emailsync.errors import PermanentError
+
+            raise PermanentError("injected append failure")
         key = self.state.raw_keys.get(raw, f"raw:{raw.decode('utf-8', 'replace')}")
         if self.gmail:
             mailbox = next((name for name in self.state.messages if name.lower() == "all mail"), "All Mail")
@@ -140,7 +173,20 @@ class FakeSource:
                     uid=max((item.uid or 0 for item in messages), default=0) + 1,
                 )
             )
+        if self.state.append_after_write_failures:
+            self.state.append_after_write_failures -= 1
+            from emailsync.errors import PermanentError
+
+            raise PermanentError("injected post-append failure")
         return len(self.state.messages[mailbox if self.gmail else folder])
+
+    def has_message(self, folder, key):
+        self.state.has_message_calls += 1
+        if self.state.has_message_override is not None:
+            return self.state.has_message_override
+        if self.gmail:
+            folder = next((name for name in self.state.messages if name.lower() == "all mail"), folder)
+        return any(message.key == key for message in self.state.messages.get(folder, []))
 
     def set_flags(self, locations, add=(), remove=()):
         with self.state.lock:
@@ -165,6 +211,7 @@ class FakeSource:
         return True
 
     def remove_folder(self, location, folder):
+        self.state.source_removed_locations.append(location)
         scope, uid = location
         message = self._message(scope, uid)
         if self.gmail:
@@ -175,11 +222,29 @@ class FakeSource:
             return True
         return False
 
+    def move_folder(self, location, folder):
+        if self.gmail or not self.state.source_move_enabled:
+            return False
+        self.state.source_move_count += 1
+        scope, uid = location
+        message = self._message(scope, uid)
+        self.state.messages[scope].remove(message)
+        target = self.state.messages.setdefault(folder, [])
+        message.uid = max((item.uid or 0 for item in target), default=0) + 1
+        target.append(message)
+        return True
+
     def trash_folder(self):
         return next((name for name in self.state.messages if name.lower() == "trash"), None)
 
     def to_trash(self, locations):
+        if not self.state.source_trash_enabled:
+            from emailsync.errors import PermanentError
+
+            raise PermanentError("Source has no Trash folder; message was not deleted")
         for scope, uid in list(locations):
+            if scope.lower() == "trash":
+                continue
             message = self._message(scope, uid)
             if self.gmail:
                 message.targets = ["@trash"]

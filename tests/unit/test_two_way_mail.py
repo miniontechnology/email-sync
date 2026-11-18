@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from emailsync import db
 from emailsync.jobs.control import RunControl
 from emailsync.mail.pipeline import MailMigration
@@ -39,6 +41,13 @@ def run_migration(store, job_id, state, options=None):
 def make_store(tmp_path):
     store = db.Store(tmp_path / "twoway.db")
     return store, store.create_job("two-way test", {}, None)
+
+
+def add_destination_only(state, key, folder="Work", raw=None):
+    raw = raw or key.encode()
+    state.destination.setdefault(folder, []).append(key)
+    state.destination_raw[key] = raw
+    state.raw_keys[raw] = key
 
 
 def test_first_run_records_both_sides_without_pushing_state(tmp_path):
@@ -96,12 +105,11 @@ def test_destination_only_message_is_copied_back_once_and_resumed(tmp_path):
     store, job_id = make_store(tmp_path)
     source_message = FakeMail("mid:seed", b"seed", ["INBOX"])
     state = FakeMailState({"INBOX": [source_message]})
+    state.messages["Work"] = []
     assert run_migration(store, job_id, state).status == "completed"
 
     raw = b"new destination message"
-    state.destination.setdefault("Work", []).append("mid:new")
-    state.destination_raw["mid:new"] = raw
-    state.raw_keys[raw] = "mid:new"
+    add_destination_only(state, "mid:new", raw=raw)
     state.dest_flags[("Work", "mid:new")] = frozenset({"\\seen"})
     first = run_migration(store, job_id, state)
     assert first.status == "completed"
@@ -114,6 +122,323 @@ def test_destination_only_message_is_copied_back_once_and_resumed(tmp_path):
     assert [mail.key for mail in state.messages["Work"]] == ["mid:new"]
     assert store.pairs_get_all(job_id)["mid:new"]["state"] == "synced"
     assert state.upload_count == 1
+
+
+def test_copyback_append_failure_retries_after_source_search_miss_without_trashing_destination(tmp_path):
+    store, job_id = make_store(tmp_path)
+    state = FakeMailState({"INBOX": [FakeMail("mid:seed", b"seed", ["INBOX"])], "Work": []})
+    assert run_migration(store, job_id, state).status == "completed"
+    add_destination_only(state, "mid:retry")
+    state.append_failures = 1
+
+    failed = run_migration(store, job_id, state)
+    assert failed.status == "completed_with_errors"
+    assert store.pairs_get_all(job_id)["mid:retry"]["state"] == "copying_back"
+    assert state.messages["Work"] == []
+    assert state.destination.get("Trash") is None
+
+    retried = run_migration(store, job_id, state)
+    assert retried.status == "completed"
+    assert [message.key for message in state.messages["Work"]] == ["mid:retry"]
+    assert store.pairs_get_all(job_id)["mid:retry"]["state"] == "copying_back"
+    assert state.destination.get("Trash") is None
+
+    resumed = run_migration(store, job_id, state)
+    assert resumed.status == "completed"
+    assert store.pairs_get_all(job_id)["mid:retry"]["state"] == "synced"
+    assert state.destination.get("Trash") is None
+    assert state.has_message_calls == 2
+
+
+def test_copyback_search_hit_marks_pair_ignored_without_appending_or_trashing(tmp_path):
+    store, job_id = make_store(tmp_path)
+    state = FakeMailState({"INBOX": [FakeMail("mid:seed", b"seed", ["INBOX"])], "Work": []})
+    assert run_migration(store, job_id, state).status == "completed"
+    add_destination_only(state, "mid:already-in-source")
+    store.pairs_put_many(
+        job_id,
+        [
+            {
+                "key": "mid:already-in-source",
+                "state": "copying_back",
+                "src_folders": [],
+                "src_flags": [],
+                "dst_folders": ["Work"],
+                "dst_flags": [],
+            }
+        ],
+    )
+    state.has_message_override = True
+
+    result = run_migration(store, job_id, state)
+
+    assert result.status == "completed"
+    assert store.pairs_get_all(job_id)["mid:already-in-source"]["state"] == "ignored"
+    assert state.messages["Work"] == []
+    assert state.destination["Work"] == ["mid:already-in-source"]
+    assert state.destination.get("Trash") is None
+
+
+def test_copyback_resume_keeps_recorded_destination_primary_folder(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:resume-primary", b"primary", ["Work"])
+    state = FakeMailState({"INBOX": [FakeMail("mid:seed", b"seed", ["INBOX"])], "Work": [message]})
+    assert run_migration(store, job_id, state).status == "completed"
+    state.destination["INBOX"].append("mid:resume-primary")
+    store.pairs_put_many(
+        job_id,
+        [
+            {
+                "key": "mid:resume-primary",
+                "state": "copying_back",
+                "src_folders": ["Work"],
+                "src_flags": [],
+                "dst_folders": ["Work"],
+                "dst_flags": [],
+            }
+        ],
+    )
+
+    result = run_migration(store, job_id, state)
+
+    assert result.status == "completed"
+    assert store.pairs_get_all(job_id)["mid:resume-primary"]["dst_folders"] == ["Work"]
+    assert state.destination.get("Trash") is None
+
+
+def test_copyback_without_message_id_stays_pending_and_warns_once(tmp_path):
+    store, job_id = make_store(tmp_path)
+    state = FakeMailState({"INBOX": [FakeMail("mid:seed", b"seed", ["INBOX"])], "Work": []})
+    assert run_migration(store, job_id, state).status == "completed"
+    key = "fp:" + "a" * 32
+    add_destination_only(state, key)
+    store.pairs_put_many(
+        job_id,
+        [
+            {
+                "key": key,
+                "state": "copying_back",
+                "src_folders": [],
+                "src_flags": [],
+                "dst_folders": ["Work"],
+                "dst_flags": [],
+            }
+        ],
+    )
+
+    result = run_migration(store, job_id, state)
+
+    assert result.status == "completed"
+    assert store.pairs_get_all(job_id)[key]["state"] == "copying_back"
+    assert state.messages["Work"] == []
+    assert state.has_message_calls == 0
+    warnings = [
+        event["message"]
+        for event in store.get_events(job_id)
+        if "without Message-ID were not retried" in event["message"]
+    ]
+    assert len(warnings) == 1
+    assert state.destination.get("Trash") is None
+
+
+@pytest.mark.parametrize(
+    ("target", "exclude"),
+    [("Work", []), ("Work", ["Work"]), ("Junk", [])],
+)
+def test_copyback_unscanned_or_junk_target_is_left_alone_with_summary(tmp_path, target, exclude):
+    store, job_id = make_store(tmp_path)
+    messages = {"INBOX": [FakeMail("mid:seed", b"seed", ["INBOX"])]}
+    if target == "Junk" or exclude:
+        messages[target] = []
+    state = FakeMailState(messages)
+    assert run_migration(store, job_id, state).status == "completed"
+    add_destination_only(state, "mid:unscanned", target)
+    options = Options(
+        two_way=True,
+        sync_interval_minutes=15,
+        verify=False,
+        workers=1,
+        max_deletion_percent=100,
+        exclude_folders=exclude,
+    )
+
+    result = run_migration(store, job_id, state, options)
+
+    assert result.status == "completed"
+    assert "mid:unscanned" not in store.pairs_get_all(job_id)
+    assert state.destination[target] == ["mid:unscanned"]
+    assert not any(message.key == "mid:unscanned" for folder in state.messages.values() for message in folder)
+    summaries = [
+        event["message"]
+        for event in store.get_events(job_id)
+        if "destination-only message(s) are in folders that aren't synced back" in event["message"]
+    ]
+    assert summaries == ["1 destination-only message(s) are in folders that aren't synced back; left alone"]
+    assert state.destination.get("Trash") is None
+
+
+def test_flag_conflict_sets_the_flag_on_both_sides(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:flag-conflict", b"flags", ["INBOX"])
+    state = FakeMailState({"INBOX": [message]})
+    assert run_migration(store, job_id, state).status == "completed"
+    pair = store.pairs_get_all(job_id)["mid:flag-conflict"]
+    store.pairs_put_many(
+        job_id,
+        [
+            {
+                **pair,
+                "src_flags": [],
+                "dst_flags": ["\\seen"],
+            }
+        ],
+    )
+    message.flags = ("\\Seen",)
+    state.dest_flags[("INBOX", "mid:flag-conflict")] = frozenset()
+
+    result = run_migration(store, job_id, state)
+
+    assert result.status == "completed"
+    assert "\\seen" in {flag.lower() for flag in message.flags}
+    assert "\\seen" in {flag.lower() for flag in state.dest_flags[("INBOX", "mid:flag-conflict")]}
+
+
+def test_folder_conflict_uses_source_folders(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:folder-conflict", b"folders", ["INBOX"])
+    state = FakeMailState({"INBOX": [message]})
+    assert run_migration(store, job_id, state).status == "completed"
+    state.messages["INBOX"].remove(message)
+    state.messages["Work"] = [message]
+    state.destination["INBOX"].remove("mid:folder-conflict")
+    state.destination["Other"] = ["mid:folder-conflict"]
+
+    result = run_migration(store, job_id, state)
+
+    assert result.status == "completed"
+    assert [item.key for item in state.messages["Work"]] == ["mid:folder-conflict"]
+    assert state.destination["Work"] == ["mid:folder-conflict"]
+    assert state.destination["Other"] == []
+
+
+def test_ambiguous_source_key_is_skipped_with_warning(tmp_path):
+    store, job_id = make_store(tmp_path)
+    state = FakeMailState(
+        {
+            "INBOX": [
+                FakeMail("mid:ambiguous", b"one", ["INBOX"]),
+                FakeMail("mid:ambiguous", b"two", ["INBOX"]),
+            ]
+        }
+    )
+
+    baseline = run_migration(store, job_id, state)
+    assert baseline.status == "completed"
+    before_destination = {folder: list(keys) for folder, keys in state.destination.items()}
+    before_pairs = store.pairs_get_all(job_id)
+
+    result = run_migration(store, job_id, state)
+
+    assert result.status == "completed"
+    assert store.pairs_get_all(job_id)["mid:ambiguous"]["state"] == "synced"
+    assert state.destination == before_destination
+    assert store.pairs_get_all(job_id) == before_pairs
+    assert any(
+        "Skipped 1 ambiguous two-way message key(s)" in event["message"] for event in store.get_events(job_id)
+    )
+
+
+def test_percent_threshold_pauses_for_deletion_in_folder_with_twenty_messages(tmp_path):
+    store, job_id = make_store(tmp_path)
+    messages = [FakeMail(f"mid:threshold-{number}", str(number).encode(), ["INBOX"]) for number in range(20)]
+    state = FakeMailState({"INBOX": messages})
+    assert run_migration(store, job_id, state).status == "completed"
+    state.messages["INBOX"].remove(messages[0])
+    options = Options(
+        two_way=True,
+        sync_interval_minutes=15,
+        verify=False,
+        workers=1,
+        max_deletions=100,
+        max_deletion_percent=1,
+    )
+
+    result = run_migration(store, job_id, state, options)
+
+    assert result.status == "paused"
+    assert [item["key"] for item in store.get_job(job_id)["pending_deletions"]] == ["mid:threshold-0"]
+    assert len(state.destination["INBOX"]) == 20
+    assert state.destination.get("Trash") is None
+
+
+def test_missing_source_trash_keeps_pair_and_does_not_expunge(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:no-source-trash", b"keep", ["INBOX"])
+    state = FakeMailState({"INBOX": [message, FakeMail("mid:other", b"other", ["INBOX"])]})
+    assert run_migration(store, job_id, state).status == "completed"
+    state.destination["INBOX"].remove("mid:no-source-trash")
+    state.source_trash_enabled = False
+
+    result = run_migration(store, job_id, state)
+
+    assert result.status == "completed_with_errors"
+    assert store.pairs_get_all(job_id)["mid:no-source-trash"]["state"] == "synced"
+    assert state.messages["INBOX"][0] is message
+    assert state.destination.get("Trash") is None
+    assert any("Source has no Trash folder" in event["message"] for event in store.get_events(job_id))
+
+
+def test_source_folder_removal_only_touches_that_folders_uid(tmp_path):
+    store, job_id = make_store(tmp_path)
+    state = FakeMailState(
+        {
+            "INBOX": [FakeMail("mid:folder-remove", b"same", ["INBOX"])],
+            "Work": [FakeMail("mid:folder-remove", b"same", ["Work"])],
+        }
+    )
+    assert run_migration(store, job_id, state).status == "completed"
+    state.destination["INBOX"].remove("mid:folder-remove")
+
+    result = run_migration(store, job_id, state)
+
+    assert result.status == "completed"
+    assert state.source_removed_locations == [("INBOX", 1)]
+    assert state.messages["INBOX"] == []
+    assert [item.key for item in state.messages["Work"]] == ["mid:folder-remove"]
+
+
+def test_single_destination_folder_move_uses_source_move(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:atomic-move", b"move", ["INBOX"])
+    state = FakeMailState({"INBOX": [message]})
+    assert run_migration(store, job_id, state).status == "completed"
+    state.destination["INBOX"].remove("mid:atomic-move")
+    state.destination["Work"] = ["mid:atomic-move"]
+
+    result = run_migration(store, job_id, state)
+
+    assert result.status == "completed"
+    assert state.source_move_count == 1
+    assert state.messages["INBOX"] == []
+    assert [item.key for item in state.messages["Work"]] == ["mid:atomic-move"]
+    assert state.destination["Work"] == ["mid:atomic-move"]
+
+
+def test_single_destination_folder_move_falls_back_when_source_lacks_move(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:copy-remove", b"copy", ["INBOX"])
+    state = FakeMailState({"INBOX": [message]})
+    assert run_migration(store, job_id, state).status == "completed"
+    state.destination["INBOX"].remove("mid:copy-remove")
+    state.destination["Work"] = ["mid:copy-remove"]
+    state.source_move_enabled = False
+
+    result = run_migration(store, job_id, state)
+
+    assert result.status == "completed"
+    assert state.source_move_count == 0
+    assert state.messages["INBOX"] == []
+    assert [item.key for item in state.messages["Work"]] == ["mid:copy-remove"]
 
 
 def test_deletion_safety_pauses_then_moves_only_to_trash_after_approval(tmp_path):
