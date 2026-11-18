@@ -243,6 +243,8 @@ class ImapSource:
             raise PermanentError("Source has no Trash folder; message was not deleted")
         moved = 0
         for scope, uid in locations:
+            if scope == trash:
+                continue
             self.conn.ensure_writable(scope)
             if self.conn.has("MOVE"):
                 self.conn.move([uid], trash)
