@@ -251,6 +251,15 @@ class ImapConnection:
     def copy(self, uids: list[int], folder: str) -> None:
         self.c.copy(uids, folder)
 
+    def move(self, uids: list[int], folder: str) -> None:
+        self.c.move(uids, folder)
+
+    def add_gmail_labels(self, uids: list[int], labels) -> None:
+        self.c.add_gmail_labels(uids, labels)
+
+    def remove_gmail_labels(self, uids: list[int], labels) -> None:
+        self.c.remove_gmail_labels(uids, labels)
+
     def uid_expunge(self, uids: list[int]) -> None:
         self.c.expunge(uids)
 

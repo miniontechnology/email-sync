@@ -122,7 +122,7 @@ class ImapDest:
             for uid, data in self.conn.fetch_meta(uids[i : i + INDEX_BATCH]).items():
                 key = summary_from_headers(data["header"])["key"]
                 index.add(name, key)
-                if self.options.sync_flags_labels:
+                if self.options.sync_flags_labels or self.options.two_way:
                     index.add_ref(key, f"{name}:{selected['uidvalidity']}:{uid}", [name], data["flags"])
         index.mark_indexed(name)
 
@@ -138,6 +138,23 @@ class ImapDest:
             uid = self.conn.append(name, raw, flags, internaldate)
             refs.append(f"{name}:{uid}" if uid else f"{name}:?")
         return ";".join(refs)
+
+    def fetch_raw(self, ref: str) -> bytes:
+        folder, validity, uid = self._parse_ref(ref)
+        selected = self.conn.select(folder, readonly=True)
+        if selected["uidvalidity"] != validity:
+            raise PermanentError("destination folder changed")
+        raw = self.conn.fetch_bodies([uid]).get(uid)
+        if raw is None:
+            raise PermanentError("destination message disappeared")
+        return raw
+
+    def fetch_internaldate(self, ref: str):
+        folder, validity, uid = self._parse_ref(ref)
+        selected = self.conn.select(folder, readonly=True)
+        if selected["uidvalidity"] != validity:
+            raise PermanentError("destination folder changed")
+        return (self.conn.fetch_meta([uid]).get(uid) or {}).get("internaldate")
 
     @staticmethod
     def _parse_ref(ref: str) -> tuple[str, int, int]:
@@ -262,6 +279,31 @@ class ImapDest:
                     errors[change.source_key] = str(error)
         return errors
 
+    def to_trash(self, copies: list) -> int:
+        trash, _ = self.resolve("@trash", create=True)
+        moved = 0
+        for copy in copies:
+            folder, validity, uid = self._parse_ref(copy.ref)
+            if folder == trash:
+                continue
+
+            def move_one(folder=folder, validity=validity, uid=uid):
+                selected = self.conn.ensure_writable(folder)
+                if selected["uidvalidity"] != validity:
+                    raise PermanentError("destination folder changed")
+                if self.conn.has("MOVE"):
+                    self.conn.move([uid], trash)
+                elif self.conn.has("UIDPLUS"):
+                    self.conn.copy([uid], trash)
+                    self.conn.add_flags([uid], ["\\Deleted"])
+                    self.conn.uid_expunge([uid])
+                else:
+                    raise PermanentError("Destination lacks MOVE and UIDPLUS; message was not deleted")
+
+            move_one()
+            moved += 1
+        return moved
+
 
 class JmapDest:
     index_mode = "all"
@@ -371,6 +413,43 @@ class JmapDest:
         blob = self.client.upload(raw)
         return self.client.import_email(blob, ids, flags_to_keywords(flags), _utc_iso(internaldate))
 
+    def fetch_raw(self, email_id: str) -> bytes:
+        response = self.client.call(
+            [
+                [
+                    "Email/get",
+                    {"accountId": self.client.account_id, "ids": [email_id], "properties": ["blobId"]},
+                    "0",
+                ]
+            ]
+        )
+        item = next(iter(response[0][1].get("list") or ()), None)
+        if not item or not item.get("blobId"):
+            raise PermanentError(f"Destination message {email_id!r} has no downloadable blob")
+        return self.client.download(item["blobId"])
+
+    def fetch_internaldate(self, email_id: str):
+        response = self.client.call(
+            [
+                [
+                    "Email/get",
+                    {
+                        "accountId": self.client.account_id,
+                        "ids": [email_id],
+                        "properties": ["receivedAt"],
+                    },
+                    "0",
+                ]
+            ]
+        )
+        item = next(iter(response[0][1].get("list") or ()), None)
+        value = item.get("receivedAt") if item else None
+        if not value:
+            return None
+        import datetime as dt
+
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+
     def apply_state(self, changes: list[StateChange], retry) -> dict[str, str]:
         errors: dict[str, str] = {}
         patches: dict[str, dict] = {}
@@ -432,6 +511,21 @@ class JmapDest:
                 for source_key in batch_sources.get(email_id, ()):
                     errors[source_key] = error
         return errors
+
+    def to_trash(self, copies: list) -> int:
+        trash, _ = self.resolve("@trash", create=True)
+        trash_id = self.path_to_id[trash]
+        patches = {}
+        for copy in copies:
+            patch = {f"mailboxIds/{trash_id}": True}
+            for folder_id in self._ids(list(copy.folders)):
+                if folder_id != trash_id:
+                    patch[f"mailboxIds/{folder_id}"] = None
+            patches[copy.ref] = patch
+        errors = self.client.update_emails(patches)
+        if errors:
+            raise PermanentError("; ".join(errors.values()))
+        return len(patches)
 
 
 def make_dest(endpoint: Endpoint, options: Options):
