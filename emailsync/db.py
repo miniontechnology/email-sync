@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS mail_pairs (
     src_flags TEXT NOT NULL,
     dst_folders TEXT NOT NULL,
     dst_flags TEXT NOT NULL,
+    dst_mixed TEXT NOT NULL DEFAULT '[]',
     updated_at REAL NOT NULL,
     PRIMARY KEY (job_id, key)
 );
@@ -144,6 +145,9 @@ class Store:
             ):
                 if column not in job_columns:
                     conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {declaration}")
+            pair_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mail_pairs)")}
+            if "dst_mixed" not in pair_columns:
+                conn.execute("ALTER TABLE mail_pairs ADD COLUMN dst_mixed TEXT NOT NULL DEFAULT '[]'")
 
     # -- connections -------------------------------------------------------------------------
     def conn(self) -> sqlite3.Connection:
@@ -451,7 +455,7 @@ class Store:
         out = {}
         for row in rows:
             item = dict(row)
-            for field in ("src_folders", "src_flags", "dst_folders", "dst_flags"):
+            for field in ("src_folders", "src_flags", "dst_folders", "dst_flags", "dst_mixed"):
                 try:
                     item[field] = json.loads(item[field])
                 except (TypeError, ValueError):
@@ -464,10 +468,11 @@ class Store:
         with self.write() as conn:
             for row in rows:
                 conn.execute(
-                    "INSERT INTO mail_pairs(job_id,key,state,src_folders,src_flags,dst_folders,dst_flags,updated_at)"
-                    " VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(job_id,key) DO UPDATE SET"
+                    "INSERT INTO mail_pairs(job_id,key,state,src_folders,src_flags,dst_folders,dst_flags,dst_mixed,updated_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id,key) DO UPDATE SET"
                     " state=excluded.state, src_folders=excluded.src_folders, src_flags=excluded.src_flags,"
-                    " dst_folders=excluded.dst_folders, dst_flags=excluded.dst_flags, updated_at=excluded.updated_at",
+                    " dst_folders=excluded.dst_folders, dst_flags=excluded.dst_flags,"
+                    " dst_mixed=excluded.dst_mixed, updated_at=excluded.updated_at",
                     (
                         job_id,
                         row["key"],
@@ -476,6 +481,7 @@ class Store:
                         json.dumps(sorted(set(row.get("src_flags") or ()))),
                         json.dumps(sorted(set(row.get("dst_folders") or ()))),
                         json.dumps(sorted(set(row.get("dst_flags") or ()))),
+                        json.dumps(sorted(set(row.get("dst_mixed") or ()))),
                         now,
                     ),
                 )

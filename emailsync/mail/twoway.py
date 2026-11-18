@@ -26,6 +26,8 @@ class DstEntry:
     folders: set[str] = field(default_factory=set)
     flags: frozenset[str] = frozenset()
     normalize_copy_flags: set[str] = field(default_factory=set)
+    mixed_flags: set[str] = field(default_factory=set)
+    changed_copy_flags: set[str] = field(default_factory=set)
     ambiguous: bool = False
     trash_copies: list[DestCopy] = field(default_factory=list)
 
@@ -159,6 +161,7 @@ class TwoWayReconciler:
             copy_flags = [copy.flags for copy in entry.copies]
             flags = set().union(*copy_flags) if copy_flags else set()
             baseline_flags = normalize_flags(pair.get("dst_flags") or ()) if pair else None
+            baseline_mixed = normalize_flags(pair.get("dst_mixed") or ()) if pair else frozenset()
             if baseline_flags is not None:
                 flags.update(baseline_flags)
             selected_flags = set()
@@ -166,9 +169,17 @@ class TwoWayReconciler:
                 values = [flag in flags_for_copy for flags_for_copy in copy_flags]
                 if not values:
                     continue
-                if all(value == values[0] for value in values):
+                if flag in baseline_mixed:
+                    if all(value == values[0] for value in values):
+                        selected = values[0]
+                        entry.changed_copy_flags.add(flag)
+                    else:
+                        selected = flag in baseline_flags
+                        entry.mixed_flags.add(flag)
+                elif all(value == values[0] for value in values):
                     selected = values[0]
                 else:
+                    entry.mixed_flags.add(flag)
                     entry.normalize_copy_flags.add(flag)
                     if baseline_flags is None:
                         selected = values[0]
@@ -225,7 +236,7 @@ class TwoWayReconciler:
                 )
         return reverse
 
-    def _put_pair(self, key, state, src_folders, src_flags, dst_folders, dst_flags):
+    def _put_pair(self, key, state, src_folders, src_flags, dst_folders, dst_flags, dst_mixed=()):
         self.store.pairs_put_many(
             self.job_id,
             [
@@ -236,6 +247,7 @@ class TwoWayReconciler:
                     src_flags=src_flags,
                     dst_folders=dst_folders,
                     dst_flags=dst_flags,
+                    dst_mixed=dst_mixed,
                 )
             ],
         )
@@ -296,7 +308,7 @@ class TwoWayReconciler:
         if key.startswith("mid:"):
             try:
                 if self.source.has_message(target, key):
-                    self._put_pair(key, "ignored", [], [], entry.folders, entry.flags)
+                    self._put_pair(key, "ignored", [], [], entry.folders, entry.flags, entry.mixed_flags)
                     return
             except Exception as exc:
                 self.warning_count += 1
@@ -306,7 +318,7 @@ class TwoWayReconciler:
                     )
                 self.failed(str(exc))
                 return
-        self._put_pair(key, "copying_back", [], [], [primary], entry.flags)
+        self._put_pair(key, "copying_back", [], [], [primary], entry.flags, entry.mixed_flags)
         copy = next((item for item in entry.copies if primary in item.folders), entry.copies[0])
         try:
             raw = self.retry(lambda: self.dest.fetch_raw(copy.ref), self.dest)
@@ -367,7 +379,7 @@ class TwoWayReconciler:
         for flag in set(src_flags | dst_flags | old_src_flags | old_dst_flags):
             src_now, dst_now = flag in src_flags, flag in dst_flags
             src_changed_flag = src_now != (flag in old_src_flags)
-            dst_changed_flag = dst_now != (flag in old_dst_flags)
+            dst_changed_flag = dst_now != (flag in old_dst_flags) or flag in destination.changed_copy_flags
             if src_changed_flag and dst_changed_flag:
                 desired = src_now or dst_now
                 dest_change = source_change = True
@@ -450,6 +462,9 @@ class TwoWayReconciler:
         desired_src_flags = (src_flags | source_add_flags) - source_remove_flags
         desired_dst_flags = (dst_flags | dest_add_flags) - dest_remove_flags
         desired_dst_flags -= unsupported_dst_flags
+        remaining_dst_mixed = destination.mixed_flags - (
+            destination.normalize_copy_flags - set(unsupported_dst_flags)
+        )
         self._put_pair(
             key,
             "synced",
@@ -457,6 +472,7 @@ class TwoWayReconciler:
             desired_src_flags,
             desired_dst_folders,
             desired_dst_flags,
+            remaining_dst_mixed,
         )
         if (
             dest_add
@@ -513,6 +529,7 @@ class TwoWayReconciler:
                             src_flags=src.flags,
                             dst_folders=dst.folders,
                             dst_flags=dst.flags,
+                            dst_mixed=dst.mixed_flags,
                         )
                     )
                 elif dst and dst.folders:
@@ -524,6 +541,7 @@ class TwoWayReconciler:
                             src_flags=[],
                             dst_folders=dst.folders,
                             dst_flags=dst.flags,
+                            dst_mixed=dst.mixed_flags,
                         )
                     )
             self.store.pairs_put_many(self.job_id, rows)
@@ -557,15 +575,19 @@ class TwoWayReconciler:
             pair, src, dst = pairs.get(key), source.get(key), destination.get(key)
             if pair is None:
                 if src and src.folders and dst and dst.folders:
-                    self._put_pair(key, "synced", src.folders, src.flags, dst.folders, dst.flags)
+                    self._put_pair(
+                        key, "synced", src.folders, src.flags, dst.folders, dst.flags, dst.mixed_flags
+                    )
                 elif src and src.trash and dst and dst.folders:
-                    self._put_pair(key, "ignored", [], [], dst.folders, dst.flags)
+                    self._put_pair(key, "ignored", [], [], dst.folders, dst.flags, dst.mixed_flags)
                 elif dst and dst.folders:
                     self._copy_back(key, dst, reverse, pair)
                 continue
             if pair["state"] == "ignored":
                 if src and src.folders and dst and dst.folders:
-                    self._put_pair(key, "synced", src.folders, src.flags, dst.folders, dst.flags)
+                    self._put_pair(
+                        key, "synced", src.folders, src.flags, dst.folders, dst.flags, dst.mixed_flags
+                    )
                 continue
             if pair["state"] == "copying_back":
                 if src and src.folders:
@@ -577,6 +599,7 @@ class TwoWayReconciler:
                         src.flags,
                         [primary],
                         dst.flags if dst else pair.get("dst_flags") or [],
+                        dst.mixed_flags if dst else pair.get("dst_mixed") or [],
                     )
                 elif dst and dst.folders:
                     self._copy_back(key, dst, reverse, pair)

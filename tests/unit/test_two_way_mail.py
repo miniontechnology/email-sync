@@ -1,4 +1,5 @@
 import json
+import sqlite3
 
 import pytest
 
@@ -356,6 +357,56 @@ def test_excluding_gmail_label_drops_pair_without_trashing(tmp_path):
     assert "mid:gmail-excluded-work" not in store.pairs_get_all(job_id)
     assert state.destination["Work"] == ["mid:gmail-excluded-work"]
     assert state.destination.get("Trash") is None
+
+
+def test_destination_mixed_flag_baseline_is_stable_until_copies_agree(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:mixed-baseline", b"mixed", ["INBOX"])
+    state = FakeMailState({"INBOX": [message], "Work": []})
+    state.destination["INBOX"] = ["mid:mixed-baseline"]
+    state.destination["Work"] = ["mid:mixed-baseline"]
+    state.dest_flags[("INBOX", "mid:mixed-baseline")] = frozenset({"\\seen"})
+    state.dest_flags[("Work", "mid:mixed-baseline")] = frozenset()
+
+    assert run_migration(store, job_id, state).status == "completed"
+    pair = store.pairs_get_all(job_id)["mid:mixed-baseline"]
+    assert pair["dst_flags"] == ["\\seen"]
+    assert pair["dst_mixed"] == ["\\seen"]
+
+    first = run_migration(store, job_id, state)
+    second = run_migration(store, job_id, state)
+
+    assert first.status == second.status == "completed"
+    assert message.flags == ()
+    assert state.dest_flags[("INBOX", "mid:mixed-baseline")] == frozenset({"\\seen"})
+    assert state.dest_flags[("Work", "mid:mixed-baseline")] == frozenset()
+    assert store.pairs_get_all(job_id)["mid:mixed-baseline"]["dst_mixed"] == ["\\seen"]
+
+    state.dest_flags[("Work", "mid:mixed-baseline")] = frozenset({"\\seen"})
+    converged = run_migration(store, job_id, state)
+
+    assert converged.status == "completed"
+    assert "\\seen" in {flag.lower() for flag in message.flags}
+    assert state.dest_flags[("INBOX", "mid:mixed-baseline")] == frozenset({"\\seen"})
+    assert state.dest_flags[("Work", "mid:mixed-baseline")] == frozenset({"\\seen"})
+    assert store.pairs_get_all(job_id)["mid:mixed-baseline"]["dst_mixed"] == []
+
+
+def test_destination_mixed_flag_column_migrates_legacy_pair_table(tmp_path):
+    path = tmp_path / "legacy.db"
+    connection = sqlite3.connect(path)
+    with connection:
+        connection.execute(
+            "CREATE TABLE mail_pairs(job_id INTEGER NOT NULL, key TEXT NOT NULL, state TEXT NOT NULL, "
+            "src_folders TEXT NOT NULL, src_flags TEXT NOT NULL, dst_folders TEXT NOT NULL, "
+            "dst_flags TEXT NOT NULL, updated_at REAL NOT NULL, PRIMARY KEY(job_id, key))"
+        )
+    connection.close()
+
+    store = db.Store(path)
+    columns = {row["name"]: row for row in store.conn().execute("PRAGMA table_info(mail_pairs)")}
+    assert columns["dst_mixed"]["notnull"]
+    assert columns["dst_mixed"]["dflt_value"] == "'[]'"
 
 
 def test_flag_conflict_sets_the_flag_on_both_sides(tmp_path):
