@@ -27,7 +27,10 @@ CREATE TABLE IF NOT EXISTS jobs (
     started_at REAL,
     finished_at REAL,
     next_run_at REAL,
-    run_count INTEGER NOT NULL DEFAULT 0
+    run_count INTEGER NOT NULL DEFAULT 0,
+    twoway_baseline_at REAL,
+    pending_deletions TEXT,
+    approved_deletions TEXT
 );
 CREATE TABLE IF NOT EXISTS tasks (
     job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -39,6 +42,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     skipped INTEGER NOT NULL DEFAULT 0,
     failed INTEGER NOT NULL DEFAULT 0,
     updated INTEGER NOT NULL DEFAULT 0,
+    copied_back INTEGER NOT NULL DEFAULT 0,
+    trashed INTEGER NOT NULL DEFAULT 0,
     bytes INTEGER NOT NULL DEFAULT 0,
     message TEXT,
     started_at REAL,
@@ -73,6 +78,17 @@ CREATE TABLE IF NOT EXISTS ledger (
     PRIMARY KEY (job_id, kind, source_key)
 );
 CREATE INDEX IF NOT EXISTS ledger_status ON ledger(job_id, kind, status);
+CREATE TABLE IF NOT EXISTS mail_pairs (
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    src_folders TEXT NOT NULL,
+    src_flags TEXT NOT NULL,
+    dst_folders TEXT NOT NULL,
+    dst_flags TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (job_id, key)
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
@@ -116,6 +132,18 @@ class Store:
                 columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
                 if "updated" not in columns:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN updated INTEGER NOT NULL DEFAULT 0")
+                if table == "tasks":
+                    for column in ("copied_back", "trashed"):
+                        if column not in columns:
+                            conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+            job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
+            for column, declaration in (
+                ("twoway_baseline_at", "REAL"),
+                ("pending_deletions", "TEXT"),
+                ("approved_deletions", "TEXT"),
+            ):
+                if column not in job_columns:
+                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {declaration}")
 
     # -- connections -------------------------------------------------------------------------
     def conn(self) -> sqlite3.Connection:
@@ -190,7 +218,7 @@ class Store:
 
     def delete_job(self, job_id: int) -> None:
         with self.write() as conn:
-            for table in ("ledger", "events", "scopes", "tasks"):
+            for table in ("ledger", "mail_pairs", "events", "scopes", "tasks"):
                 conn.execute(f"DELETE FROM {table} WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
 
@@ -264,7 +292,7 @@ class Store:
             conn.execute(
                 "INSERT INTO tasks(job_id, kind, status, started_at) VALUES (?,?,?,?)"
                 " ON CONFLICT(job_id, kind) DO UPDATE SET status=excluded.status, total=0, already=0,"
-                " copied=0, skipped=0, failed=0, updated=0, bytes=0, message=NULL, started_at=excluded.started_at,"
+                " copied=0, skipped=0, failed=0, updated=0, copied_back=0, trashed=0, bytes=0, message=NULL, started_at=excluded.started_at,"
                 " finished_at=NULL",
                 (job_id, kind, status, now),
             )
@@ -410,6 +438,62 @@ class Store:
                 conn.execute("DELETE FROM ledger WHERE job_id=?", (job_id,))
             else:
                 conn.execute("DELETE FROM ledger WHERE job_id=? AND kind=?", (job_id, kind))
+            if kind in (None, "mail"):
+                conn.execute("DELETE FROM mail_pairs WHERE job_id=?", (job_id,))
+                conn.execute(
+                    "UPDATE jobs SET twoway_baseline_at=NULL, pending_deletions=NULL, "
+                    "approved_deletions=NULL WHERE id=?",
+                    (job_id,),
+                )
+
+    def pairs_get_all(self, job_id: int) -> dict[str, dict]:
+        rows = self.query("SELECT * FROM mail_pairs WHERE job_id=?", (job_id,))
+        out = {}
+        for row in rows:
+            item = dict(row)
+            for field in ("src_folders", "src_flags", "dst_folders", "dst_flags"):
+                try:
+                    item[field] = json.loads(item[field])
+                except (TypeError, ValueError):
+                    item[field] = []
+            out[item["key"]] = item
+        return out
+
+    def pairs_put_many(self, job_id: int, rows: Iterable[dict]) -> None:
+        now = time.time()
+        with self.write() as conn:
+            for row in rows:
+                conn.execute(
+                    "INSERT INTO mail_pairs(job_id,key,state,src_folders,src_flags,dst_folders,dst_flags,updated_at)"
+                    " VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(job_id,key) DO UPDATE SET"
+                    " state=excluded.state, src_folders=excluded.src_folders, src_flags=excluded.src_flags,"
+                    " dst_folders=excluded.dst_folders, dst_flags=excluded.dst_flags, updated_at=excluded.updated_at",
+                    (
+                        job_id,
+                        row["key"],
+                        row["state"],
+                        json.dumps(sorted(set(row.get("src_folders") or ()))),
+                        json.dumps(sorted(set(row.get("src_flags") or ()))),
+                        json.dumps(sorted(set(row.get("dst_folders") or ()))),
+                        json.dumps(sorted(set(row.get("dst_flags") or ()))),
+                        now,
+                    ),
+                )
+
+    def pairs_delete(self, job_id: int, keys: Iterable[str]) -> None:
+        with self.write() as conn:
+            conn.executemany(
+                "DELETE FROM mail_pairs WHERE job_id=? AND key=?", ((job_id, key) for key in keys)
+            )
+
+    def pairs_reset(self, job_id: int) -> None:
+        with self.write() as conn:
+            conn.execute("DELETE FROM mail_pairs WHERE job_id=?", (job_id,))
+            conn.execute(
+                "UPDATE jobs SET twoway_baseline_at=NULL, pending_deletions=NULL, "
+                "approved_deletions=NULL WHERE id=?",
+                (job_id,),
+            )
 
     # -- events ------------------------------------------------------------------------------
     def add_event(self, job_id: int, level: str, message: str) -> None:
@@ -432,6 +516,11 @@ class Store:
 def _job_row(row: sqlite3.Row) -> dict:
     d = dict(row)
     d["config"] = json.loads(d.pop("config_json"))
+    for field in ("pending_deletions", "approved_deletions"):
+        try:
+            d[field] = json.loads(d[field]) if d.get(field) else []
+        except (TypeError, ValueError):
+            d[field] = []
     return d
 
 
