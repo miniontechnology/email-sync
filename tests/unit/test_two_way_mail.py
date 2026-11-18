@@ -366,6 +366,34 @@ def test_unsupported_destination_keyword_stays_on_source_across_runs(tmp_path):
     assert state.dest_flags[("INBOX", "mid:unsupported-keyword")] == frozenset()
 
 
+def test_read_change_on_secondary_destination_copy_normalizes_all_copies(tmp_path):
+    store, job_id = make_store(tmp_path)
+    state = FakeMailState(
+        {
+            "INBOX": [FakeMail("mid:secondary-read", b"read", ["INBOX", "Work"])],
+            "Work": [FakeMail("mid:secondary-read", b"read", ["INBOX", "Work"])],
+        }
+    )
+    assert run_migration(store, job_id, state).status == "completed"
+    assert state.destination["INBOX"] == ["mid:secondary-read"]
+    assert state.destination["Work"] == ["mid:secondary-read"]
+    state.dest_flags[("Work", "mid:secondary-read")] = frozenset({"\\seen"})
+
+    changed = run_migration(store, job_id, state)
+
+    assert changed.status == "completed"
+    assert "\\seen" in {flag.lower() for flag in state.messages["INBOX"][0].flags}
+    assert "\\seen" in {flag.lower() for flag in state.messages["Work"][0].flags}
+    assert "\\seen" in {flag.lower() for flag in state.dest_flags[("INBOX", "mid:secondary-read")]}
+    assert "\\seen" in {flag.lower() for flag in state.dest_flags[("Work", "mid:secondary-read")]}
+    applied = state.apply_state_count
+
+    rerun = run_migration(store, job_id, state)
+
+    assert rerun.status == "completed"
+    assert state.apply_state_count == applied
+
+
 def test_imap_destination_reports_keywords_rejected_by_permanent_flags():
     class Connection:
         def __init__(self):

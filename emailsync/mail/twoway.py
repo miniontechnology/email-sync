@@ -25,6 +25,7 @@ class DstEntry:
     copies: list[DestCopy] = field(default_factory=list)
     folders: set[str] = field(default_factory=set)
     flags: frozenset[str] = frozenset()
+    normalize_copy_flags: set[str] = field(default_factory=set)
     ambiguous: bool = False
     trash_copies: list[DestCopy] = field(default_factory=list)
 
@@ -135,7 +136,7 @@ class TwoWayReconciler:
                 self.log(f"Source folder {scope} looks empty; skipped deletions this run", "warning")
         return entries, source_counts, empty, scope_counts, scope_targets
 
-    def _destination_snapshot(self):
+    def _destination_snapshot(self, pairs):
         index = DestIndex(scope="account")
         self.retry(lambda: self.dest.index_all(index), self.dest)
         trash, _ = self.retry(lambda: self.dest.resolve("@trash", create=False), self.dest)
@@ -143,6 +144,7 @@ class TwoWayReconciler:
         counts = Counter()
         for key, copies in index.entries().items():
             entry = DstEntry()
+            pair = pairs.get(key)
             for copy in copies:
                 folders = set(copy.folders)
                 is_trash = bool(trash and trash in folders)
@@ -153,9 +155,29 @@ class TwoWayReconciler:
                 if folders:
                     for folder in folders:
                         counts[folder] += 1
-                    if not entry.flags:
-                        entry.flags = normalize_flags(copy.flags)
                     entry.copies.append(DestCopy(copy.ref, frozenset(folders), normalize_flags(copy.flags)))
+            copy_flags = [copy.flags for copy in entry.copies]
+            flags = set().union(*copy_flags) if copy_flags else set()
+            baseline_flags = normalize_flags(pair.get("dst_flags") or ()) if pair else None
+            if baseline_flags is not None:
+                flags.update(baseline_flags)
+            selected_flags = set()
+            for flag in flags:
+                values = [flag in flags_for_copy for flags_for_copy in copy_flags]
+                if not values:
+                    continue
+                if all(value == values[0] for value in values):
+                    selected = values[0]
+                else:
+                    entry.normalize_copy_flags.add(flag)
+                    if baseline_flags is None:
+                        selected = values[0]
+                    else:
+                        changed_values = [value for value in set(values) if value != (flag in baseline_flags)]
+                        selected = changed_values[0] if changed_values else values[0]
+                if selected:
+                    selected_flags.add(flag)
+            entry.flags = normalize_flags(selected_flags)
             seen = Counter(folder for copy in entry.copies for folder in copy.folders)
             entry.ambiguous = any(count > 1 for count in seen.values())
             entries[key] = entry
@@ -361,6 +383,14 @@ class TwoWayReconciler:
                 (dest_add_flags if desired else dest_remove_flags).add(flag)
             if source_change:
                 (source_add_flags if desired else source_remove_flags).add(flag)
+        desired_dst_flags = (dst_flags | dest_add_flags) - dest_remove_flags
+        for flag in destination.normalize_copy_flags:
+            if flag in desired_dst_flags:
+                dest_add_flags.add(flag)
+                dest_remove_flags.discard(flag)
+            else:
+                dest_remove_flags.add(flag)
+                dest_add_flags.discard(flag)
         try:
             unsupported_dst_flags = self._apply_destination(
                 key,
@@ -443,7 +473,7 @@ class TwoWayReconciler:
     def reconcile(self, baseline=False, plan_only=False):
         pairs = self.store.pairs_get_all(self.job_id)
         source, source_counts, source_empty, _, scope_targets = self._source_snapshot(pairs)
-        destination, dest_counts, dest_empty = self._destination_snapshot()
+        destination, dest_counts, dest_empty = self._destination_snapshot(pairs)
         reverse = self._reverse_map()
         scanned_source_targets = {target for targets in scope_targets.values() for target in targets}
         ambiguous_keys = set()

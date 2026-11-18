@@ -59,6 +59,7 @@ class FakeMailState:
         self.source_move_count = 0
         self.source_removed_locations = []
         self.unsupported_destination_flags = set()
+        self.apply_state_count = 0
 
 
 class FakeSource:
@@ -345,6 +346,7 @@ class FakeDest:
         errors = {}
         unsupported_flags = defaultdict(set)
         with self.state.lock:
+            self.state.apply_state_count += 1
             for change in changes:
                 remaining = self.state.apply_failures.get(change.source_key, 0)
                 if remaining:
