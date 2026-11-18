@@ -359,6 +359,32 @@ def test_excluding_gmail_label_drops_pair_without_trashing(tmp_path):
     assert state.destination.get("Trash") is None
 
 
+def test_disabling_gmail_spam_drops_pair_without_trashing(tmp_path):
+    store, job_id = make_store(tmp_path)
+    spam = FakeMail("mid:gmail-spam", b"spam", ["@junk"])
+    remaining = FakeMail("mid:gmail-spam-other", b"other", ["INBOX"])
+    state = FakeMailState({"All Mail": [remaining], "Spam": [spam]}, gmail=True)
+    options = Options(
+        two_way=True,
+        sync_interval_minutes=15,
+        verify=False,
+        workers=1,
+        max_deletion_percent=100,
+        include_spam=True,
+    )
+
+    assert run_migration(store, job_id, state, options).status == "completed"
+    assert store.pairs_get_all(job_id)["mid:gmail-spam"]["src_folders"] == ["Junk"]
+    options.include_spam = False
+
+    result = run_migration(store, job_id, state, options)
+
+    assert result.status == "completed"
+    assert "mid:gmail-spam" not in store.pairs_get_all(job_id)
+    assert state.destination["Junk"] == ["mid:gmail-spam"]
+    assert state.destination.get("Trash") is None
+
+
 def test_destination_mixed_flag_baseline_is_stable_until_copies_agree(tmp_path):
     store, job_id = make_store(tmp_path)
     message = FakeMail("mid:mixed-baseline", b"mixed", ["INBOX"])

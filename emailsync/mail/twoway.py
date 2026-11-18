@@ -502,6 +502,15 @@ class TwoWayReconciler:
             if self.source.gmail
             else set()
         )
+        if self.source.gmail:
+            if not self.options.include_spam:
+                junk_target = self._resolve("@junk")
+                if junk_target:
+                    excluded_source_targets.add(junk_target)
+            if not self.options.include_trash:
+                trash_target = self._resolve("@trash")
+                if trash_target:
+                    excluded_source_targets.add(trash_target)
         ambiguous_keys = set()
         all_keys = set(source) | set(destination) | set(pairs)
         for key in all_keys:
