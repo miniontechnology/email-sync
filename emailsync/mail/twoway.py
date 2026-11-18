@@ -42,6 +42,8 @@ class TwoWayReconciler:
         self.failed = failed
         self.ambiguous = 0
         self.warning_count = 0
+        self.unscanned_copybacks = 0
+        self.unsearchable_copybacks = 0
 
     def _resolve(self, target):
         if not target:
@@ -216,34 +218,77 @@ class TwoWayReconciler:
             ],
         )
 
-    def _copy_back(self, key, entry, reverse):
-        inbox, _ = self._resolve("@inbox"), False
+    def _copy_back_target(self, primary, reverse):
+        target = reverse.get(primary, primary)
+        if self.source.gmail and (
+            not target or target.lower() in ("\\inbox", "\\sent", "\\draft", "\\trash", "\\spam")
+        ):
+            role = {
+                "\\inbox": "inbox",
+                "\\sent": "sent",
+                "\\draft": "drafts",
+                "\\trash": "trash",
+                "\\spam": "junk",
+            }.get(target.lower() if target else "", "all")
+            source_folders = self.retry(self.source.folders, self.source) or []
+            source_folder = next((folder for folder in source_folders if folder.role == role), None)
+            target = source_folder.name if source_folder else "INBOX"
+        elif target in ("", None):
+            target = "INBOX"
+        return target
+
+    def _copy_back_target_is_scanned(self, target):
+        if self.source.gmail:
+            lowered_target = target.casefold()
+            if any(lowered_target == folder.casefold() for folder in self.options.exclude_folders):
+                return False
+            folders = self.retry(self.source.folders, self.source) or []
+            folder = next((item for item in folders if item.name.casefold() == lowered_target), None)
+            return not folder or folder.role not in ("junk", "trash")
+        scopes = self.retry(self.source.scopes, self.source) or []
+        return any(scope.name == target for scope in scopes)
+
+    def _log_copyback_summaries(self):
+        if self.unscanned_copybacks:
+            self.log(
+                f"{self.unscanned_copybacks} destination-only message(s) are in folders that aren't synced back; left alone",
+                "warning",
+            )
+        if self.unsearchable_copybacks:
+            self.log(
+                f"{self.unsearchable_copybacks} copying-back message(s) without Message-ID were not retried",
+                "warning",
+            )
+
+    def _copy_back(self, key, entry, reverse, pair=None):
+        inbox = self._resolve("@inbox")
         primary = sorted(entry.folders, key=lambda folder: (folder != inbox, folder))[0]
-        pair = self.store.pairs_get_all(self.job_id).get(key)
-        if pair and pair["state"] == "copying_back":
-            self._put_pair(key, "synced", entry.folders, entry.flags, [primary], entry.flags)
+        target = self._copy_back_target(primary, reverse)
+        if not self._copy_back_target_is_scanned(target):
+            self.unscanned_copybacks += 1
             return
+        retrying = bool(pair and pair["state"] == "copying_back")
+        if retrying and not key.startswith("mid:"):
+            self.unsearchable_copybacks += 1
+            return
+        if key.startswith("mid:"):
+            try:
+                if self.source.has_message(target, key):
+                    self._put_pair(key, "ignored", [], [], entry.folders, entry.flags)
+                    return
+            except Exception as exc:
+                self.warning_count += 1
+                if self.warning_count <= 20:
+                    self.log(
+                        f"Could not check whether source already has {key}; will retry: {exc}", "warning"
+                    )
+                self.failed(str(exc))
+                return
         self._put_pair(key, "copying_back", [], [], [primary], entry.flags)
         copy = next((item for item in entry.copies if primary in item.folders), entry.copies[0])
         try:
             raw = self.retry(lambda: self.dest.fetch_raw(copy.ref), self.dest)
             date = self.retry(lambda: self.dest.fetch_internaldate(copy.ref), self.dest)
-            target = reverse.get(primary, primary)
-            if self.source.gmail and (
-                not target or target.lower() in ("\\inbox", "\\sent", "\\draft", "\\trash", "\\spam")
-            ):
-                role = {
-                    "\\inbox": "inbox",
-                    "\\sent": "sent",
-                    "\\draft": "drafts",
-                    "\\trash": "trash",
-                    "\\spam": "junk",
-                }.get(target.lower() if target else "", "all")
-                source_folders = self.retry(self.source.folders, self.source) or []
-                source_folder = next((folder for folder in source_folders if folder.role == role), None)
-                target = source_folder.name if source_folder else "INBOX"
-            elif target in ("", None):
-                target = "INBOX"
             self.source.append(target, raw, entry.flags, date)
         except Exception as exc:
             self.warning_count += 1
@@ -457,7 +502,7 @@ class TwoWayReconciler:
                 elif src and src.trash and dst and dst.folders:
                     self._put_pair(key, "ignored", [], [], dst.folders, dst.flags)
                 elif dst and dst.folders:
-                    self._copy_back(key, dst, reverse)
+                    self._copy_back(key, dst, reverse, pair)
                 continue
             if pair["state"] == "ignored":
                 if src and src.folders and dst and dst.folders:
@@ -465,11 +510,7 @@ class TwoWayReconciler:
                 continue
             if pair["state"] == "copying_back":
                 if src and src.folders:
-                    primary = (
-                        sorted(dst.folders)[0]
-                        if dst and dst.folders
-                        else sorted(pair.get("dst_folders") or ["INBOX"])[0]
-                    )
+                    primary = next(iter(pair.get("dst_folders") or ["INBOX"]))
                     self._put_pair(
                         key,
                         "synced",
@@ -479,7 +520,7 @@ class TwoWayReconciler:
                         dst.flags if dst else pair.get("dst_flags") or [],
                     )
                 elif dst and dst.folders:
-                    self._copy_back(key, dst, reverse)
+                    self._copy_back(key, dst, reverse, pair)
                 elif not (src and src.folders):
                     self.store.pairs_delete(self.job_id, [key])
                 continue
@@ -499,12 +540,14 @@ class TwoWayReconciler:
                 self.store.pairs_delete(self.job_id, [key])
 
         if (source_empty or dest_empty) and pairs:
+            self._log_copyback_summaries()
             self.log(
                 "A source folder or the destination index looks empty; skipped deletions this run", "warning"
             )
             return False
         if not deletions:
             self.store.update_job(self.job_id, pending_deletions=None)
+            self._log_copyback_summaries()
             return False
         total_by_folder = defaultdict(int)
         for item in deletions:
@@ -521,6 +564,7 @@ class TwoWayReconciler:
         if exceeds and not keys <= approved:
             pending = [{k: item[k] for k in ("key", "side", "folder")} for item in deletions]
             self.store.update_job(self.job_id, pending_deletions=json.dumps(pending))
+            self._log_copyback_summaries()
             self.log(
                 f"{len(deletions)} messages would be moved to Trash; review and apply on the job page",
                 "warning",
@@ -542,4 +586,5 @@ class TwoWayReconciler:
             pending_deletions=None,
             approved_deletions=None,
         )
+        self._log_copyback_summaries()
         return False

@@ -199,6 +199,9 @@ class ImapConnection:
         criteria = ["SINCE", since] if since else ["ALL"]
         return sorted(int(u) for u in self.c.search(criteria))
 
+    def search_header(self, name: str, value: str) -> list[int]:
+        return sorted(int(uid) for uid in self.c.search(["HEADER", name, value]))
+
     def fetch_meta(self, uids: list[int], gmail: bool = False) -> dict[int, dict]:
         items = [HEADER_ITEM, b"FLAGS", b"INTERNALDATE", b"RFC822.SIZE"]
         if gmail:

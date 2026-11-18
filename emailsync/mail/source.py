@@ -149,6 +149,18 @@ class ImapSource:
     def trash_folder(self) -> str | None:
         return next((folder.name for folder in self.folders() if folder.role == "trash"), None)
 
+    def has_message(self, folder: str, key: str) -> bool | None:
+        if not key.startswith("mid:"):
+            return None
+        message_id = key.removeprefix("mid:")
+        if self.gmail:
+            all_mail = next((item.name for item in self.folders() if item.role == "all"), None)
+            if not all_mail:
+                return False
+            folder = all_mail
+        self.conn.ensure_selected(folder)
+        return bool(self.conn.search_header("Message-ID", f"<{message_id}>"))
+
     def append(self, folder: str, raw: bytes, flags=(), internaldate=None):
         if not self.gmail:
             self.ensure_folder(folder)
