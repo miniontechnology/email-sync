@@ -147,6 +147,7 @@ class MailMigration:
         self._queue = queue.Queue(maxsize=max(2, self.options.workers * 2))
         self._coordinator_source = None
         self._coordinator_dest = None
+        self._run_started_at = 0.0
 
     def _log(self, level, message):
         self.store.add_event(self.job_id, level, message)
@@ -655,6 +656,8 @@ class MailMigration:
                     pair = pairs.get(key)
                     if not pair or not pair.get("dst_folders"):
                         continue
+                    if float(pair.get("updated_at") or 0) < self._run_started_at:
+                        continue
                     row_targets = pair["dst_folders"]
                 else:
                     row_targets = row["targets"]
@@ -678,6 +681,7 @@ class MailMigration:
             dest.close()
 
     def run(self) -> TaskResult:
+        self._run_started_at = time.time()
         self.store.reset_task(self.job_id, "mail", "running")
         self.progress.flush(force=True)
         self._coordinator_source = self.source_factory(self.config.endpoints["mail"]["source"], self.options)

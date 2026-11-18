@@ -388,6 +388,37 @@ def test_missing_source_trash_keeps_pair_and_does_not_expunge(tmp_path):
     assert any("Source has no Trash folder" in event["message"] for event in store.get_events(job_id))
 
 
+def test_verify_does_not_fail_or_recopy_preexisting_destination_deletion(tmp_path):
+    store, job_id = make_store(tmp_path)
+    message = FakeMail("mid:verify-deleted", b"keep", ["INBOX"])
+    state = FakeMailState({"INBOX": [message, FakeMail("mid:other", b"other", ["INBOX"])]})
+    assert run_migration(store, job_id, state).status == "completed"
+    initial_uploads = state.upload_count
+    state.destination["INBOX"].remove("mid:verify-deleted")
+    state.source_trash_enabled = False
+    options = Options(
+        two_way=True,
+        sync_interval_minutes=15,
+        verify=True,
+        workers=1,
+        max_deletion_percent=100,
+    )
+
+    result = run_migration(store, job_id, state, options)
+
+    ledger = next(
+        row
+        for row in store.ledger_items(job_id, "mail", limit=None)
+        if row.get("match_key") == "mid:verify-deleted"
+    )
+    assert result.status == "completed_with_errors"
+    assert ledger["status"] == "done"
+    assert state.destination["INBOX"] == ["mid:other"]
+    assert "mid:verify-deleted" not in state.destination["INBOX"]
+    assert state.destination.get("Trash") is None
+    assert state.upload_count == initial_uploads
+
+
 def test_source_folder_removal_only_touches_that_folders_uid(tmp_path):
     store, job_id = make_store(tmp_path)
     state = FakeMailState(
