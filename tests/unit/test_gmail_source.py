@@ -21,18 +21,26 @@ class FakeImap:
     def list_folders(self):
         from emailsync.mail.folders import Folder
 
-        return [
+        folders = [
             Folder("[Gmail]/All Mail", "/", ("\\All",)),
             Folder("INBOX", "/", ("\\Inbox",)),
             Folder("[Gmail]/Spam", "/", ("\\Junk",)),
             Folder("[Gmail]/Trash", "/", ("\\Trash",)),
         ]
+        folders.extend(Folder(label, "/", ()) for label in self.labels if not label.startswith("\\"))
+        return folders
 
     def select(self, name, readonly=True):
         return {"uidvalidity": 1}
 
     def create_folder(self, name):
         self.calls.append(("create_folder", name))
+        if name not in self.labels:
+            self.labels.append(name)
+
+    def append(self, folder, raw, flags, internaldate):
+        self.calls.append(("append", folder, raw, flags, internaldate))
+        return "uid"
 
     def ensure_writable(self, name):
         self.calls.append(("ensure_writable", name))
@@ -135,6 +143,24 @@ def test_gmail_two_way_folder_labels_archive_and_trash_use_gmail_operations():
     assert ("remove_gmail_labels", [7], ["\\Inbox"]) in connection.calls
     assert ("move", [7], "[Gmail]/Trash") in connection.calls
     assert ("move", [8], "[Gmail]/Trash") not in connection.calls
+
+
+def test_gmail_append_creates_missing_custom_label_but_not_system_folders():
+    source = ImapSource(Endpoint("gmail", host="imap.gmail.com"), Options(two_way=True), gmail=True)
+    connection = FakeImap()
+    source.conn = connection
+
+    source.append("New/Label", b"message")
+    source.append("[Gmail]/Trash", b"trash")
+    source.append("INBOX", b"inbox")
+
+    assert ("create_folder", "New/Label") in connection.calls
+    assert ("append", "New/Label", b"message", (), None) in connection.calls
+    assert ("create_folder", "[Gmail]/Trash") not in connection.calls
+    assert ("create_folder", "INBOX") not in connection.calls
+    assert connection.calls.index(("create_folder", "New/Label")) < connection.calls.index(
+        ("append", "New/Label", b"message", (), None)
+    )
 
 
 def test_has_message_searches_message_id_in_target_or_gmail_all_mail():

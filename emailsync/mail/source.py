@@ -162,12 +162,11 @@ class ImapSource:
         return bool(self.conn.search_header("Message-ID", f"<{message_id}>"))
 
     def append(self, folder: str, raw: bytes, flags=(), internaldate=None):
-        if not self.gmail:
-            self.ensure_folder(folder)
+        self.ensure_folder(folder)
         return self.conn.append(folder, raw, flags, internaldate)
 
     def ensure_folder(self, folder):
-        if self.gmail:
+        if self.gmail and (folder.upper() == "INBOX" or folder.casefold().startswith("[gmail]/")):
             return
         if folder not in {item.name for item in self.folders()}:
             self.conn.create_folder(folder)
