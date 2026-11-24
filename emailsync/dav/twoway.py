@@ -276,6 +276,9 @@ class DavTwoWayReconciler:
             if not scope_items.get(scope_name):
                 guarded.add("empty source scope")
 
+        if failed_scopes or failed_collections:
+            guarded.add("incomplete snapshot")
+
         discovered_hrefs = set(available_collections)
         unmapped = discovered_hrefs - mapped_hrefs
         if unmapped:
@@ -290,7 +293,8 @@ class DavTwoWayReconciler:
             )
         if guarded:
             self.log(
-                "warning", "DAV deletions were suppressed because a paired collection was empty or missing"
+                "warning",
+                "DAV deletions were suppressed because a paired collection was empty or missing, or a snapshot was incomplete",
             )
         return {
             "scopes": scopes,

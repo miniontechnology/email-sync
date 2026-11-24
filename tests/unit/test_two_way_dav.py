@@ -1063,6 +1063,39 @@ def test_empty_or_missing_paired_scope_suppresses_deletions_and_retains_pairs(tm
     assert dest.delete_calls == []
 
 
+def test_failed_other_contact_scope_snapshot_suppresses_deletion_after_move(tmp_path):
+    store = db.Store(tmp_path / "failed-move-snapshot.db")
+    job_id = store.create_job("DAV", {}, None)
+    moved_source = _with_ref(_contact("person-1", "Moved"), "source:A/person-1.vcf", '"s1"')
+    anchor_source = _with_ref(_contact("anchor", "Anchor"), "source:A/anchor.vcf", '"s2"')
+    moved_dest = _with_ref(_contact("person-1", "Moved"), "dest:Default/person-1.vcf", '"d1"')
+    anchor_dest = _with_ref(_contact("anchor", "Anchor"), "dest:Default/anchor.vcf", '"d2"')
+    scopes = [
+        DavScope("A", {"href": "source:A", "displayname": "A"}),
+        DavScope("B", {"href": "source:B", "displayname": "B"}),
+    ]
+    reconciler, source, dest, _progress, logs = _reconciler(
+        store,
+        job_id,
+        "contacts",
+        {"A": [moved_source, anchor_source], "B": []},
+        {"dest:Default": [moved_dest, anchor_dest]},
+        scopes=scopes,
+    )
+
+    reconciler.reconcile(baseline=True)
+    source.items_by_scope["A"] = [anchor_source]
+    source.items_by_scope["B"] = [moved_source]
+    source.strict_failures.add("B")
+
+    reconciler.reconcile()
+
+    assert "A|person-1" in store.dav_pairs_get_all(job_id, "contacts")
+    assert dest.delete_calls == []
+    assert store.dav_deleted_list(job_id, "contacts") == []
+    assert any("deletions were suppressed" in message for _level, message in logs)
+
+
 def test_deletion_percent_limit_pauses_until_kind_scoped_approval(tmp_path):
     store = db.Store(tmp_path / "percent-limit.db")
     job_id = store.create_job("DAV", {}, None)
