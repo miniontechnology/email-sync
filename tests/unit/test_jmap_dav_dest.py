@@ -291,6 +291,59 @@ def test_calendar_put_disables_scheduling_and_sets_calendar(monkeypatch):
     assert client.calls[-1][1] == (CORE, CALENDARS, CALENDARS_PARSE)
 
 
+@pytest.mark.parametrize(
+    ("kind", "parsed", "object_name", "uid", "collection_key", "collection_id"),
+    [
+        ("contacts", {"uid": "contact-1"}, "ContactCard", "contact-1", "addressBookIds", "book-1"),
+        ("contacts", [{"uid": "contact-1"}, None], "ContactCard", "contact-1", "addressBookIds", "book-1"),
+        ("calendars", {"uid": "event-1"}, "CalendarEvent", "event-1", "calendarIds", "calendar-1"),
+        ("calendars", [{"uid": "event-1"}], "CalendarEvent", "event-1", "calendarIds", "calendar-1"),
+    ],
+)
+def test_put_normalizes_dict_and_list_parse_results(
+    monkeypatch, kind, parsed, object_name, uid, collection_key, collection_id
+):
+    destination, client = _destination(
+        monkeypatch,
+        kind,
+        [
+            [[f"{object_name}/parse", {"parsed": {"blob-1": parsed}}, "p"]],
+            [[f"{object_name}/set", {"created": {"c0": {"id": "created-1"}}}, "s"]],
+        ],
+    )
+    destination.connect()
+
+    assert destination.put({"id": collection_id, "href": collection_id}, "item", b"data") is True
+    created = client.calls[-1][0][0][1]["create"]
+    assert created["c0"]["uid"] == uid
+    assert created["c0"][collection_key] == {collection_id: True}
+
+
+@pytest.mark.parametrize(
+    ("kind", "parsed", "object_name", "uid"),
+    [
+        ("contacts", {"uid": "contact-1"}, "ContactCard", "contact-1"),
+        ("contacts", [{"uid": "contact-1"}], "ContactCard", "contact-1"),
+        ("calendars", {"uid": "event-1"}, "CalendarEvent", "event-1"),
+        ("calendars", [{"uid": "event-1"}], "CalendarEvent", "event-1"),
+    ],
+)
+def test_update_normalizes_dict_and_list_parse_results(monkeypatch, kind, parsed, object_name, uid):
+    destination, client = _destination(
+        monkeypatch,
+        kind,
+        [
+            [[f"{object_name}/parse", {"parsed": {"blob-1": parsed}}, "p"]],
+            [[f"{object_name}/get", {"list": [{"id": "object-1", "uid": uid}]}, "g"]],
+            [[f"{object_name}/set", {"updated": {"object-1": {}}}, "u"]],
+        ],
+    )
+    destination.connect()
+
+    assert destination.update({"id": "collection-1"}, "object-1", None, b"data") is True
+    assert client.calls[-1][0][0][1]["update"]["object-1"]["uid"] == uid
+
+
 def test_contact_update_nulls_removed_properties_not_server_managed_ones(monkeypatch):
     parsed = {
         "id": None,
@@ -424,15 +477,19 @@ def test_jmap_update_returns_false_when_object_is_not_found(monkeypatch):
     assert client.calls[-1][0][0][0] == "ContactCard/get"
 
 
-def test_empty_calendar_parse_result_raises_permanent_error(monkeypatch):
-    destination, _client = _destination(
-        monkeypatch,
-        "calendars",
-        [[["CalendarEvent/parse", {"parsed": {"blob-1": []}}, "p"]]],
+@pytest.mark.parametrize(
+    "kind,object_name,collection_id",
+    [("contacts", "ContactCard", "book-1"), ("calendars", "CalendarEvent", "calendar-1")],
+)
+@pytest.mark.parametrize("parsed", [[], None, "invalid", [None]])
+def test_empty_parse_result_raises_permanent_error(monkeypatch, kind, object_name, collection_id, parsed):
+    destination, client = _destination(
+        monkeypatch, kind, [[[f"{object_name}/parse", {"parsed": {"blob-1": parsed}}, "p"]]]
     )
     destination.connect()
-    with pytest.raises(PermanentError, match="No VEVENT in item; JMAP calendars only import events"):
-        destination.put({"href": "calendar-1"}, "empty.ics", b"VCALENDAR")
+    with pytest.raises(PermanentError, match="Stalwart could not parse the item"):
+        destination.put({"href": collection_id}, "empty", b"")
+    assert len(client.calls) == 2
 
 
 def test_items_pages_and_computes_contact_fingerprint(monkeypatch):

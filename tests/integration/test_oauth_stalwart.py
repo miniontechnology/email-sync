@@ -5,7 +5,13 @@ from uuid import uuid4
 import httpx
 import pytest
 from fastapi.testclient import TestClient
-from test_protocol_migrations import STALWART_PASSWORD, STALWART_USER, _raw, _seed_greenmail
+from test_protocol_migrations import (
+    STALWART_PASSWORD,
+    STALWART_USER,
+    _job_failure_context,
+    _raw,
+    _seed_greenmail,
+)
 
 from emailsync.config import Settings
 from emailsync.crypto import SecretBox
@@ -158,7 +164,9 @@ def test_stalwart_oauth_signin_then_jmap_imap_and_contacts_migrations(tmp_path):
                 "calendars": {"source": None, "dest": None},
             },
         )
-        assert result["status"] == "completed", result["last_error"]
+        assert result["status"] == "completed", (
+            f"{result['last_error']!r}; {_job_failure_context(store, result['id'])}"
+        )
         assert store.get_tasks(result["id"])[0]["copied"] == 1
 
         current = store.get_account(account_id)
@@ -181,7 +189,9 @@ def test_stalwart_oauth_signin_then_jmap_imap_and_contacts_migrations(tmp_path):
                 "calendars": {"source": None, "dest": None},
             },
         )
-        assert result["status"] == "completed", result["last_error"]
+        assert result["status"] == "completed", (
+            f"{result['last_error']!r}; {_job_failure_context(store, result['id'])}"
+        )
         assert store.get_tasks(result["id"])[0]["copied"] == 1
         refreshed = secretbox.decrypt(store.get_account(account_id)["secrets_enc"])
         assert refreshed["expires_at"] > 0
@@ -207,5 +217,7 @@ def test_stalwart_oauth_signin_then_jmap_imap_and_contacts_migrations(tmp_path):
                 "calendars": {"source": None, "dest": None},
             },
         )
-        assert result["status"] == "completed", result["last_error"]
+        assert result["status"] == "completed", (
+            f"{result['last_error']!r}; {_job_failure_context(store, result['id'])}"
+        )
         assert store.get_tasks(result["id"])[0]["copied"] == 1
