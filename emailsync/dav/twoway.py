@@ -487,9 +487,9 @@ class DavTwoWayReconciler:
                 self._task_progress("trashed")
             return False
         exceeded = self._deletions_exceed_limit(deletions, snapshot)
-        keys = {item["key"] for item in deletions}
-        approved = self.store.get_approved_keys(self.job_id, self.kind)
-        if exceeded and not keys <= approved:
+        planned = {(item["key"], item["side"]) for item in deletions}
+        approved = self.store.get_approved(self.job_id, self.kind)
+        if exceeded and not planned <= approved:
             pending = [
                 {
                     "kind": self.kind,
