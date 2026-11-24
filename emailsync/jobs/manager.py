@@ -246,6 +246,10 @@ class JobManager:
 
             old = self._load_config(job, resolve=False)
             config.options.dav_match_fingerprint = old.options.dav_match_fingerprint
+            errors = [*merge_saved_settings(config, old), *self._validate(config)]
+            if errors:
+                raise ValueError(" ".join(errors))
+
             mail_endpoints_changed = any(
                 _identity(config.endpoints["mail"].get(side)) != _identity(old.endpoints["mail"].get(side))
                 for side in ("source", "dest")
@@ -258,10 +262,6 @@ class JobManager:
                     for side in ("source", "dest")
                 )
             ]
-            errors = [*merge_saved_settings(config, old), *self._validate(config)]
-            if errors:
-                raise ValueError(" ".join(errors))
-
             changed_kinds = [
                 kind for kind in endpoint_changed_kinds if self.store.ledger_counts(job_id, kind)
             ]

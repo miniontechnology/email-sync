@@ -421,6 +421,38 @@ def test_edit_job_requires_confirmation_and_resets_only_changed_kind(tmp_path):
     )
 
 
+def test_edit_mail_username_resets_inherited_dav_pairs_and_baseline(tmp_path):
+    _settings, store, manager = make_manager(tmp_path)
+    config = config_with_contacts("mail-old")
+    config.options.two_way = True
+    config.options.sync_interval_minutes = 15
+    job_id = completed_job(manager, store, config)
+    store.dav_pairs_put_many(
+        job_id,
+        "contacts",
+        [
+            {
+                "key": "Default|person",
+                "state": "synced",
+                "src_hash": "source",
+                "dst_hash": "destination",
+            }
+        ],
+    )
+    store.set_task_baseline(job_id, "contacts", 1234.0)
+
+    changed = manager._load_config(store.get_job(job_id), resolve=False)
+    changed.endpoints["mail"]["dest"].username = "bob"
+    changed.endpoints["contacts"]["dest"].password = ""
+
+    assert manager.edit_job(job_id, changed) == []
+
+    saved = manager._load_config(store.get_job(job_id), resolve=False)
+    assert saved.endpoints["contacts"]["dest"].username == "bob"
+    assert store.dav_pairs_get_all(job_id, "contacts") == {}
+    assert store.get_task_baseline(job_id, "contacts") is None
+
+
 def test_edit_file_endpoint_keeps_or_replaces_uploads_safely(tmp_path):
     settings, store, manager = make_manager(tmp_path)
     old_dir = settings.uploads_dir / "old"
