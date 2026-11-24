@@ -77,6 +77,13 @@ class Options:
     update_changed_items: bool = True
     sync_interval_minutes: int = 0
     dav_match_fingerprint: bool = True
+    two_way: bool = False
+    max_deletions: int = 50
+    max_deletion_percent: int = 10
+
+    def __post_init__(self):
+        self.max_deletions = max(0, int(self.max_deletions))
+        self.max_deletion_percent = max(0, min(100, int(self.max_deletion_percent)))
 
     @classmethod
     def from_dict(cls, data: dict | None) -> "Options":
@@ -141,6 +148,16 @@ class JobConfig:
             errors.append(
                 "Configure a source and a destination for at least one of mail, contacts or calendars."
             )
+        if self.options.two_way:
+            mail = self.endpoints["mail"]
+            if not mail["source"] or not mail["dest"]:
+                errors.append("Two-way sync requires mail to be enabled.")
+            if self.options.sync_interval_minutes <= 0:
+                errors.append("Two-way sync requires a sync interval greater than zero.")
+            if mail["source"] and mail["source"].type not in MAIL_SOURCE_TYPES:
+                errors.append("Two-way sync requires an IMAP or Gmail mail source.")
+            if mail["dest"] and mail["dest"].type not in MAIL_DEST_TYPES:
+                errors.append("Two-way sync requires an IMAP or JMAP mail destination.")
         allowed = {
             "mail": (MAIL_SOURCE_TYPES, MAIL_DEST_TYPES),
             "contacts": (CONTACTS_SOURCE_TYPES, ("carddav", "jmap")),

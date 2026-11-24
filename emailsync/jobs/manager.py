@@ -246,6 +246,10 @@ class JobManager:
 
             old = self._load_config(job, resolve=False)
             config.options.dav_match_fingerprint = old.options.dav_match_fingerprint
+            mail_endpoints_changed = any(
+                _identity(config.endpoints["mail"].get(side)) != _identity(old.endpoints["mail"].get(side))
+                for side in ("source", "dest")
+            )
             errors = [*merge_saved_settings(config, old), *self._validate(config)]
             if errors:
                 raise ValueError(" ".join(errors))
@@ -272,6 +276,8 @@ class JobManager:
                     "info",
                     f"Copy records for {kind} cleared because its source or destination changed",
                 )
+            if mail_endpoints_changed or (old.options.two_way and not config.options.two_way):
+                self.store.pairs_reset(job_id)
             unused_upload_dirs = (
                 self._upload_dirs(old) - self._upload_dirs(config) - self._other_job_upload_dirs(job_id)
             )

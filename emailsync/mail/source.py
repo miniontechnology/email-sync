@@ -68,6 +68,8 @@ class ImapSource:
             out = []
             for f in folders:
                 target = map_source_folder(f, self.options)
+                if self.options.two_way and f.role == "trash" and target is None:
+                    target = "@trash"
                 if target:
                     out.append(Scope(name=f.name, target=target))
             return out
@@ -143,6 +145,116 @@ class ImapSource:
     def fetch_bodies(self, scope: Scope, uids: list[int]) -> dict[int, bytes]:
         self.ensure_scope(scope)
         return self.conn.fetch_bodies(uids)
+
+    def trash_folder(self) -> str | None:
+        return next((folder.name for folder in self.folders() if folder.role == "trash"), None)
+
+    def has_message(self, folder: str, key: str) -> bool | None:
+        if not key.startswith("mid:"):
+            return None
+        message_id = key.removeprefix("mid:")
+        if self.gmail:
+            all_mail = next((item.name for item in self.folders() if item.role == "all"), None)
+            if not all_mail:
+                return False
+            folder = all_mail
+        self.conn.ensure_selected(folder)
+        return bool(self.conn.search_header("Message-ID", f"<{message_id}>"))
+
+    def append(self, folder: str, raw: bytes, flags=(), internaldate=None):
+        self.ensure_folder(folder)
+        return self.conn.append(folder, raw, flags, internaldate)
+
+    def ensure_folder(self, folder):
+        if self.gmail and (folder.upper() == "INBOX" or folder.casefold().startswith("[gmail]/")):
+            return
+        if folder not in {item.name for item in self.folders()}:
+            self.conn.create_folder(folder)
+
+    def set_flags(self, locations, add=(), remove=()):
+        grouped = {}
+        for scope, uid in locations:
+            grouped.setdefault(scope, []).append(uid)
+        for scope, uids in grouped.items():
+            self.conn.ensure_writable(scope)
+            if add:
+                self.conn.add_flags(sorted(set(uids)), [self._imap_flag(flag) for flag in add])
+            if remove:
+                self.conn.remove_flags(sorted(set(uids)), [self._imap_flag(flag) for flag in remove])
+
+    @staticmethod
+    def _imap_flag(flag):
+        return {
+            "\\seen": "\\Seen",
+            "\\flagged": "\\Flagged",
+            "\\answered": "\\Answered",
+            "\\draft": "\\Draft",
+        }.get(flag.lower(), flag)
+
+    @staticmethod
+    def _gmail_label(folder):
+        return {
+            "@inbox": "\\Inbox",
+            "@sent": "\\Sent",
+            "@drafts": "\\Draft",
+            "@trash": "\\Trash",
+            "@junk": "\\Spam",
+        }.get(folder.lower(), folder)
+
+    def add_folder(self, location, folder):
+        scope, uid = location
+        self.conn.ensure_writable(scope)
+        if self.gmail:
+            label = self._gmail_label(folder)
+            if label:
+                self.conn.add_gmail_labels([uid], [label])
+            return True
+        self.ensure_folder(folder)
+        self.conn.copy([uid], folder)
+        return True
+
+    def move_folder(self, location, folder):
+        if self.gmail or not self.conn.has("MOVE"):
+            return False
+        scope, uid = location
+        self.ensure_folder(folder)
+        self.conn.ensure_writable(scope)
+        self.conn.move([uid], folder)
+        return True
+
+    def remove_folder(self, location, folder):
+        scope, uid = location
+        self.conn.ensure_writable(scope)
+        if self.gmail:
+            label = self._gmail_label(folder)
+            if label:
+                self.conn.remove_gmail_labels([uid], [label])
+            return True
+        if not self.conn.has("UIDPLUS"):
+            return False
+        self.conn.add_flags([uid], ["\\Deleted"])
+        self.conn.uid_expunge([uid])
+        return True
+
+    def to_trash(self, locations):
+        trash = self.trash_folder()
+        if not trash:
+            raise PermanentError("Source has no Trash folder; message was not deleted")
+        moved = 0
+        for scope, uid in locations:
+            if scope == trash:
+                continue
+            self.conn.ensure_writable(scope)
+            if self.conn.has("MOVE"):
+                self.conn.move([uid], trash)
+            elif self.conn.has("UIDPLUS"):
+                self.conn.copy([uid], trash)
+                self.conn.add_flags([uid], ["\\Deleted"])
+                self.conn.uid_expunge([uid])
+            else:
+                raise PermanentError("Source lacks MOVE and UIDPLUS; message was not deleted")
+            moved += 1
+        return moved
 
 
 def make_source(endpoint: Endpoint, options: Options):
