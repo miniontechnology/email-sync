@@ -338,6 +338,13 @@ class DavClient:
             return False
         if response.status_code in (201, 204):
             return _safe_url(str(response.url))
+        if response.status_code in (403, 409):
+            raise PermanentError(f"DAV PUT returned HTTP {response.status_code}")
+        if response.status_code >= 400:
+            try:
+                response.raise_for_status()
+            except Exception as exc:
+                raise wrap(exc) from exc
         raise PermanentError(f"DAV PUT returned HTTP {response.status_code}")
 
     def update(self, href: str, data: bytes, etag: str | None) -> bool:

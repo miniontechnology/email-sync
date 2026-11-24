@@ -1,6 +1,8 @@
 import httpx
+import pytest
 
 from emailsync.connectors.dav import DavClient, _auth_for, _safe_url
+from emailsync.errors import FatalError, PermanentError, TransientError
 from emailsync.options import Endpoint
 
 
@@ -45,7 +47,7 @@ def test_dav_client_update_uses_if_match_and_returns_false_for_stale_etag():
 
 def test_dav_client_put_returns_created_url_and_false_when_it_exists():
     requests = []
-    statuses = iter((201, 412))
+    statuses = iter((201, 204, 412))
 
     def handler(request):
         requests.append(request)
@@ -58,8 +60,28 @@ def test_dav_client_put_returns_created_url_and_false_when_it_exists():
         assert client.put(collection, "person-1.vcf", b"card") == (
             "https://dav.example.test/addressbook/person-1.vcf"
         )
+        assert client.put(collection, "person-1.vcf", b"card") == (
+            "https://dav.example.test/addressbook/person-1.vcf"
+        )
         assert client.put(collection, "person-1.vcf", b"card") is False
         assert requests[0].headers["If-None-Match"] == "*"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [(403, PermanentError), (409, PermanentError), (503, TransientError), (507, FatalError)],
+)
+def test_dav_client_put_classifies_error_statuses(status, error):
+    def handler(request):
+        return httpx.Response(status, request=request)
+
+    client = DavClient(Endpoint("carddav", url="https://dav.example.test"))
+    client.http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    try:
+        with pytest.raises(error, match=f"HTTP {status}|{status}"):
+            client.put({"href": "https://dav.example.test/addressbook/"}, "person.vcf", b"card")
     finally:
         client.close()
 
