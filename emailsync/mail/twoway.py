@@ -678,9 +678,9 @@ class TwoWayReconciler:
             for folder, count in counts.items()
         )
         exceeds = len(deletions) > self.options.max_deletions or over_percent
-        approved = self.store.get_approved_keys(self.job_id, "mail")
-        keys = {item["key"] for item in deletions}
-        if exceeds and not keys <= approved:
+        approved = self.store.get_approved(self.job_id, "mail")
+        planned = {(item["key"], item["side"]) for item in deletions}
+        if exceeds and not planned <= approved:
             pending = [{k: item[k] for k in ("key", "side", "folder")} for item in deletions]
             self.store.set_pending_deletions(self.job_id, "mail", pending)
             self._log_copyback_summaries()

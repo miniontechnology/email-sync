@@ -799,7 +799,7 @@ def test_deletion_safety_pauses_then_moves_only_to_trash_after_approval(tmp_path
 
     store.update_job(
         job_id,
-        approved_deletions=json.dumps(["mid:delete"]),
+        approved_deletions=json.dumps([{"kind": "mail", "key": "mid:delete", "side": "destination"}]),
         pending_deletions=None,
     )
     applied = run_migration(store, job_id, state, options)

@@ -268,10 +268,10 @@ class Store:
                 (json.dumps(pending) if pending else None, job_id),
             )
 
-    def get_approved_keys(self, job_id: int, kind: str) -> set[str]:
+    def get_approved(self, job_id: int, kind: str) -> set[tuple[str, str]]:
         rows = self.query("SELECT approved_deletions FROM jobs WHERE id=?", (job_id,))
         approved = _decode_approved(rows[0]["approved_deletions"]) if rows else []
-        return {item["key"] for item in approved if item["kind"] == kind}
+        return {(item["key"], item["side"]) for item in approved if item["kind"] == kind and item.get("side")}
 
     def approve_pending_deletions(self, job_id: int) -> list[dict]:
         with self.write() as conn:
@@ -286,12 +286,15 @@ class Store:
                 if isinstance(item, dict) and item.get("key")
             ]
             approved = _decode_approved(row["approved_deletions"])
-            known = {(item["kind"], item["key"]) for item in approved}
+            known = {(item["kind"], item["key"], item.get("side")) for item in approved}
             for item in pending:
-                pair = (item["kind"], item["key"])
-                if pair not in known:
-                    approved.append({"kind": pair[0], "key": pair[1]})
-                    known.add(pair)
+                approval = {"kind": item["kind"], "key": item["key"]}
+                if item.get("side"):
+                    approval["side"] = item["side"]
+                approval_key = (approval["kind"], approval["key"], approval.get("side"))
+                if approval_key not in known:
+                    approved.append(approval)
+                    known.add(approval_key)
             conn.execute(
                 "UPDATE jobs SET approved_deletions=?, pending_deletions=NULL WHERE id=?",
                 (json.dumps(approved) if approved else None, job_id),
@@ -725,7 +728,10 @@ def _decode_approved(value) -> list[dict]:
         if isinstance(item, str) and item:
             result.append({"kind": "mail", "key": item})
         elif isinstance(item, dict) and item.get("key"):
-            result.append({"kind": _deletion_kind(item), "key": item["key"]})
+            approved = {"kind": _deletion_kind(item), "key": item["key"]}
+            if item.get("side"):
+                approved["side"] = str(item["side"])
+            result.append(approved)
     return result
 
 

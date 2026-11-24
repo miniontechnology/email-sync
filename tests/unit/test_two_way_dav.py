@@ -333,11 +333,11 @@ def test_kind_scoped_pending_and_approved_deletions_preserve_legacy_mail(tmp_pat
     approved = store.approve_pending_deletions(job_id)
 
     assert {item["kind"] for item in approved} == {"mail", "contacts"}
-    assert store.get_approved_keys(job_id, "mail") == {"mail-1"}
-    assert store.get_approved_keys(job_id, "contacts") == {"contact-1"}
+    assert store.get_approved(job_id, "mail") == {("mail-1", "source")}
+    assert store.get_approved(job_id, "contacts") == {("contact-1", "destination")}
     assert store.get_job(job_id)["approved_deletions"] == [
-        {"kind": "mail", "key": "mail-1"},
-        {"kind": "contacts", "key": "contact-1"},
+        {"kind": "mail", "key": "mail-1", "side": "source"},
+        {"kind": "contacts", "key": "contact-1", "side": "destination"},
     ]
 
     store.update_job(
@@ -350,15 +350,15 @@ def test_kind_scoped_pending_and_approved_deletions_preserve_legacy_mail(tmp_pat
     assert store.get_pending_deletions(job_id, "mail") == [
         {"key": "legacy-mail", "side": "source", "kind": "mail"}
     ]
-    assert store.get_approved_keys(job_id, "mail") == {"legacy-approved"}
-    assert store.get_approved_keys(job_id, "contacts") == set()
+    assert store.get_approved(job_id, "mail") == set()
+    assert store.get_approved(job_id, "contacts") == set()
 
     store.set_pending_deletions(job_id, "mail", [{"key": "replacement"}])
     store.clear_deletions(job_id, "mail")
 
     assert store.get_pending_deletions(job_id, "mail") == []
     assert store.get_pending_deletions(job_id, "contacts") == [{"kind": "contacts", "key": "contact-2"}]
-    assert store.get_approved_keys(job_id, "mail") == set()
+    assert store.get_approved(job_id, "mail") == set()
 
 
 def test_ledger_reset_clears_dav_pairs_baseline_and_deletions_by_kind(tmp_path):
@@ -814,8 +814,48 @@ def test_deletion_percent_limit_pauses_until_kind_scoped_approval(tmp_path):
     assert len(dest.destination["dest:Default"]) == 17
     assert len(store.dav_deleted_list(job_id, "contacts")) == 3
     assert store.get_pending_deletions(job_id, "contacts") == []
-    assert store.get_approved_keys(job_id, "contacts") == set()
+    assert store.get_approved(job_id, "contacts") == set()
     assert any("review and apply" in message for _level, message in logs)
+
+
+def test_deletion_approval_does_not_carry_over_to_the_other_side(tmp_path):
+    store = db.Store(tmp_path / "approval-side.db")
+    job_id = store.create_job("DAV", {}, None)
+    src1 = _with_ref(_contact("person-1", "One"), "source:Default/1.vcf", '"s1"')
+    src2 = _with_ref(_contact("person-2", "Two"), "source:Default/2.vcf", '"s2"')
+    dst1 = _with_ref(_contact("person-1", "One"), "dest:Default/1.vcf", '"d1"')
+    dst2 = _with_ref(_contact("person-2", "Two"), "dest:Default/2.vcf", '"d2"')
+    reconciler, source, dest, _progress, _logs = _reconciler(
+        store,
+        job_id,
+        "contacts",
+        {"Default": [src1, src2]},
+        {"dest:Default": [dst1, dst2]},
+        options=Options(max_deletions=0, max_deletion_percent=100),
+    )
+    reconciler.reconcile(baseline=True)
+    source.items_by_scope["Default"] = [src2]
+
+    assert reconciler.reconcile() is True
+    assert store.get_pending_deletions(job_id, "contacts")[0]["side"] == "destination"
+    store.approve_pending_deletions(job_id)
+
+    source.items_by_scope["Default"] = [src1, src2]
+    dest.destination["dest:Default"] = [dst2]
+
+    assert reconciler.reconcile() is True
+    assert store.get_pending_deletions(job_id, "contacts") == [
+        {
+            "key": "Default|person-1",
+            "side": "source",
+            "folder": "Default",
+            "subject": "One",
+            "kind": "contacts",
+        }
+    ]
+    assert "Default|person-1" in store.dav_pairs_get_all(job_id, "contacts")
+    assert source.items_by_scope["Default"] == [src1, src2]
+    assert dest.destination["dest:Default"] == [dst2]
 
 
 def test_max_deletion_count_pauses_even_for_small_collections(tmp_path):

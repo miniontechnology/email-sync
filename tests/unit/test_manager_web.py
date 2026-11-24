@@ -233,7 +233,9 @@ def test_deletion_review_apply_and_discard_routes(tmp_path):
         discarded = client.post(f"/jobs/{discard_id}/deletions/discard", follow_redirects=False)
 
     assert applied.status_code == 303
-    assert store.get_job(apply_id)["approved_deletions"] == [{"kind": "mail", "key": "mid:apply"}]
+    assert store.get_job(apply_id)["approved_deletions"] == [
+        {"kind": "mail", "key": "mid:apply", "side": "destination"}
+    ]
     assert store.get_job(apply_id)["pending_deletions"] == []
     assert discarded.status_code == 303
     assert store.pairs_get_all(discard_id)["mid:discard"]["state"] == "ignored"
@@ -327,8 +329,8 @@ def test_mixed_deletion_review_and_saved_dav_download(tmp_path):
         discarded = client.post(f"/jobs/{discard_id}/deletions/discard", follow_redirects=False)
 
     assert applied.status_code == 303
-    assert store.get_approved_keys(apply_id, "mail") == {"mid:mail"}
-    assert store.get_approved_keys(apply_id, "contacts") == {"Default|person"}
+    assert store.get_approved(apply_id, "mail") == {("mid:mail", "destination")}
+    assert store.get_approved(apply_id, "contacts") == {("Default|person", "source")}
     assert store.get_pending_deletions(apply_id) == []
     assert discarded.status_code == 303
     assert store.dav_pairs_get_all(discard_id, "contacts")["Default|person"]["state"] == "ignored"

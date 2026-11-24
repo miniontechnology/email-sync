@@ -465,7 +465,7 @@ def test_greenmail_stalwart_two_way_sync_and_trash_safety(tmp_path, destination_
     assert safety_key in {item["key"] for item in pending}
     store.update_job(
         job_id,
-        approved_deletions=json.dumps([safety_key]),
+        approved_deletions=json.dumps([{"kind": "mail", "key": safety_key, "side": "destination"}]),
         pending_deletions=None,
     )
     applied, _store, _job = _run_mail(
