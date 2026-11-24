@@ -117,3 +117,39 @@ def test_dav_client_get_and_conditional_delete_handle_missing_and_stale_objects(
         assert "If-Match" not in requests[4].headers
     finally:
         client.close()
+
+
+def test_strict_listing_rejects_missing_multiget_objects():
+    collection = "https://dav.example.test/addressbook/"
+    requested = []
+
+    def handler(request):
+        if request.method == "PROPFIND":
+            body = (
+                '<d:multistatus xmlns:d="DAV:">'
+                "<d:response><d:href>/addressbook/</d:href></d:response>"
+                "<d:response><d:href>/addressbook/one.vcf</d:href>"
+                '<d:propstat><d:prop><d:getetag>"one"</d:getetag></d:prop></d:propstat></d:response>'
+                "<d:response><d:href>/addressbook/two.vcf</d:href>"
+                '<d:propstat><d:prop><d:getetag>"two"</d:getetag></d:prop></d:propstat></d:response>'
+                "</d:multistatus>"
+            )
+            return httpx.Response(207, text=body, request=request)
+        requested.extend(request.url.path for _ in [0])
+        body = (
+            '<d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">'
+            "<d:response><d:href>/addressbook/one.vcf</d:href>"
+            '<d:propstat><d:prop><d:getetag>"one"</d:getetag>'
+            "<card:address-data>BEGIN:VCARD\\r\\nUID:one\\r\\nEND:VCARD</card:address-data>"
+            "</d:prop></d:propstat></d:response></d:multistatus>"
+        )
+        return httpx.Response(207, text=body, request=request)
+
+    client = DavClient(Endpoint("carddav", url="https://dav.example.test"))
+    client.http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    try:
+        with pytest.raises(TransientError, match="incomplete DAV listing: 1 of 2 objects missing"):
+            client.list_objects(collection, strict=True)
+        assert requested == ["/addressbook/"]
+    finally:
+        client.close()

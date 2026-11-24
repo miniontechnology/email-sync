@@ -7,7 +7,7 @@ from urllib.parse import quote, unquote, urljoin, urlsplit, urlunsplit
 
 import httpx
 
-from emailsync.errors import AuthError, PermanentError, ThrottledError, wrap
+from emailsync.errors import AuthError, PermanentError, ThrottledError, TransientError, wrap
 from emailsync.oauth import OAuthBearerAuth, StaticBearerAuth
 from emailsync.options import Endpoint
 
@@ -279,7 +279,7 @@ class DavClient:
         )
         return {"href": _safe_url(href), "displayname": name}
 
-    def list_objects(self, collection: dict | str) -> list[tuple[str, str | None, str]]:
+    def list_objects(self, collection: dict | str, strict: bool = False) -> list[tuple[str, str | None, str]]:
         href = collection["href"] if isinstance(collection, dict) else collection
         request = ET.Element(f"{{{DAV}}}propfind")
         prop = ET.SubElement(request, f"{{{DAV}}}prop")
@@ -321,6 +321,14 @@ class DavClient:
                 etag = props.get("getetag")
                 if data is not None and data.text is not None:
                     objects.append((obj_href, etag.text if etag is not None else None, data.text))
+        if strict:
+            listed_hrefs = {obj_href for obj_href, _etag in object_refs}
+            returned_hrefs = {obj_href for obj_href, _etag, _data in objects}
+            missing = len(listed_hrefs - returned_hrefs)
+            if missing:
+                raise TransientError(
+                    f"incomplete DAV listing: {missing} of {len(listed_hrefs)} objects missing"
+                )
         return objects
 
     def put(self, collection: dict | str, filename: str, data: bytes) -> str | bool:

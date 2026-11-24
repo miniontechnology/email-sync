@@ -81,7 +81,7 @@ class _FakeSource:
     def scopes(self):
         return list(self.scopes_list)
 
-    def items(self, scope):
+    def items(self, scope, strict=False):
         return list(self.items_by_scope.get(scope.name, []))
 
     def _find(self, ref):
@@ -155,7 +155,7 @@ class _FakeDest:
         self.update_calls = []
         self.delete_calls = []
 
-    def items(self, collection):
+    def items(self, collection, strict=False):
         return list(self.destination.get(collection["href"], []))
 
     def _find(self, ref):

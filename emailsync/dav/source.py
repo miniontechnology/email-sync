@@ -62,14 +62,14 @@ class DavSource:
         _home, collections = self.client.discover()
         return [DavScope(name=item["displayname"], collection=item) for item in collections]
 
-    def items(self, scope: DavScope):
+    def items(self, scope: DavScope, strict: bool = False):
         if self.endpoint.type == "file":
             items = []
             for _filename, data in scope.collection.get("files", []):
                 items.extend(_decode_objects(data, self.kind))
             return items
         items = []
-        for href, etag, data in self.client.list_objects(scope.collection):
+        for href, etag, data in self.client.list_objects(scope.collection, strict=strict):
             decoded = list(_decode_objects(data, self.kind))
             for item in decoded:
                 item.ref = href

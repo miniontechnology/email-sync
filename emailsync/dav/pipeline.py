@@ -73,11 +73,11 @@ class DavDestination:
         self.collections.append(collection)
         return collection
 
-    def items(self, collection):
+    def items(self, collection, strict=False):
         from emailsync.dav.source import _decode_objects
 
         out = []
-        for href, etag, data in self.client.list_objects(collection):
+        for href, etag, data in self.client.list_objects(collection, strict=strict):
             decoded = list(_decode_objects(data, self.kind))
             for item in decoded:
                 item.ref = href

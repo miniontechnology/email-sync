@@ -143,7 +143,9 @@ class DavTwoWayReconciler:
             target = self._target_for(scope)
             targets[scope.name] = target
             try:
-                items = self._call(lambda scope=scope: self.source.items(scope), self.source) or []
+                items = (
+                    self._call(lambda scope=scope: self.source.items(scope, strict=True), self.source) or []
+                )
             except Exception as exc:
                 self._failed(exc)
                 self.log("warning", f"Could not snapshot DAV source collection {scope.name}: {exc}")
@@ -198,7 +200,13 @@ class DavTwoWayReconciler:
             collection_targets[href] = target
         for href, collection in collection_targets.items():
             try:
-                items = self._call(lambda collection=collection: self.dest.items(collection), self.dest) or []
+                items = (
+                    self._call(
+                        lambda collection=collection: self.dest.items(collection, strict=True),
+                        self.dest,
+                    )
+                    or []
+                )
             except Exception as exc:
                 self._failed(exc)
                 self.log(
