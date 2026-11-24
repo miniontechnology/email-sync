@@ -250,7 +250,9 @@ class DavTwoWayReconciler:
                     dest_by_collection_uid[key] = record
         scope_names = [scope.name for scope in scopes]
         guarded = set()
-        for key in pairs:
+        for key, pair in pairs.items():
+            if pair["state"] == "ignored":
+                continue
             scope_name = self._scope_name_for_key(key, scope_names)
             if scope_name is None:
                 guarded.add("missing source scope")
@@ -259,7 +261,6 @@ class DavTwoWayReconciler:
                 guarded.add("failed source snapshot")
                 continue
             target = targets.get(scope_name)
-            pair = pairs[key]
             href = pair.get("dst_href") or (target["href"] if target else None)
             if href is None:
                 guarded.add("missing mapped destination collection")

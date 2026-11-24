@@ -453,6 +453,52 @@ def test_dav_baseline_records_pairs_and_ignores_destination_only_items(tmp_path)
     assert store.get_task_baseline(job_id, "contacts") is not None
 
 
+def test_removed_ignored_collection_does_not_guard_other_deletions(tmp_path):
+    store = db.Store(tmp_path / "ignored-collection-removed.db")
+    job_id = store.create_job("DAV", {}, None)
+    work_one = _with_ref(_event("event-1", "One"), "source:Work/event-1.ics", '"s1"')
+    work_two = _with_ref(_event("event-2", "Two"), "source:Work/event-2.ics", '"s2"')
+    destination_one = _with_ref(_event("event-1", "One"), "dest:Work/event-1.ics", '"d1"')
+    destination_two = _with_ref(_event("event-2", "Two"), "dest:Work/event-2.ics", '"d2"')
+    ignored_item = _with_ref(_event("ignored-only", "Extra"), "dest:Ignored/extra.ics", '"d3"')
+    scopes = [
+        DavScope("Work", {"href": "source:Work", "displayname": "Work"}),
+        DavScope("Ignored", {"href": "source:Ignored", "displayname": "Ignored"}),
+    ]
+    collections = [
+        {"href": "dest:Work", "displayname": "Work"},
+        {"href": "dest:Ignored", "displayname": "Ignored"},
+    ]
+    reconciler, source, dest, _progress, logs = _reconciler(
+        store,
+        job_id,
+        "calendars",
+        {"Work": [work_one, work_two], "Ignored": []},
+        {"dest:Work": [destination_one, destination_two], "dest:Ignored": [ignored_item]},
+        scopes=scopes,
+        dest=_FakeDest(
+            "calendars",
+            {"dest:Work": [destination_one, destination_two], "dest:Ignored": [ignored_item]},
+            collections=collections,
+        ),
+    )
+
+    reconciler.reconcile(baseline=True)
+    assert store.dav_pairs_get_all(job_id, "calendars")["Ignored|ignored-only"]["state"] == "ignored"
+
+    dest.collections = [collections[0]]
+    dest.destination.pop("dest:Ignored")
+    source.items_by_scope["Work"] = [work_two]
+
+    reconciler.reconcile()
+
+    assert dest.delete_calls == [(destination_one.ref, destination_one.etag)]
+    pairs = store.dav_pairs_get_all(job_id, "calendars")
+    assert "Work|event-1" not in pairs
+    assert pairs["Ignored|ignored-only"]["state"] == "ignored"
+    assert not any("deletions were suppressed" in message for _level, message in logs)
+
+
 def test_pairs_keep_their_destination_collection_when_default_is_added(tmp_path):
     store = db.Store(tmp_path / "default-added.db")
     job_id = store.create_job("DAV", {}, None)
