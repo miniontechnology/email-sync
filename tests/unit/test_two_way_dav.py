@@ -71,6 +71,7 @@ class _FakeSource:
             DavScope(name, {"href": f"source:{name}", "displayname": name}) for name in items_by_scope
         ]
         self.items_by_scope = items_by_scope
+        self.strict_failures = set()
         self.put_results = list(put_results or [])
         self.update_results = list(update_results or [])
         self.delete_results = list(delete_results or [])
@@ -82,6 +83,8 @@ class _FakeSource:
         return list(self.scopes_list)
 
     def items(self, scope, strict=False):
+        if strict and scope.name in self.strict_failures:
+            raise RuntimeError("incomplete DAV listing")
         return list(self.items_by_scope.get(scope.name, []))
 
     def _find(self, ref):
@@ -450,6 +453,36 @@ def test_dav_baseline_records_pairs_and_ignores_destination_only_items(tmp_path)
     assert pairs["Default|dest-only"]["state"] == "ignored"
     assert source.put_calls == dest.put_calls == []
     assert source.delete_calls == dest.delete_calls == []
+    assert store.get_task_baseline(job_id, "contacts") is not None
+
+
+def test_incomplete_snapshot_retries_dav_baseline_next_run(tmp_path):
+    store = db.Store(tmp_path / "incomplete-baseline.db")
+    job_id = store.create_job("DAV", {}, None)
+    source_item = _with_ref(_contact("person-1", "One"), "source:Default/person-1.vcf", '"s1"')
+    destination_item = _with_ref(_contact("person-1", "One"), "dest:Default/person-1.vcf", '"d1"')
+    reconciler, source, _dest, _progress, logs = _reconciler(
+        store,
+        job_id,
+        "contacts",
+        {"Default": [source_item]},
+        {"dest:Default": [destination_item]},
+    )
+    source.strict_failures.add("Default")
+
+    assert reconciler.reconcile(baseline=True) is False
+    assert store.dav_pairs_get_all(job_id, "contacts") == {}
+    assert store.get_task_baseline(job_id, "contacts") is None
+    assert any(
+        level == "warning" and "baseline was not recorded" in message and "retried next run" in message
+        for level, message in logs
+    )
+
+    source.strict_failures.clear()
+    assert reconciler.reconcile(baseline=True) is False
+
+    pair = store.dav_pairs_get_all(job_id, "contacts")["Default|person-1"]
+    assert pair["state"] == "synced"
     assert store.get_task_baseline(job_id, "contacts") is not None
 
 

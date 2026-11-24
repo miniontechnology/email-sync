@@ -628,6 +628,12 @@ class DavTwoWayReconciler:
         ambiguous = snapshot["ambiguous"]
 
         if baseline:
+            if snapshot["failed_scopes"] or snapshot["failed_collections"]:
+                self.log(
+                    "warning",
+                    f"The initial two-way {self.kind} baseline was not recorded because a DAV snapshot was incomplete; it will be retried next run",
+                )
+                return False
             if not plan_only:
                 if self._stopped():
                     return False
