@@ -1,5 +1,7 @@
+import io
 import json
 import time
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -120,7 +122,7 @@ def test_two_way_option_validation_and_edit_values(tmp_path):
 
 def test_turning_off_two_way_clears_pairs_and_baseline(tmp_path):
     _settings, store, manager = make_manager(tmp_path)
-    config = mail_config()
+    config = config_with_contacts()
     config.options.two_way = True
     config.options.sync_interval_minutes = 15
     job_id = completed_job(manager, store, config)
@@ -138,6 +140,20 @@ def test_turning_off_two_way_clears_pairs_and_baseline(tmp_path):
         ],
     )
     store.update_job(job_id, twoway_baseline_at=time.time())
+    store.reset_task(job_id, "contacts", "completed")
+    store.set_task_baseline(job_id, "contacts", time.time())
+    store.dav_pairs_put_many(
+        job_id,
+        "contacts",
+        [
+            {
+                "key": "Default|person",
+                "state": "synced",
+                "src_hash": "source",
+                "dst_hash": "destination",
+            }
+        ],
+    )
 
     edited = manager._load_config(store.get_job(job_id), resolve=False)
     edited.options.two_way = False
@@ -145,6 +161,39 @@ def test_turning_off_two_way_clears_pairs_and_baseline(tmp_path):
 
     assert store.pairs_get_all(job_id) == {}
     assert store.get_job(job_id)["twoway_baseline_at"] is None
+    assert store.dav_pairs_get_all(job_id, "contacts") == {}
+    assert store.get_task_baseline(job_id, "contacts") is None
+
+
+def test_dav_endpoint_change_and_lost_two_way_capability_reset_pairs_without_ledger_rows(tmp_path):
+    _settings, store, manager = make_manager(tmp_path)
+    config = config_with_contacts()
+    config.options.two_way = True
+    config.options.sync_interval_minutes = 15
+    job_id = completed_job(manager, store, config)
+    store.reset_task(job_id, "contacts", "completed")
+    store.set_task_baseline(job_id, "contacts", time.time())
+    store.dav_pairs_put_many(
+        job_id,
+        "contacts",
+        [
+            {
+                "key": "Default|person",
+                "state": "synced",
+                "src_hash": "source",
+                "dst_hash": "destination",
+            }
+        ],
+    )
+
+    edited = manager._load_config(store.get_job(job_id), resolve=False)
+    edited.endpoints["contacts"]["dest"] = Endpoint(
+        "jmap", url="https://contacts.dest", username="alice", password="super-secret"
+    )
+    manager.edit_job(job_id, edited)
+
+    assert store.dav_pairs_get_all(job_id, "contacts") == {}
+    assert store.get_task_baseline(job_id, "contacts") is None
 
 
 def test_deletion_review_apply_and_discard_routes(tmp_path):
@@ -184,11 +233,107 @@ def test_deletion_review_apply_and_discard_routes(tmp_path):
         discarded = client.post(f"/jobs/{discard_id}/deletions/discard", follow_redirects=False)
 
     assert applied.status_code == 303
-    assert store.get_job(apply_id)["approved_deletions"] == ["mid:apply"]
+    assert store.get_job(apply_id)["approved_deletions"] == [{"kind": "mail", "key": "mid:apply"}]
     assert store.get_job(apply_id)["pending_deletions"] == []
     assert discarded.status_code == 303
     assert store.pairs_get_all(discard_id)["mid:discard"]["state"] == "ignored"
     assert store.get_job(discard_id)["pending_deletions"] == []
+
+
+def test_mixed_deletion_review_and_saved_dav_download(tmp_path):
+    settings, store, manager = make_manager(tmp_path)
+    active_config = config_with_contacts()
+    active_config.options.two_way = True
+    active_config.options.sync_interval_minutes = 15
+    apply_id = completed_job(manager, store, active_config)
+    store.reset_task(apply_id, "contacts", "completed")
+    store.dav_pairs_put_many(
+        apply_id,
+        "contacts",
+        [
+            {
+                "key": "Default|person",
+                "state": "synced",
+                "src_hash": "source",
+                "dst_hash": "destination",
+            }
+        ],
+    )
+    store.pairs_put_many(
+        apply_id,
+        [
+            {
+                "key": "mid:mail",
+                "state": "synced",
+                "src_folders": ["INBOX"],
+                "src_flags": [],
+                "dst_folders": ["INBOX"],
+                "dst_flags": [],
+            }
+        ],
+    )
+    store.set_pending_deletions(apply_id, "mail", [{"key": "mid:mail", "side": "destination"}])
+    store.set_pending_deletions(
+        apply_id, "contacts", [{"key": "Default|person", "side": "source", "folder": "Default"}]
+    )
+    store.dav_deleted_add(apply_id, "contacts", "Default|old-person", "source", "Default", b"saved vCard")
+
+    discard_id = completed_job(manager, store, config_with_contacts())
+    store.reset_task(discard_id, "contacts", "completed")
+    store.dav_pairs_put_many(
+        discard_id,
+        "contacts",
+        [
+            {
+                "key": "Default|person",
+                "state": "synced",
+                "src_hash": "source",
+                "dst_hash": "destination",
+            }
+        ],
+    )
+    store.pairs_put_many(
+        discard_id,
+        [
+            {
+                "key": "mid:discard",
+                "state": "synced",
+                "src_folders": ["INBOX"],
+                "src_flags": [],
+                "dst_folders": ["INBOX"],
+                "dst_flags": [],
+            }
+        ],
+    )
+    store.set_pending_deletions(discard_id, "mail", [{"key": "mid:discard", "side": "destination"}])
+    store.set_pending_deletions(discard_id, "contacts", [{"key": "Default|person", "side": "destination"}])
+
+    with TestClient(create_app(settings, store, manager)) as client:
+        fragment = client.get(f"/jobs/{apply_id}/fragment")
+        assert "CONTACTS" in fragment.text
+        assert "MAIL" in fragment.text
+        assert "deleted contact(s)" in fragment.text
+        assert "Two-way sync applies to mail, contacts" in fragment.text
+        assert "Copied back" in fragment.text
+        assert "Deleted" in fragment.text
+        download = client.get(f"/jobs/{apply_id}/deleted/contacts")
+        assert download.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(download.content)) as archive:
+            [filename] = archive.namelist()
+            assert filename.endswith(".vcf")
+            assert archive.read(filename) == b"saved vCard"
+        assert client.get(f"/jobs/{apply_id}/deleted/calendars").status_code == 404
+        applied = client.post(f"/jobs/{apply_id}/deletions/apply", follow_redirects=False)
+        discarded = client.post(f"/jobs/{discard_id}/deletions/discard", follow_redirects=False)
+
+    assert applied.status_code == 303
+    assert store.get_approved_keys(apply_id, "mail") == {"mid:mail"}
+    assert store.get_approved_keys(apply_id, "contacts") == {"Default|person"}
+    assert store.get_pending_deletions(apply_id) == []
+    assert discarded.status_code == 303
+    assert store.dav_pairs_get_all(discard_id, "contacts")["Default|person"]["state"] == "ignored"
+    assert store.pairs_get_all(discard_id)["mid:discard"]["state"] == "ignored"
+    assert store.get_pending_deletions(discard_id) == []
 
 
 def test_job_manager_encrypts_credentials_and_runs_queued_jobs(tmp_path):
@@ -442,6 +587,7 @@ def test_web_dashboard_detail_validation_and_secret_redaction(tmp_path):
         assert 'name="update_changed_items" checked' in form.text
         assert 'name="remove_stale_labels" checked' not in form.text
         assert 'name="two_way" checked' not in form.text
+        assert "CardDAV/CalDAV" in form.text
 
         invalid = client.post("/jobs", data={"name": ""})
         assert invalid.status_code == 422
