@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from emailsync import db
 from emailsync.dav.jmap_dest import JmapDavDestination
 from emailsync.dav.pipeline import DavDestination, DavMigration
-from emailsync.dav.source import DavItem, DavScope
+from emailsync.dav.source import DavItem, DavScope, DavSource
 from emailsync.jobs.control import RunControl
 from emailsync.options import Endpoint, JobConfig, Options
 
@@ -89,7 +89,7 @@ class Destination:
             from emailsync.errors import PermanentError
 
             raise PermanentError("simulated lost response after PUT")
-        return True
+        return item.ref
 
     def update(self, _collection, ref, etag, data):
         self.state.update_calls.append((ref, etag, data))
@@ -102,6 +102,23 @@ class Destination:
         item.data = data
         item.fingerprint = "fingerprint:" + data.decode("utf-8", "replace")
         item.etag = f'"etag-{len(self.state.update_calls) + 1}"'
+        return True
+
+    def get(self, ref):
+        item = next(
+            (item for items in self.state.destination.values() for item in items if item.ref == ref),
+            None,
+        )
+        return (item.etag, item.data.decode()) if item else None
+
+    def delete(self, ref, etag):
+        for items in self.state.destination.values():
+            item = next((item for item in items if item.ref == ref), None)
+            if item:
+                if item.etag != etag:
+                    return False
+                items.remove(item)
+                return True
         return True
 
 
@@ -155,6 +172,27 @@ def test_dav_destination_items_carry_href_and_etag():
     assert item.uid == "person-1"
     assert item.ref == href
     assert item.etag == etag
+
+
+def test_dav_source_items_mark_multi_object_resources_ambiguous():
+    href = "https://dav.example.test/addressbook/multi.vcf"
+    etag = '"etag-1"'
+    data = (
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:person-1\r\nFN:One\r\nEND:VCARD\r\n"
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:person-2\r\nFN:Two\r\nEND:VCARD\r\n"
+    )
+
+    class Client:
+        def list_objects(self, _collection):
+            return [(href, etag, data)]
+
+    source = DavSource(Endpoint("carddav", url="https://dav.example.test"), "contacts")
+    source.client = Client()
+
+    items = source.items(DavScope("Default", {"href": "addressbook"}))
+
+    assert {item.uid for item in items} == {"person-1", "person-2"}
+    assert all(item.ref == href and item.etag == etag and item.ambiguous for item in items)
 
 
 def test_contact_copy_and_rerun_skip_by_uid(tmp_path):
@@ -559,3 +597,36 @@ def test_jmap_dav_dry_run_with_no_collections_does_not_request_home(tmp_path, mo
     assert store.get_tasks(job_id)[0]["copied"] == 1
     assert calls == ["AddressBook/get"]
     assert store.ledger_items(job_id, "contacts", limit=None) == []
+
+
+def test_two_way_dav_baselines_reconciles_edits_and_pairs_new_copies(tmp_path):
+    store = db.Store(tmp_path / "two-way.db")
+    job_id = store.create_job("two-way contacts", {}, None)
+    original = DavItem("person-1", b"BEGIN:VCARD\nUID:person-1\nFN:Before\nEND:VCARD\n", "before")
+    state = State({"Default": [original]}, {})
+    options = Options(two_way=True, sync_interval_minutes=15, verify=False)
+
+    result = migrate(store, job_id, "contacts", state, options)
+
+    assert result.status == "completed"
+    assert store.get_task_baseline(job_id, "contacts") is not None
+    pairs = store.dav_pairs_get_all(job_id, "contacts")
+    assert pairs["Default|person-1"]["state"] == "synced"
+    assert state.update_calls == []
+
+    changed = DavItem("person-1", b"BEGIN:VCARD\nUID:person-1\nFN:After\nEND:VCARD\n", "after")
+    state.items_by_scope["Default"] = [changed]
+    result = migrate(store, job_id, "contacts", state, options)
+
+    assert result.status == "completed"
+    assert len(state.update_calls) == 1
+    assert state.destination["default"][0].data == changed.data
+
+    new_item = DavItem("person-2", b"BEGIN:VCARD\nUID:person-2\nFN:New\nEND:VCARD\n", "new")
+    state.items_by_scope["Default"].append(new_item)
+    result = migrate(store, job_id, "contacts", state, options)
+
+    assert result.status == "completed"
+    assert state.put_calls == 2
+    assert "Default|person-2" in store.dav_pairs_get_all(job_id, "contacts")
+    assert len(state.update_calls) == 1
