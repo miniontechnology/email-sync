@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS dav_pairs (
     state TEXT NOT NULL,
     src_hash TEXT,
     dst_hash TEXT,
+    dst_href TEXT,
     updated_at REAL NOT NULL,
     PRIMARY KEY (job_id, kind, key)
 );
@@ -171,6 +172,9 @@ class Store:
             pair_columns = {row["name"] for row in conn.execute("PRAGMA table_info(mail_pairs)")}
             if "dst_mixed" not in pair_columns:
                 conn.execute("ALTER TABLE mail_pairs ADD COLUMN dst_mixed TEXT NOT NULL DEFAULT '[]'")
+            dav_pair_columns = {row["name"] for row in conn.execute("PRAGMA table_info(dav_pairs)")}
+            if "dst_href" not in dav_pair_columns:
+                conn.execute("ALTER TABLE dav_pairs ADD COLUMN dst_href TEXT")
 
     # -- connections -------------------------------------------------------------------------
     def conn(self) -> sqlite3.Connection:
@@ -482,6 +486,13 @@ class Store:
                 ),
             )
 
+    def ledger_delete(self, job_id: int, kind: str, keys: Iterable[str]) -> None:
+        with self.write() as conn:
+            conn.executemany(
+                "DELETE FROM ledger WHERE job_id=? AND kind=? AND source_key=?",
+                ((job_id, kind, key) for key in keys),
+            )
+
     def ledger_counts(self, job_id: int, kind: str | None = None) -> dict[str, int]:
         if kind:
             rows = self.query(
@@ -604,9 +615,10 @@ class Store:
         with self.write() as conn:
             for row in rows:
                 conn.execute(
-                    "INSERT INTO dav_pairs(job_id,kind,key,state,src_hash,dst_hash,updated_at)"
-                    " VALUES(?,?,?,?,?,?,?) ON CONFLICT(job_id,kind,key) DO UPDATE SET"
+                    "INSERT INTO dav_pairs(job_id,kind,key,state,src_hash,dst_hash,dst_href,updated_at)"
+                    " VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(job_id,kind,key) DO UPDATE SET"
                     " state=excluded.state, src_hash=excluded.src_hash, dst_hash=excluded.dst_hash,"
+                    " dst_href=excluded.dst_href,"
                     " updated_at=excluded.updated_at",
                     (
                         job_id,
@@ -615,6 +627,7 @@ class Store:
                         row["state"],
                         row.get("src_hash"),
                         row.get("dst_hash"),
+                        row.get("dst_href"),
                         now,
                     ),
                 )
@@ -653,6 +666,10 @@ class Store:
                 "SELECT * FROM dav_deleted WHERE job_id=? AND kind=? ORDER BY id", (job_id, kind)
             )
         ]
+
+    def dav_deleted_remove(self, deleted_id: int) -> None:
+        with self.write() as conn:
+            conn.execute("DELETE FROM dav_deleted WHERE id=?", (deleted_id,))
 
     def dav_deleted_count(self, job_id: int) -> dict[str, int]:
         return {

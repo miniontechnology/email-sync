@@ -10,6 +10,7 @@ from datetime import time as datetime_time
 from icalendar import Calendar
 
 from emailsync import db
+from emailsync.dav.source import hash_for_uid
 from emailsync.dav.vobjects import content_hash
 from emailsync.errors import PermanentError
 
@@ -92,7 +93,9 @@ def _subject(data: bytes | str, kind: str) -> str:
 
 
 class DavTwoWayReconciler:
-    def __init__(self, store, job_id, kind, source, dest, options, retry, progress, log, failed):
+    def __init__(
+        self, store, job_id, kind, source, dest, options, retry, progress, log, failed, control=None
+    ):
         if kind not in ("contacts", "calendars"):
             raise ValueError("kind must be contacts or calendars")
         self.store = store
@@ -105,7 +108,11 @@ class DavTwoWayReconciler:
         self.progress = progress
         self.log = log or (lambda _level, _message: None)
         self.failed = failed or (lambda _error: None)
+        self.control = control
         self._blocked_copybacks = 0
+
+    def _stopped(self):
+        return self.control is not None and (self.control.stopped or self.control.aborted)
 
     def _call(self, operation, connection):
         if self.retry:
@@ -193,11 +200,17 @@ class DavTwoWayReconciler:
         ambiguous_dest = set()
         collection_targets = {}
         failed_collections = set()
+        available_collections = {item["href"]: item for item in self.dest.collections}
         for target in targets.values():
             if target is None:
                 continue
             href = target["href"]
             collection_targets[href] = target
+        mapped_hrefs = set(collection_targets)
+        for pair in pairs.values():
+            href = pair.get("dst_href")
+            if href in available_collections:
+                collection_targets[href] = available_collections[href]
         for href, collection in collection_targets.items():
             try:
                 items = (
@@ -246,19 +259,24 @@ class DavTwoWayReconciler:
                 guarded.add("failed source snapshot")
                 continue
             target = targets.get(scope_name)
-            if target is None:
+            pair = pairs[key]
+            href = pair.get("dst_href") or (target["href"] if target else None)
+            if href is None:
                 guarded.add("missing mapped destination collection")
                 continue
-            if target["href"] in failed_collections:
+            if href not in available_collections:
+                guarded.add("missing paired destination collection")
+                continue
+            if href in failed_collections:
                 guarded.add("failed destination snapshot")
                 continue
-            if not dest_items_by_collection.get(target["href"]):
+            if not dest_items_by_collection.get(href):
                 guarded.add("empty destination collection")
             if not scope_items.get(scope_name):
                 guarded.add("empty source scope")
 
-        discovered_hrefs = {item["href"] for item in self.dest.collections}
-        unmapped = discovered_hrefs - set(collection_targets)
+        discovered_hrefs = set(available_collections)
+        unmapped = discovered_hrefs - mapped_hrefs
         if unmapped:
             self.log(
                 "info",
@@ -289,17 +307,30 @@ class DavTwoWayReconciler:
             "failed_collections": failed_collections,
         }
 
-    def _pair(self, key, state, src_hash=None, dst_hash=None):
+    def _pair(self, key, state, src_hash=None, dst_hash=None, dst_href=None):
+        if self._stopped():
+            return False
         self.store.dav_pairs_put_many(
             self.job_id,
             self.kind,
-            [{"key": key, "state": state, "src_hash": src_hash, "dst_hash": dst_hash}],
+            [
+                {
+                    "key": key,
+                    "state": state,
+                    "src_hash": src_hash,
+                    "dst_hash": dst_hash,
+                    "dst_href": dst_href,
+                }
+            ],
         )
+        return True
 
     def _delete_pair(self, key):
         self.store.dav_pairs_delete(self.job_id, self.kind, [key])
 
     def _update_ledger_baseline(self, key, src_hash, uid):
+        if self._stopped():
+            return
         rows = self.store.ledger_get_many(self.job_id, self.kind, [key])
         row = rows.get(key)
         if not row:
@@ -343,15 +374,19 @@ class DavTwoWayReconciler:
         if method:
             method(field)
 
-    def _read_after_write(self, endpoint, ref):
+    def _read_after_write(self, endpoint, ref, uid):
         try:
             result = self._call(lambda: endpoint.get(ref), endpoint)
-            return content_hash(result[1]) if result else None
+            if self._stopped():
+                return None
+            return hash_for_uid(result[1], self.kind, uid) if result else None
         except Exception as exc:
             self.log("warning", f"Could not read back DAV object {ref}: {exc}")
             return None
 
     def _push_to_destination(self, key, source_record, dest_record):
+        if self._stopped():
+            return False
         source_item = source_record["item"]
         dest_item = dest_record["item"]
         try:
@@ -367,16 +402,26 @@ class DavTwoWayReconciler:
         except Exception as exc:
             self._failed(exc)
             return False
-        if updated is False:
-            self.log("warning", f"DAV item {key} changed during the run; will retry")
+        if updated is not True:
+            if updated is False:
+                self.log("warning", f"DAV item {key} changed during the run; will retry")
             return False
-        dst_hash = self._read_after_write(self.dest, dest_item.ref)
-        self._pair(key, "synced", source_record["hash"], dst_hash)
+        dst_hash = self._read_after_write(self.dest, dest_item.ref, source_item.uid)
+        if self._stopped() or not self._pair(
+            key,
+            "synced",
+            source_record["hash"],
+            dst_hash,
+            dest_record["target"]["href"],
+        ):
+            return False
         self._update_ledger_baseline(key, source_record["hash"], source_item.uid)
         self._progress(source_record["scope"].name, "updated")
         return True
 
     def _push_to_source(self, key, source_record, dest_record):
+        if self._stopped():
+            return False
         source_item = source_record["item"]
         dest_item = dest_record["item"]
         try:
@@ -392,11 +437,19 @@ class DavTwoWayReconciler:
         except Exception as exc:
             self._failed(exc)
             return False
-        if updated is False:
-            self.log("warning", f"DAV item {key} changed during the run; will retry")
+        if updated is not True:
+            if updated is False:
+                self.log("warning", f"DAV item {key} changed during the run; will retry")
             return False
-        src_hash = self._read_after_write(self.source, source_item.ref)
-        self._pair(key, "synced", src_hash, dest_record["hash"])
+        src_hash = self._read_after_write(self.source, source_item.ref, source_item.uid)
+        if self._stopped() or not self._pair(
+            key,
+            "synced",
+            src_hash,
+            dest_record["hash"],
+            dest_record["target"]["href"],
+        ):
+            return False
         self._update_ledger_baseline(key, src_hash, source_item.uid)
         self._progress(source_record["scope"].name, "updated")
         return True
@@ -406,7 +459,14 @@ class DavTwoWayReconciler:
         if plan_only:
             self._task_progress("copied_back")
             return
-        self._pair(key, "copying_back", None, dest_record["hash"])
+        if self._stopped() or not self._pair(
+            key,
+            "copying_back",
+            None,
+            dest_record["hash"],
+            dest_record["target"]["href"],
+        ):
+            return
         try:
             created = self._call(
                 lambda: self.source.put(
@@ -425,10 +485,17 @@ class DavTwoWayReconciler:
         except Exception as exc:
             self._failed(exc)
             return
-        if created is False:
+        if not created:
             return
-        src_hash = self._read_after_write(self.source, created)
-        self._pair(key, "synced", src_hash, dest_record["hash"])
+        src_hash = self._read_after_write(self.source, created, item.uid)
+        if self._stopped() or not self._pair(
+            key,
+            "synced",
+            src_hash,
+            dest_record["hash"],
+            dest_record["target"]["href"],
+        ):
+            return
         source_collection = scope.collection.get("displayname", scope.name)
         info = json.dumps({"fp": None, "hash": src_hash}, sort_keys=True)
         self.store.ledger_mark(
@@ -478,6 +545,8 @@ class DavTwoWayReconciler:
         return False
 
     def _apply_deletions(self, deletions, snapshot, plan_only):
+        if self._stopped():
+            return False
         if not deletions:
             if not plan_only:
                 self.store.set_pending_deletions(self.job_id, self.kind, [])
@@ -508,10 +577,12 @@ class DavTwoWayReconciler:
             return True
 
         for deletion in deletions:
+            if self._stopped():
+                break
             key = deletion["key"]
             item = deletion["record"]["item"]
             try:
-                self.store.dav_deleted_add(
+                archived_id = self.store.dav_deleted_add(
                     self.job_id,
                     self.kind,
                     key,
@@ -519,6 +590,9 @@ class DavTwoWayReconciler:
                     deletion["collection_name"],
                     item.data,
                 )
+                if self._stopped():
+                    self.store.dav_deleted_remove(archived_id)
+                    break
                 if deletion["side"] == "source":
                     deleted = self._call(
                         lambda ref=item.ref, etag=item.etag: self.source.delete(ref, etag), self.source
@@ -530,15 +604,22 @@ class DavTwoWayReconciler:
             except Exception as exc:
                 self._failed(exc)
                 continue
-            if deleted is False:
-                self.log("warning", f"DAV item {key} changed during the run; will retry")
+            if deleted is not True:
+                if deleted is None:
+                    self.store.dav_deleted_remove(archived_id)
+                elif deleted is False:
+                    self.log("warning", f"DAV item {key} changed during the run; will retry")
                 continue
             self._delete_pair(key)
+            self.store.ledger_delete(self.job_id, self.kind, [key])
             self._task_progress("trashed")
-        self.store.clear_deletions(self.job_id, self.kind)
+        if not self._stopped():
+            self.store.clear_deletions(self.job_id, self.kind)
         return False
 
     def reconcile(self, baseline=False, plan_only=False):
+        if self._stopped():
+            return False
         pairs = self.store.dav_pairs_get_all(self.job_id, self.kind)
         snapshot = self._snapshot(pairs)
         source = snapshot["source"]
@@ -547,8 +628,12 @@ class DavTwoWayReconciler:
 
         if baseline:
             if not plan_only:
+                if self._stopped():
+                    return False
                 writes = []
                 for key, source_record in source.items():
+                    if self._stopped():
+                        return False
                     if key in ambiguous:
                         continue
                     target = source_record["target"]
@@ -562,9 +647,12 @@ class DavTwoWayReconciler:
                                 "state": "synced",
                                 "src_hash": source_record["hash"],
                                 "dst_hash": dest_record["hash"],
+                                "dst_href": dest_record["target"]["href"],
                             }
                         )
                 for (href, uid), dest_record in destination.items():
+                    if self._stopped():
+                        return False
                     if snapshot["source_by_target_uid"].get((href, uid)):
                         continue
                     candidates = [
@@ -586,8 +674,11 @@ class DavTwoWayReconciler:
                                 "state": "ignored",
                                 "src_hash": None,
                                 "dst_hash": dest_record["hash"],
+                                "dst_href": href,
                             }
                         )
+                if self._stopped():
+                    return False
                 self.store.dav_pairs_put_many(self.job_id, self.kind, writes)
                 self.store.set_task_baseline(self.job_id, self.kind, time.time())
                 self.log("info", f"Recorded the initial two-way {self.kind} baseline")
@@ -596,6 +687,8 @@ class DavTwoWayReconciler:
         deletions = []
         handled_keys = set()
         for key, pair in pairs.items():
+            if self._stopped():
+                break
             if key in ambiguous or pair["state"] == "ignored":
                 continue
             scope_name = self._scope_name_for_key(key, [scope.name for scope in snapshot["scopes"]])
@@ -603,25 +696,29 @@ class DavTwoWayReconciler:
             if scope is None:
                 continue
             target = snapshot["targets"].get(scope.name)
-            if target is None:
+            dst_href = pair.get("dst_href") or (target["href"] if target else None)
+            pair_target = snapshot["collection_targets"].get(dst_href) if dst_href else None
+            if pair_target is None:
                 continue
             src_record = source.get(key)
-            dst_record = destination.get((target["href"], key[len(scope.name) + 1 :]))
+            dst_record = destination.get((dst_href, key[len(scope.name) + 1 :]))
             uid = key[len(scope.name) + 1 :]
+            if (dst_href, uid) in snapshot["ambiguous_dest"]:
+                continue
             handled_keys.add(key)
 
             if pair["state"] == "copying_back":
                 if src_record and dst_record:
                     if not plan_only:
-                        self._pair(key, "synced", src_record["hash"], dst_record["hash"])
+                        self._pair(key, "synced", src_record["hash"], dst_record["hash"], dst_href)
                         self._update_ledger_baseline(key, src_record["hash"], uid)
                     continue
                 if not src_record and dst_record:
-                    self._copy_back(key, scope, target, dst_record, plan_only=plan_only)
+                    self._copy_back(key, scope, pair_target, dst_record, plan_only=plan_only)
                     continue
                 if src_record and not dst_record:
                     if not plan_only:
-                        self._pair(key, "ignored", src_record["hash"], None)
+                        self._pair(key, "ignored", src_record["hash"], None, dst_href)
                     continue
                 if not snapshot["guarded"] and not plan_only:
                     self._delete_pair(key)
@@ -630,19 +727,19 @@ class DavTwoWayReconciler:
             if src_record and dst_record:
                 if pair["state"] != "synced":
                     if not plan_only:
-                        self._pair(key, "synced", src_record["hash"], dst_record["hash"])
+                        self._pair(key, "synced", src_record["hash"], dst_record["hash"], dst_href)
                     continue
                 src_changed = pair["src_hash"] is not None and src_record["hash"] != pair["src_hash"]
                 dst_changed = pair["dst_hash"] is not None and dst_record["hash"] != pair["dst_hash"]
                 if not src_changed and not dst_changed:
                     if not plan_only:
-                        self._pair(key, "synced", src_record["hash"], dst_record["hash"])
+                        self._pair(key, "synced", src_record["hash"], dst_record["hash"], dst_href)
                         self._update_ledger_baseline(key, src_record["hash"], uid)
                     continue
                 if src_changed and dst_changed:
                     if src_record["hash"] == dst_record["hash"]:
                         if not plan_only:
-                            self._pair(key, "synced", src_record["hash"], dst_record["hash"])
+                            self._pair(key, "synced", src_record["hash"], dst_record["hash"], dst_href)
                             self._update_ledger_baseline(key, src_record["hash"], uid)
                         continue
                     src_timestamp, dst_timestamp = source[key]["timestamp"], dst_record["timestamp"]
@@ -670,26 +767,47 @@ class DavTwoWayReconciler:
 
             if src_record and not dst_record and pair["state"] == "synced":
                 if not snapshot["guarded"]:
-                    deletions.append(self._deletion_entry(key, "source", scope, target, src_record))
+                    deletions.append(self._deletion_entry(key, "source", scope, pair_target, src_record))
                 continue
             if dst_record and not src_record and pair["state"] == "synced":
+                if any(
+                    record["key"] != key
+                    for record in snapshot["source_by_target_uid"].get((dst_href, uid), [])
+                ):
+                    continue
                 if not snapshot["guarded"]:
-                    deletions.append(self._deletion_entry(key, "destination", scope, target, dst_record))
+                    deletions.append(self._deletion_entry(key, "destination", scope, pair_target, dst_record))
                 continue
-            if not src_record and not dst_record and not snapshot["guarded"] and not plan_only:
+            if (
+                not src_record
+                and not dst_record
+                and not snapshot["guarded"]
+                and not plan_only
+                and not self._stopped()
+            ):
                 self._delete_pair(key)
 
         for key, source_record in source.items():
+            if self._stopped():
+                break
             if key in pairs or key in ambiguous or source_record["target"] is None:
                 continue
             target = source_record["target"]
             uid = source_record["item"].uid
             dest_record = destination.get((target["href"], uid))
             if dest_record and (target["href"], uid) not in snapshot["ambiguous_dest"] and not plan_only:
-                self._pair(key, "synced", source_record["hash"], dest_record["hash"])
+                self._pair(
+                    key,
+                    "synced",
+                    source_record["hash"],
+                    dest_record["hash"],
+                    dest_record["target"]["href"],
+                )
                 self._update_ledger_baseline(key, source_record["hash"], uid)
 
         for (href, uid), dest_record in destination.items():
+            if self._stopped():
+                break
             source_records = snapshot["source_by_target_uid"].get((href, uid), [])
             if source_records:
                 continue

@@ -237,6 +237,8 @@ def _reconciler(
     logs=None,
     source=None,
     dest=None,
+    retry=None,
+    control=None,
 ):
     source = source or _FakeSource(kind, items_by_scope, scopes=scopes)
     dest = dest or _FakeDest(kind, destination)
@@ -249,12 +251,27 @@ def _reconciler(
         source,
         dest,
         options or Options(max_deletions=50, max_deletion_percent=10),
-        lambda operation, _connection: operation(),
+        retry or (lambda operation, _connection: operation()),
         progress,
         lambda level, message: log_entries.append((level, message)),
         lambda _error: None,
+        control=control,
     )
     return reconciler, source, dest, progress, log_entries
+
+
+def _skip_retry_call(connection, call_number):
+    calls = 0
+
+    def retry(operation, current_connection):
+        nonlocal calls
+        if current_connection is connection:
+            calls += 1
+            if calls == call_number:
+                return None
+        return operation()
+
+    return retry
 
 
 def test_two_way_kinds_include_only_supported_pairs():
@@ -436,6 +453,42 @@ def test_dav_baseline_records_pairs_and_ignores_destination_only_items(tmp_path)
     assert store.get_task_baseline(job_id, "contacts") is not None
 
 
+def test_pairs_keep_their_destination_collection_when_default_is_added(tmp_path):
+    store = db.Store(tmp_path / "default-added.db")
+    job_id = store.create_job("DAV", {}, None)
+    source_item = _with_ref(_contact("person-1", "One"), "source:Default/person-1.vcf", '"s1"')
+    original_copy = _with_ref(_contact("person-1", "One"), "dest:Contacts/person-1.vcf", '"d1"')
+    reconciler, _source, dest, progress, _logs = _reconciler(
+        store,
+        job_id,
+        "contacts",
+        {"Default": [source_item]},
+        {"dest:Contacts": [original_copy]},
+        dest=_FakeDest(
+            "contacts",
+            {"dest:Contacts": [original_copy]},
+            collections=[{"href": "dest:Contacts", "displayname": "Contacts"}],
+        ),
+    )
+
+    reconciler.reconcile(baseline=True)
+    assert store.dav_pairs_get_all(job_id, "contacts")["Default|person-1"]["dst_href"] == "dest:Contacts"
+
+    new_default_copy = _with_ref(_contact("person-1", "One"), "dest:Default/person-1.vcf", '"d2"')
+    dest.collections.append({"href": "dest:Default", "displayname": "Default"})
+    dest.destination["dest:Default"] = [new_default_copy]
+
+    assert reconciler.reconcile() is False
+
+    pair = store.dav_pairs_get_all(job_id, "contacts")["Default|person-1"]
+    assert pair["dst_href"] == "dest:Contacts"
+    assert dest.update_calls == []
+    assert dest.delete_calls == []
+    assert _source.put_calls == []
+    assert store.get_pending_deletions(job_id, "contacts") == []
+    assert progress.values.get("updated", 0) == 0
+
+
 def test_dav_source_and_destination_edits_propagate_then_settle(tmp_path):
     store = db.Store(tmp_path / "edits.db")
     job_id = store.create_job("DAV", {}, None)
@@ -473,6 +526,61 @@ def test_dav_source_and_destination_edits_propagate_then_settle(tmp_path):
 
     assert len(dest.update_calls) == 1
     assert len(source.update_calls) == 1
+
+
+def test_reformatted_ics_readback_does_not_create_a_false_edit(tmp_path):
+    store = db.Store(tmp_path / "reformatted-readback.db")
+    job_id = store.create_job("DAV", {}, None)
+    src = _with_ref(
+        _event("event-1", "Original"),
+        "source:Calendar/event-1.ics",
+        '"s1"',
+    )
+    dst = _with_ref(
+        _event("event-1", "Original"),
+        "dest:Calendar/event-1.ics",
+        '"d1"',
+    )
+    source = _FakeSource(
+        "calendars",
+        {"Calendar": [src]},
+        scopes=[DavScope("Calendar", {"href": "source:Calendar", "displayname": "Calendar"})],
+    )
+    dest = _FakeDest(
+        "calendars",
+        {"dest:Calendar": [dst]},
+        collections=[{"href": "dest:Calendar", "displayname": "Calendar"}],
+    )
+    reconciler, source, dest, _progress, _logs = _reconciler(
+        store, job_id, "calendars", source.items_by_scope, dest.destination, source=source, dest=dest
+    )
+    reconciler.reconcile(baseline=True)
+    source.items_by_scope["Calendar"][0] = _with_ref(
+        _event("event-1", "Source edit", "20240201T000000Z"),
+        src.ref,
+        src.etag,
+    )
+    get = dest.get
+
+    def reformatted_get(ref):
+        result = get(ref)
+        if result:
+            etag, data = result
+            return etag, data.replace("SUMMARY:Source edit", "SUMMARY:Source\r\n  edit")
+        return result
+
+    dest.get = reformatted_get
+
+    reconciler.reconcile()
+
+    pair = store.dav_pairs_get_all(job_id, "calendars")["Calendar|event-1"]
+    assert pair["dst_hash"] == content_hash(dest.destination["dest:Calendar"][0].data)
+    assert len(dest.update_calls) == 1
+
+    reconciler.reconcile()
+
+    assert len(dest.update_calls) == 1
+    assert source.update_calls == []
 
 
 def test_dav_conflict_uses_rev_and_source_wins_when_missing_or_equal(tmp_path):
@@ -615,6 +723,106 @@ def test_dav_conditional_update_failure_leaves_pair_unchanged(tmp_path):
     assert pair["src_hash"] == old_pair["src_hash"]
     assert pair["dst_hash"] == old_pair["dst_hash"]
     assert any("changed during the run; will retry" in message for _level, message in logs)
+
+
+def test_skipped_copy_back_does_not_write_ledger_and_retries(tmp_path):
+    store = db.Store(tmp_path / "copyback-skipped.db")
+    job_id = store.create_job("DAV", {}, None)
+    extra = _with_ref(_contact("dest-only", "Extra"), "dest:Default/dest-only.vcf", '"d1"')
+    reconciler, source, dest, progress, _logs = _reconciler(
+        store, job_id, "contacts", {"Default": []}, {"dest:Default": [extra]}
+    )
+    reconciler.retry = _skip_retry_call(source, 3)
+
+    reconciler.reconcile()
+
+    pair = store.dav_pairs_get_all(job_id, "contacts")["Default|dest-only"]
+    assert pair["state"] == "copying_back"
+    assert store.ledger_get_many(job_id, "contacts", ["Default|dest-only"]) == {}
+    assert source.put_calls == []
+    assert progress.values.get("copied_back", 0) == 0
+    assert dest.delete_calls == []
+
+    reconciler.retry = lambda operation, _connection: operation()
+    reconciler.reconcile()
+
+    assert store.dav_pairs_get_all(job_id, "contacts")["Default|dest-only"]["state"] == "synced"
+    assert (
+        store.ledger_get_many(job_id, "contacts", ["Default|dest-only"])["Default|dest-only"]["status"]
+        == db.SKIPPED
+    )
+    assert len(source.put_calls) == 1
+    assert progress.values["copied_back"] == 1
+    assert dest.delete_calls == []
+
+
+def test_skipped_update_keeps_pair_and_ledger_unchanged_then_retries(tmp_path):
+    store = db.Store(tmp_path / "update-skipped.db")
+    job_id = store.create_job("DAV", {}, None)
+    src = _with_ref(_contact("person-1", "Original"), "source:Default/person-1.vcf", '"s1"')
+    dst = _with_ref(_contact("person-1", "Original"), "dest:Default/person-1.vcf", '"d1"')
+    reconciler, _source, dest, _progress, _logs = _reconciler(
+        store, job_id, "contacts", {"Default": [src]}, {"dest:Default": [dst]}
+    )
+    reconciler.reconcile(baseline=True)
+    key = "Default|person-1"
+    old_pair = store.dav_pairs_get_all(job_id, "contacts")[key]
+    store.ledger_mark(job_id, "contacts", key, db.DONE, match_key="person-1", info="original")
+    old_ledger = store.ledger_get_many(job_id, "contacts", [key])[key]
+    reconciler.source.items_by_scope["Default"][0] = _with_ref(
+        _contact("person-1", "Changed"), src.ref, src.etag
+    )
+    reconciler.retry = _skip_retry_call(dest, 2)
+
+    reconciler.reconcile()
+
+    assert store.dav_pairs_get_all(job_id, "contacts")[key] == old_pair
+    assert store.ledger_get_many(job_id, "contacts", [key])[key]["info"] == old_ledger["info"]
+    assert dest.update_calls == []
+
+    reconciler.retry = lambda operation, _connection: operation()
+    reconciler.reconcile()
+
+    assert len(dest.update_calls) == 1
+    assert store.dav_pairs_get_all(job_id, "contacts")[key]["src_hash"] != old_pair["src_hash"]
+    assert store.ledger_get_many(job_id, "contacts", [key])[key]["info"] != old_ledger["info"]
+
+
+def test_skipped_delete_keeps_pair_and_archive_unchanged_then_retries(tmp_path):
+    store = db.Store(tmp_path / "delete-skipped.db")
+    job_id = store.create_job("DAV", {}, None)
+    src = _with_ref(_contact("person-1", "One"), "source:Default/person-1.vcf", '"s1"')
+    dst = _with_ref(_contact("person-1", "One"), "dest:Default/person-1.vcf", '"d1"')
+    source_anchor = _with_ref(_contact("anchor", "Anchor"), "source:Default/anchor.vcf", '"s2"')
+    dest_anchor = _with_ref(_contact("anchor", "Anchor"), "dest:Default/anchor.vcf", '"d2"')
+    reconciler, source, dest, progress, _logs = _reconciler(
+        store,
+        job_id,
+        "contacts",
+        {"Default": [src, source_anchor]},
+        {"dest:Default": [dst, dest_anchor]},
+    )
+    reconciler.reconcile(baseline=True)
+    key = "Default|person-1"
+    store.ledger_mark(job_id, "contacts", key, db.DONE, match_key="person-1", info="original")
+    source.items_by_scope["Default"] = [source_anchor]
+    reconciler.retry = _skip_retry_call(dest, 2)
+
+    reconciler.reconcile()
+
+    assert key in store.dav_pairs_get_all(job_id, "contacts")
+    assert store.dav_deleted_list(job_id, "contacts") == []
+    assert store.ledger_get_many(job_id, "contacts", [key])[key]["info"] == "original"
+    assert dest.delete_calls == []
+    assert progress.values.get("trashed", 0) == 0
+
+    reconciler.retry = lambda operation, _connection: operation()
+    reconciler.reconcile()
+
+    assert key not in store.dav_pairs_get_all(job_id, "contacts")
+    assert len(store.dav_deleted_list(job_id, "contacts")) == 1
+    assert len(dest.delete_calls) == 1
+    assert progress.values["trashed"] == 1
 
 
 def test_destination_only_item_copies_back_and_writes_skipped_ledger_row(tmp_path):
@@ -912,6 +1120,57 @@ def test_ambiguous_items_are_skipped_and_unmapped_collections_are_left_alone(tmp
     assert any("ambiguous DAV item" in message for _level, message in logs)
     assert any("no source mapping" in message for _level, message in logs)
     assert dest.destination["dest:Other"] == [other_item]
+
+
+def test_ambiguous_destination_pair_is_never_deleted_or_updated(tmp_path):
+    store = db.Store(tmp_path / "ambiguous-pair.db")
+    job_id = store.create_job("DAV", {}, None)
+    src = _with_ref(_contact("person-1", "One"), "source:Default/person-1.vcf", '"s1"')
+    dst = _with_ref(_contact("person-1", "One"), "dest:Default/person-1.vcf", '"d1"')
+    reconciler, source, dest, _progress, _logs = _reconciler(
+        store, job_id, "contacts", {"Default": [src]}, {"dest:Default": [dst]}
+    )
+    reconciler.reconcile(baseline=True)
+    duplicate = _with_ref(_contact("person-1", "Duplicate"), "dest:Default/duplicate.vcf", '"d2"')
+    dest.destination["dest:Default"].append(duplicate)
+
+    reconciler.reconcile()
+
+    assert "Default|person-1" in store.dav_pairs_get_all(job_id, "contacts")
+    assert dest.delete_calls == []
+    assert dest.update_calls == []
+    assert source.update_calls == []
+
+
+def test_destination_deletion_is_skipped_when_another_source_scope_maps_to_uid(tmp_path):
+    store = db.Store(tmp_path / "other-source-record.db")
+    job_id = store.create_job("DAV", {}, None)
+    scopes = [
+        DavScope("Work", {"href": "source:Work", "displayname": "Work"}),
+        DavScope("Default", {"href": "source:Default", "displayname": "Default"}),
+    ]
+    work_item = _with_ref(_contact("person-1", "One"), "source:Work/person-1.vcf", '"sw1"')
+    work_other = _with_ref(_contact("other", "Other"), "source:Work/other.vcf", '"sw2"')
+    destination_item = _with_ref(_contact("person-1", "One"), "dest:Default/person-1.vcf", '"d1"')
+    destination_other = _with_ref(_contact("other", "Other"), "dest:Default/other.vcf", '"d2"')
+    reconciler, _source, dest, _progress, _logs = _reconciler(
+        store,
+        job_id,
+        "contacts",
+        {"Work": [work_item, work_other], "Default": []},
+        {"dest:Default": [destination_item, destination_other]},
+        scopes=scopes,
+    )
+    reconciler.reconcile(baseline=True)
+    reconciler.source.items_by_scope["Work"] = [work_other]
+    replacement = _with_ref(_contact("person-1", "One elsewhere"), "source:Default/person-1.vcf", '"sd1"')
+    reconciler.source.items_by_scope["Default"] = [replacement]
+
+    reconciler.reconcile()
+
+    assert "Work|person-1" in store.dav_pairs_get_all(job_id, "contacts")
+    assert dest.delete_calls == []
+    assert any(item.uid == "person-1" for item in dest.destination["dest:Default"])
 
 
 def test_contacts_copyback_reverse_mapping_prefers_default_scope(tmp_path):

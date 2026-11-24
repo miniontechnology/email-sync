@@ -7,6 +7,7 @@ from pathlib import Path
 from emailsync.connectors.dav import DavClient
 from emailsync.dav.vobjects import (
     contact_fingerprint,
+    content_hash,
     ensure_vcard_uid,
     event_fingerprint,
     split_ics,
@@ -134,3 +135,10 @@ def _decode_objects(data: str | bytes, kind: str):
         summary = str(component.get("summary", "")) if component else ""
         start = component.get("dtstart") if component else None
         yield DavItem(uid, calendar, event_fingerprint(summary, start))
+
+
+def hash_for_uid(data: str | bytes, kind: str, uid: str) -> str | None:
+    items = list(_decode_objects(data, kind))
+    if len(items) != 1 or items[0].uid != uid:
+        return None
+    return content_hash(items[0].data)

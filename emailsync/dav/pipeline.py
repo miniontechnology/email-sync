@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from emailsync import db
 from emailsync.connectors.dav import DavClient
 from emailsync.dav.jmap_dest import JmapDavDestination
-from emailsync.dav.source import DavSource
+from emailsync.dav.source import DavSource, hash_for_uid
 from emailsync.dav.twoway import DavTwoWayReconciler
 from emailsync.dav.vobjects import content_hash
 from emailsync.errors import AuthError, FatalError, ReauthRequired, wrap
@@ -288,9 +288,12 @@ class DavMigration:
             self.progress,
             self.log,
             self._record_reconcile_failure,
+            control=self.control,
         )
 
-    def _record_two_way_pair(self, source_key, source_hash, destination_hash):
+    def _record_two_way_pair(self, source_key, source_hash, destination_hash, destination_href):
+        if self.control.stopped or self.control.aborted:
+            return
         with self._two_way_pair_lock:
             if source_key in self._two_way_pair_keys or source_key in self._two_way_ambiguous_keys:
                 return
@@ -303,26 +306,38 @@ class DavMigration:
                         "state": "synced",
                         "src_hash": source_hash,
                         "dst_hash": destination_hash,
+                        "dst_href": destination_href,
                     }
                 ],
             )
             self._two_way_pair_keys.add(source_key)
 
     def _pair_for_indexed_item(self, source_key, item, indexed, source_hash):
-        if not self._two_way_active or not self._two_way_baseline or self.options.dry_run:
+        if (
+            not self._two_way_active
+            or not self._two_way_baseline
+            or self.options.dry_run
+            or self.control.stopped
+            or self.control.aborted
+        ):
             return
         if item.uid in indexed.get("ambiguous_uids", set()) or item.ambiguous:
             return
         destination_hash = indexed.get("hashes", {}).get(item.uid)
-        self._record_two_way_pair(source_key, source_hash, destination_hash)
+        self._record_two_way_pair(
+            source_key,
+            source_hash,
+            destination_hash,
+            indexed["collection"]["href"],
+        )
 
-    def _destination_hash_after_put(self, href):
+    def _destination_hash_after_put(self, href, uid):
         try:
             current = self._retry(lambda: self.dest.get(href), self.dest)
         except Exception as exc:
             self.log("warning", f"Could not read back DAV object {href}: {exc}")
             return None
-        return content_hash(current[1]) if current else None
+        return hash_for_uid(current[1], self.kind, uid) if current else None
 
     def _target_for(self, dest, scope):
         collections = dest.collections
@@ -404,19 +419,20 @@ class DavMigration:
                     return
                 if self.control.stopped or self.control.aborted:
                     return
-                if not updated:
-                    self.store.ledger_mark(
-                        self.job_id,
-                        self.kind,
-                        source_key,
-                        settled_row["status"],
-                        match_key=item.uid,
-                        targets=settled_row.get("targets") or [collection_name],
-                        error="destination changed during the run; will retry",
-                    )
-                    self._update_warning(
-                        f"Destination changed during the run while updating {source_key}; will retry"
-                    )
+                if updated is not True:
+                    if updated is False:
+                        self.store.ledger_mark(
+                            self.job_id,
+                            self.kind,
+                            source_key,
+                            settled_row["status"],
+                            match_key=item.uid,
+                            targets=settled_row.get("targets") or [collection_name],
+                            error="destination changed during the run; will retry",
+                        )
+                        self._update_warning(
+                            f"Destination changed during the run while updating {source_key}; will retry"
+                        )
                     return
                 self.store.ledger_mark(
                     self.job_id,
@@ -480,12 +496,16 @@ class DavMigration:
             created = self._retry(lambda: self.dest.put(target, filename, item.data), self.dest)
             if self.control.stopped or self.control.aborted:
                 return
+            if created is None:
+                return
             if created:
                 status = db.DONE
                 self.progress.update(scope.name, "copied")
                 if self._two_way_active and self._two_way_baseline:
-                    destination_hash = self._destination_hash_after_put(created)
-                    self._record_two_way_pair(source_key, digest, destination_hash)
+                    destination_hash = self._destination_hash_after_put(created, item.uid)
+                    if self.control.stopped or self.control.aborted:
+                        return
+                    self._record_two_way_pair(source_key, digest, destination_hash, target["href"])
             else:
                 status = db.SKIPPED
                 self.progress.update(scope.name, "skipped")
