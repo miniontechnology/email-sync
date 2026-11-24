@@ -581,6 +581,7 @@ class DavTwoWayReconciler:
             )
             return True
 
+        unconfirmed = False
         for deletion in deletions:
             if self._stopped():
                 break
@@ -611,14 +612,15 @@ class DavTwoWayReconciler:
                 continue
             if deleted is not True:
                 if deleted is None:
-                    self.store.dav_deleted_remove(archived_id)
+                    unconfirmed = True
+                    break
                 elif deleted is False:
                     self.log("warning", f"DAV item {key} changed during the run; will retry")
                 continue
             self._delete_pair(key)
             self.store.ledger_delete(self.job_id, self.kind, [key])
             self._task_progress("trashed")
-        if not self._stopped():
+        if not self._stopped() and not unconfirmed:
             self.store.clear_deletions(self.job_id, self.kind)
         return False
 

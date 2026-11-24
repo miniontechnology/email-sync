@@ -867,7 +867,7 @@ def test_skipped_update_keeps_pair_and_ledger_unchanged_then_retries(tmp_path):
     assert store.ledger_get_many(job_id, "contacts", [key])[key]["info"] != old_ledger["info"]
 
 
-def test_skipped_delete_keeps_pair_and_archive_unchanged_then_retries(tmp_path):
+def test_unconfirmed_delete_keeps_archive_and_pair_then_retries(tmp_path):
     store = db.Store(tmp_path / "delete-skipped.db")
     job_id = store.create_job("DAV", {}, None)
     src = _with_ref(_contact("person-1", "One"), "source:Default/person-1.vcf", '"s1"')
@@ -890,7 +890,8 @@ def test_skipped_delete_keeps_pair_and_archive_unchanged_then_retries(tmp_path):
     reconciler.reconcile()
 
     assert key in store.dav_pairs_get_all(job_id, "contacts")
-    assert store.dav_deleted_list(job_id, "contacts") == []
+    [uncertain_archive] = store.dav_deleted_list(job_id, "contacts")
+    assert uncertain_archive["data"] == dst.data
     assert store.ledger_get_many(job_id, "contacts", [key])[key]["info"] == "original"
     assert dest.delete_calls == []
     assert progress.values.get("trashed", 0) == 0
@@ -899,7 +900,7 @@ def test_skipped_delete_keeps_pair_and_archive_unchanged_then_retries(tmp_path):
     reconciler.reconcile()
 
     assert key not in store.dav_pairs_get_all(job_id, "contacts")
-    assert len(store.dav_deleted_list(job_id, "contacts")) == 1
+    assert len(store.dav_deleted_list(job_id, "contacts")) == 2
     assert len(dest.delete_calls) == 1
     assert progress.values["trashed"] == 1
 
