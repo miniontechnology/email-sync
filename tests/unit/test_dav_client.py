@@ -41,3 +41,57 @@ def test_dav_client_update_uses_if_match_and_returns_false_for_stale_etag():
         assert [request.content for request in requests] == [b"updated card", b"stale card"]
     finally:
         client.close()
+
+
+def test_dav_client_put_returns_created_url_and_false_when_it_exists():
+    requests = []
+    statuses = iter((201, 412))
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(next(statuses), request=request)
+
+    client = DavClient(Endpoint("carddav", url="https://dav.example.test"))
+    client.http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    try:
+        collection = {"href": "https://dav.example.test/addressbook/"}
+        assert client.put(collection, "person-1.vcf", b"card") == (
+            "https://dav.example.test/addressbook/person-1.vcf"
+        )
+        assert client.put(collection, "person-1.vcf", b"card") is False
+        assert requests[0].headers["If-None-Match"] == "*"
+    finally:
+        client.close()
+
+
+def test_dav_client_get_and_conditional_delete_handle_missing_and_stale_objects():
+    requests = []
+    responses = iter(
+        (
+            (200, {"ETag": '"etag-1"'}, b"vCard"),
+            (404, {}, b""),
+            (204, {}, b""),
+            (412, {}, b""),
+            (404, {}, b""),
+        )
+    )
+
+    def handler(request):
+        requests.append(request)
+        status, headers, content = next(responses)
+        return httpx.Response(status, headers=headers, content=content, request=request)
+
+    client = DavClient(Endpoint("carddav", url="https://dav.example.test"))
+    client.http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    href = "https://dav.example.test/addressbook/person-1.vcf"
+    try:
+        assert client.get(href) == ('"etag-1"', "vCard")
+        assert client.get(href) is None
+        assert client.delete(href, '"etag-1"') is True
+        assert client.delete(href, '"etag-1"') is False
+        assert client.delete(href, None) is True
+        assert requests[2].headers["If-Match"] == '"etag-1"'
+        assert requests[3].headers["If-Match"] == '"etag-1"'
+        assert "If-Match" not in requests[4].headers
+    finally:
+        client.close()

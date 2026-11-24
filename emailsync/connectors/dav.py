@@ -93,7 +93,17 @@ class DavClient:
     def close(self) -> None:
         self.http.close()
 
-    def _request(self, method: str, url: str, *, headers=None, content=None):
+    def _request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers=None,
+        content=None,
+        allow_not_found=False,
+        allow_forbidden=False,
+        raw_statuses=False,
+    ):
         url = _safe_url(url)
         for _ in range(7):
             try:
@@ -106,10 +116,12 @@ class DavClient:
                 )
             except Exception as exc:
                 raise wrap(exc) from exc
-            if response.status_code in (401, 403):
+            if response.status_code == 401 or (response.status_code == 403 and not allow_forbidden):
                 raise AuthError(f"DAV login failed (HTTP {response.status_code})")
             if response.status_code not in _REDIRECTS:
                 if response.status_code == 412:
+                    return response
+                if response.status_code == 404 and allow_not_found:
                     return response
                 if response.status_code == 429:
                     retry = response.headers.get("Retry-After", "")
@@ -122,7 +134,7 @@ class DavClient:
                         except (TypeError, ValueError):
                             delay = 300.0
                     raise ThrottledError("DAV server rate limited the request", delay)
-                if response.status_code >= 400:
+                if response.status_code >= 400 and not raw_statuses:
                     try:
                         response.raise_for_status()
                     except Exception as exc:
@@ -311,15 +323,22 @@ class DavClient:
                     objects.append((obj_href, etag.text if etag is not None else None, data.text))
         return objects
 
-    def put(self, collection: dict | str, filename: str, data: bytes) -> bool:
+    def put(self, collection: dict | str, filename: str, data: bytes) -> str | bool:
         base = collection["href"] if isinstance(collection, dict) else collection
         url = urljoin(base.rstrip("/") + "/", quote(filename, safe=""))
-        response = self._request("PUT", url, headers={"If-None-Match": "*"}, content=data)
+        response = self._request(
+            "PUT",
+            url,
+            headers={"If-None-Match": "*"},
+            content=data,
+            allow_forbidden=True,
+            raw_statuses=True,
+        )
         if response.status_code == 412:
             return False
-        if response.status_code not in (201, 204):
-            response.raise_for_status()
-        return True
+        if response.status_code in (201, 204):
+            return _safe_url(str(response.url))
+        raise PermanentError(f"DAV PUT returned HTTP {response.status_code}")
 
     def update(self, href: str, data: bytes, etag: str | None) -> bool:
         headers = {"If-Match": etag} if etag else None
@@ -329,6 +348,23 @@ class DavClient:
         if 200 <= response.status_code < 300:
             return True
         raise PermanentError(f"DAV update returned HTTP {response.status_code}")
+
+    def get(self, href: str) -> tuple[str | None, str] | None:
+        response = self._request("GET", href, allow_not_found=True)
+        if response.status_code == 404:
+            return None
+        if 200 <= response.status_code < 300:
+            return response.headers.get("ETag"), response.text
+        raise PermanentError(f"DAV GET returned HTTP {response.status_code}")
+
+    def delete(self, href: str, etag: str | None) -> bool:
+        headers = {"If-Match": etag} if etag else None
+        response = self._request("DELETE", href, headers=headers, allow_not_found=True, raw_statuses=True)
+        if response.status_code == 412:
+            return False
+        if response.status_code == 404 or 200 <= response.status_code < 300:
+            return True
+        raise PermanentError(f"DAV DELETE returned HTTP {response.status_code}")
 
     def create_collection(self, name: str) -> dict:
         base, collections = self.discover()

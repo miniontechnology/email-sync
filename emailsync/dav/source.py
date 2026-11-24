@@ -28,6 +28,7 @@ class DavItem:
     fingerprint: str
     ref: str = ""
     etag: str | None = None
+    ambiguous: bool = False
 
 
 class DavSource:
@@ -68,9 +69,34 @@ class DavSource:
                 items.extend(_decode_objects(data, self.kind))
             return items
         items = []
-        for _href, _etag, data in self.client.list_objects(scope.collection):
-            items.extend(_decode_objects(data, self.kind))
+        for href, etag, data in self.client.list_objects(scope.collection):
+            decoded = list(_decode_objects(data, self.kind))
+            for item in decoded:
+                item.ref = href
+                item.etag = etag
+                item.ambiguous = len(decoded) > 1
+            items.extend(decoded)
         return items
+
+    def put(self, collection, filename, data):
+        if self.client is None:
+            raise RuntimeError("DAV source is not connected")
+        return self.client.put(collection, filename, data)
+
+    def update(self, _collection, ref, etag, data):
+        if self.client is None:
+            raise RuntimeError("DAV source is not connected")
+        return self.client.update(ref, data, etag)
+
+    def delete(self, ref, etag):
+        if self.client is None:
+            raise RuntimeError("DAV source is not connected")
+        return self.client.delete(ref, etag)
+
+    def get(self, ref):
+        if self.client is None:
+            raise RuntimeError("DAV source is not connected")
+        return self.client.get(ref)
 
 
 def _file_collections(paths: list[str], kind: str):
