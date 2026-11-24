@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     copied_back INTEGER NOT NULL DEFAULT 0,
     trashed INTEGER NOT NULL DEFAULT 0,
     bytes INTEGER NOT NULL DEFAULT 0,
+    twoway_baseline_at REAL,
     message TEXT,
     started_at REAL,
     finished_at REAL,
@@ -89,6 +90,26 @@ CREATE TABLE IF NOT EXISTS mail_pairs (
     dst_mixed TEXT NOT NULL DEFAULT '[]',
     updated_at REAL NOT NULL,
     PRIMARY KEY (job_id, key)
+);
+CREATE TABLE IF NOT EXISTS dav_pairs (
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    src_hash TEXT,
+    dst_hash TEXT,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (job_id, kind, key)
+);
+CREATE TABLE IF NOT EXISTS dav_deleted (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    side TEXT NOT NULL,
+    collection TEXT NOT NULL,
+    data BLOB NOT NULL,
+    deleted_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,6 +158,8 @@ class Store:
                     for column in ("copied_back", "trashed"):
                         if column not in columns:
                             conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+                    if "twoway_baseline_at" not in columns:
+                        conn.execute("ALTER TABLE tasks ADD COLUMN twoway_baseline_at REAL")
             job_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
             for column, declaration in (
                 ("twoway_baseline_at", "REAL"),
@@ -220,9 +243,68 @@ class Store:
         with self.write() as conn:
             conn.execute(f"UPDATE jobs SET {cols} WHERE id=?", (*fields.values(), job_id))
 
+    def get_pending_deletions(self, job_id: int, kind: str | None = None) -> list[dict]:
+        rows = self.query("SELECT pending_deletions FROM jobs WHERE id=?", (job_id,))
+        pending = _decode_list(rows[0]["pending_deletions"]) if rows else []
+        normalized = [_normalize_pending(item) for item in pending if isinstance(item, dict)]
+        if kind is not None:
+            normalized = [item for item in normalized if item["kind"] == kind]
+        return normalized
+
+    def set_pending_deletions(self, job_id: int, kind: str, entries: Iterable[dict]) -> None:
+        with self.write() as conn:
+            row = conn.execute("SELECT pending_deletions FROM jobs WHERE id=?", (job_id,)).fetchone()
+            pending = _decode_list(row["pending_deletions"]) if row else []
+            pending = [
+                _normalize_pending(item)
+                for item in pending
+                if isinstance(item, dict) and _deletion_kind(item) != kind
+            ]
+            pending.extend(
+                {**entry, "kind": kind} for entry in entries if isinstance(entry, dict) and entry.get("key")
+            )
+            conn.execute(
+                "UPDATE jobs SET pending_deletions=? WHERE id=?",
+                (json.dumps(pending) if pending else None, job_id),
+            )
+
+    def get_approved_keys(self, job_id: int, kind: str) -> set[str]:
+        rows = self.query("SELECT approved_deletions FROM jobs WHERE id=?", (job_id,))
+        approved = _decode_approved(rows[0]["approved_deletions"]) if rows else []
+        return {item["key"] for item in approved if item["kind"] == kind}
+
+    def approve_pending_deletions(self, job_id: int) -> list[dict]:
+        with self.write() as conn:
+            row = conn.execute(
+                "SELECT pending_deletions, approved_deletions FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
+            if not row:
+                return []
+            pending = [
+                _normalize_pending(item)
+                for item in _decode_list(row["pending_deletions"])
+                if isinstance(item, dict) and item.get("key")
+            ]
+            approved = _decode_approved(row["approved_deletions"])
+            known = {(item["kind"], item["key"]) for item in approved}
+            for item in pending:
+                pair = (item["kind"], item["key"])
+                if pair not in known:
+                    approved.append({"kind": pair[0], "key": pair[1]})
+                    known.add(pair)
+            conn.execute(
+                "UPDATE jobs SET approved_deletions=?, pending_deletions=NULL WHERE id=?",
+                (json.dumps(approved) if approved else None, job_id),
+            )
+            return pending
+
+    def clear_deletions(self, job_id: int, kind: str) -> None:
+        with self.write() as conn:
+            _clear_deletions_conn(conn, job_id, kind)
+
     def delete_job(self, job_id: int) -> None:
         with self.write() as conn:
-            for table in ("ledger", "mail_pairs", "events", "scopes", "tasks"):
+            for table in ("ledger", "mail_pairs", "dav_pairs", "dav_deleted", "events", "scopes", "tasks"):
                 conn.execute(f"DELETE FROM {table} WHERE job_id=?", (job_id,))
             conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
 
@@ -440,15 +522,27 @@ class Store:
         with self.write() as conn:
             if kind is None:
                 conn.execute("DELETE FROM ledger WHERE job_id=?", (job_id,))
-            else:
-                conn.execute("DELETE FROM ledger WHERE job_id=? AND kind=?", (job_id, kind))
-            if kind in (None, "mail"):
                 conn.execute("DELETE FROM mail_pairs WHERE job_id=?", (job_id,))
+                conn.execute("DELETE FROM dav_pairs WHERE job_id=?", (job_id,))
                 conn.execute(
                     "UPDATE jobs SET twoway_baseline_at=NULL, pending_deletions=NULL, "
                     "approved_deletions=NULL WHERE id=?",
                     (job_id,),
                 )
+                conn.execute("UPDATE tasks SET twoway_baseline_at=NULL WHERE job_id=?", (job_id,))
+            else:
+                conn.execute("DELETE FROM ledger WHERE job_id=? AND kind=?", (job_id, kind))
+            if kind == "mail":
+                conn.execute("DELETE FROM mail_pairs WHERE job_id=?", (job_id,))
+                conn.execute("UPDATE jobs SET twoway_baseline_at=NULL WHERE id=?", (job_id,))
+                _clear_deletions_conn(conn, job_id, "mail")
+            elif kind in ("contacts", "calendars"):
+                conn.execute("DELETE FROM dav_pairs WHERE job_id=? AND kind=?", (job_id, kind))
+                conn.execute(
+                    "UPDATE tasks SET twoway_baseline_at=NULL WHERE job_id=? AND kind=?",
+                    (job_id, kind),
+                )
+                _clear_deletions_conn(conn, job_id, kind)
 
     def pairs_get_all(self, job_id: int) -> dict[str, dict]:
         rows = self.query("SELECT * FROM mail_pairs WHERE job_id=?", (job_id,))
@@ -495,10 +589,87 @@ class Store:
     def pairs_reset(self, job_id: int) -> None:
         with self.write() as conn:
             conn.execute("DELETE FROM mail_pairs WHERE job_id=?", (job_id,))
+            conn.execute("UPDATE jobs SET twoway_baseline_at=NULL WHERE id=?", (job_id,))
+            _clear_deletions_conn(conn, job_id, "mail")
+
+    def dav_pairs_get_all(self, job_id: int, kind: str) -> dict[str, dict]:
+        rows = self.query("SELECT * FROM dav_pairs WHERE job_id=? AND kind=?", (job_id, kind))
+        return {row["key"]: dict(row) for row in rows}
+
+    def dav_pairs_put_many(self, job_id: int, kind: str, rows: Iterable[dict]) -> None:
+        now = time.time()
+        with self.write() as conn:
+            for row in rows:
+                conn.execute(
+                    "INSERT INTO dav_pairs(job_id,kind,key,state,src_hash,dst_hash,updated_at)"
+                    " VALUES(?,?,?,?,?,?,?) ON CONFLICT(job_id,kind,key) DO UPDATE SET"
+                    " state=excluded.state, src_hash=excluded.src_hash, dst_hash=excluded.dst_hash,"
+                    " updated_at=excluded.updated_at",
+                    (
+                        job_id,
+                        kind,
+                        row["key"],
+                        row["state"],
+                        row.get("src_hash"),
+                        row.get("dst_hash"),
+                        now,
+                    ),
+                )
+
+    def dav_pairs_delete(self, job_id: int, kind: str, keys: Iterable[str]) -> None:
+        with self.write() as conn:
+            conn.executemany(
+                "DELETE FROM dav_pairs WHERE job_id=? AND kind=? AND key=?",
+                ((job_id, kind, key) for key in keys),
+            )
+
+    def dav_pairs_reset(self, job_id: int, kind: str) -> None:
+        with self.write() as conn:
+            conn.execute("DELETE FROM dav_pairs WHERE job_id=? AND kind=?", (job_id, kind))
             conn.execute(
-                "UPDATE jobs SET twoway_baseline_at=NULL, pending_deletions=NULL, "
-                "approved_deletions=NULL WHERE id=?",
+                "UPDATE tasks SET twoway_baseline_at=NULL WHERE job_id=? AND kind=?",
+                (job_id, kind),
+            )
+            _clear_deletions_conn(conn, job_id, kind)
+
+    def dav_deleted_add(self, job_id: int, kind: str, key: str, side: str, collection: str, data) -> int:
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        with self.write() as conn:
+            cur = conn.execute(
+                "INSERT INTO dav_deleted(job_id,kind,key,side,collection,data,deleted_at)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (job_id, kind, key, side, collection, sqlite3.Binary(data), time.time()),
+            )
+            return int(cur.lastrowid)
+
+    def dav_deleted_list(self, job_id: int, kind: str) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.query(
+                "SELECT * FROM dav_deleted WHERE job_id=? AND kind=? ORDER BY id", (job_id, kind)
+            )
+        ]
+
+    def dav_deleted_count(self, job_id: int) -> dict[str, int]:
+        return {
+            row["kind"]: row["count"]
+            for row in self.query(
+                "SELECT kind, COUNT(*) AS count FROM dav_deleted WHERE job_id=? GROUP BY kind",
                 (job_id,),
+            )
+        }
+
+    def get_task_baseline(self, job_id: int, kind: str) -> float | None:
+        rows = self.query("SELECT twoway_baseline_at FROM tasks WHERE job_id=? AND kind=?", (job_id, kind))
+        return rows[0]["twoway_baseline_at"] if rows else None
+
+    def set_task_baseline(self, job_id: int, kind: str, ts: float | None) -> None:
+        with self.write() as conn:
+            conn.execute(
+                "INSERT INTO tasks(job_id,kind,status,twoway_baseline_at) VALUES(?,?,'pending',?)"
+                " ON CONFLICT(job_id,kind) DO UPDATE SET twoway_baseline_at=excluded.twoway_baseline_at",
+                (job_id, kind, ts),
             )
 
     # -- events ------------------------------------------------------------------------------
@@ -528,6 +699,56 @@ def _job_row(row: sqlite3.Row) -> dict:
         except (TypeError, ValueError):
             d[field] = []
     return d
+
+
+def _decode_list(value) -> list:
+    try:
+        result = json.loads(value) if value else []
+    except (TypeError, ValueError):
+        return []
+    return result if isinstance(result, list) else []
+
+
+def _deletion_kind(item) -> str:
+    if isinstance(item, dict) and item.get("kind"):
+        return str(item["kind"])
+    return "mail"
+
+
+def _normalize_pending(item: dict) -> dict:
+    return {**item, "kind": _deletion_kind(item)}
+
+
+def _decode_approved(value) -> list[dict]:
+    result = []
+    for item in _decode_list(value):
+        if isinstance(item, str) and item:
+            result.append({"kind": "mail", "key": item})
+        elif isinstance(item, dict) and item.get("key"):
+            result.append({"kind": _deletion_kind(item), "key": item["key"]})
+    return result
+
+
+def _clear_deletions_conn(conn, job_id: int, kind: str) -> None:
+    row = conn.execute(
+        "SELECT pending_deletions, approved_deletions FROM jobs WHERE id=?", (job_id,)
+    ).fetchone()
+    if not row:
+        return
+    pending = [
+        _normalize_pending(item)
+        for item in _decode_list(row["pending_deletions"])
+        if isinstance(item, dict) and _deletion_kind(item) != kind
+    ]
+    approved = [item for item in _decode_approved(row["approved_deletions"]) if item["kind"] != kind]
+    conn.execute(
+        "UPDATE jobs SET pending_deletions=?, approved_deletions=? WHERE id=?",
+        (
+            json.dumps(pending) if pending else None,
+            json.dumps(approved) if approved else None,
+            job_id,
+        ),
+    )
 
 
 def _account_row(row: sqlite3.Row) -> dict:
