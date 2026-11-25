@@ -87,8 +87,10 @@ contacts and calendar sources.
    use Google Takeout files. Configure Stalwart's CardDAV, CalDAV, or JMAP endpoints as the
    destinations. JMAP imports require the server's vCard and iCalendar parse capabilities.
    DAV/JMAP credentials may be left blank to reuse credentials from that side's mail endpoint.
-4. Run a dry run first. Review folder mappings, selected source scopes, and progress before
-   running a real copy.
+4. Use **Folders → Load folders** to choose source folders and, if needed, enter destination
+   names. Folders added to the source later are included automatically. The collapsed
+   **Advanced: exclude list and folder mapping** section exposes the saved settings behind the
+   picker. Run a dry run first and review its progress before running a real copy.
 
 ## Editing migrations
 

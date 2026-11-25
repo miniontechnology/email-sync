@@ -13,6 +13,7 @@ from emailsync.crypto import SecretBox
 from emailsync.db import Store
 from emailsync.jobs.control import TaskResult
 from emailsync.jobs.manager import JobManager, ResetConfirmationRequired, merge_saved_settings
+from emailsync.mail.folders import Folder
 from emailsync.options import Endpoint, JobConfig, Options
 from emailsync.web.app import _config_to_values, create_app
 
@@ -771,6 +772,192 @@ def test_api_test_lists_jmap_dav_destination_collections(tmp_path, monkeypatch):
         )
     assert response.status_code == 200
     assert response.json()["folders"] == [{"source": "Default", "target": "address-book-1"}]
+
+
+def test_api_folders_returns_rows_and_destination_names(tmp_path, monkeypatch):
+    class FakeSource:
+        def __init__(self, _endpoint, _options):
+            pass
+
+        def connect(self):
+            return self
+
+        def folders(self):
+            return [Folder("INBOX"), Folder("Work")]
+
+        def close(self):
+            pass
+
+    class FakeDestination:
+        id_to_path = {"inbox-id": "INBOX", "work-id": "Work/Projects"}
+
+        def __init__(self, _endpoint, _options):
+            pass
+
+        def connect(self):
+            return self
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("emailsync.web.app.make_source", FakeSource)
+    monkeypatch.setattr("emailsync.web.app.make_dest", FakeDestination)
+    settings, store, manager = make_manager(tmp_path)
+
+    with TestClient(create_app(settings, store, manager)) as client:
+        response = client.post(
+            "/api/folders",
+            json={
+                "source": {"type": "imap", "host": "source.example", "username": "alice"},
+                "dest": {"type": "jmap", "url": "https://dest.example", "username": "alice"},
+                "options": {"folder_map": {"Work": "Projects"}},
+            },
+        )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["ok"] is True
+    assert [row["key"] for row in body["rows"]] == ["INBOX", "Work"]
+    assert body["rows"][1]["dest"] == "Projects"
+    assert body["dest_folders"] == ["INBOX", "Work/Projects"]
+    assert body["dest_detail"] == ""
+
+
+def test_api_folders_destination_failure_is_non_fatal(tmp_path, monkeypatch):
+    class FakeSource:
+        def __init__(self, _endpoint, _options):
+            pass
+
+        def connect(self):
+            return self
+
+        def folders(self):
+            return [Folder("INBOX")]
+
+        def close(self):
+            pass
+
+    class BrokenDestination:
+        def __init__(self, _endpoint, _options):
+            pass
+
+        def connect(self):
+            raise RuntimeError("destination is unavailable")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("emailsync.web.app.make_source", FakeSource)
+    monkeypatch.setattr("emailsync.web.app.make_dest", BrokenDestination)
+    settings, store, manager = make_manager(tmp_path)
+
+    with TestClient(create_app(settings, store, manager)) as client:
+        response = client.post(
+            "/api/folders",
+            json={
+                "source": {"type": "imap", "host": "source.example", "username": "alice"},
+                "dest": {"type": "imap", "host": "dest.example", "username": "alice"},
+            },
+        )
+
+    body = response.json()
+    assert body["ok"] is True
+    assert [row["name"] for row in body["rows"]] == ["INBOX"]
+    assert body["dest_folders"] == []
+    assert body["dest_detail"] == "destination is unavailable"
+
+
+def test_api_folders_uses_saved_password_for_job_endpoint(tmp_path, monkeypatch):
+    settings, store, manager = make_manager(tmp_path)
+    job_id = completed_job(manager, store, mail_config())
+    manager._schedule_once = lambda: None
+    tested = []
+
+    class FakeSource:
+        def __init__(self, endpoint, _options):
+            tested.append(endpoint)
+
+        def connect(self):
+            return self
+
+        def folders(self):
+            return [Folder("INBOX")]
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("emailsync.web.app.make_source", FakeSource)
+    with TestClient(create_app(settings, store, manager)) as client:
+        response = client.post(
+            "/api/folders",
+            json={
+                "job_id": job_id,
+                "source": {
+                    "type": "gmail",
+                    "host": "imap.gmail.com",
+                    "username": "alice",
+                },
+                "dest": None,
+            },
+        )
+
+    assert response.json()["ok"] is True
+    assert tested[0].password == "super-secret"
+    assert response.json()["gmail"] is True
+
+
+def test_api_folders_source_failure_returns_no_rows(tmp_path, monkeypatch):
+    class BrokenSource:
+        def __init__(self, _endpoint, _options):
+            pass
+
+        def connect(self):
+            raise RuntimeError("source is unavailable")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("emailsync.web.app.make_source", BrokenSource)
+    settings, store, manager = make_manager(tmp_path)
+
+    with TestClient(create_app(settings, store, manager)) as client:
+        response = client.post(
+            "/api/folders",
+            json={
+                "source": {"type": "imap", "host": "source.example", "username": "alice"},
+                "dest": None,
+            },
+        )
+
+    body = response.json()
+    assert body["ok"] is False
+    assert body["detail"] == "source is unavailable"
+    assert body["rows"] == []
+
+
+def test_new_and_edit_forms_render_folder_picker_and_saved_advanced_settings(tmp_path):
+    settings, store, manager = make_manager(tmp_path)
+    config = mail_config()
+    config.options.exclude_folders = ["Old"]
+    config.options.folder_map = {"INBOX": "Primary", "Missing": "Archive"}
+    job_id = completed_job(manager, store, config)
+    manager._schedule_once = lambda: None
+
+    with TestClient(create_app(settings, store, manager)) as client:
+        new_page = client.get("/jobs/new")
+        edit_page = client.get(f"/jobs/{job_id}/edit")
+
+    assert new_page.status_code == 200
+    assert 'id="folder-picker"' in new_page.text
+    assert 'id="load-folders"' in new_page.text
+    assert "Advanced: exclude list and folder mapping" in new_page.text
+    assert 'name="folder_map"' in new_page.text
+    assert 'name="exclude_folders"' in new_page.text
+    assert '<details class="folder-advanced">' in new_page.text
+    assert edit_page.status_code == 200
+    assert "INBOX =&gt; Primary" in edit_page.text
+    assert "Missing =&gt; Archive" in edit_page.text
+    assert ">Old</textarea>" in edit_page.text
 
 
 def test_edit_page_prefills_settings_and_never_renders_secrets(tmp_path):

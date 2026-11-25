@@ -29,7 +29,7 @@ Roughly in priority order; open an issue/PR to reprioritise.
 
 ## App
 - Authentication / multi-user access control for the web UI.
-- Per-folder selection checkboxes in the UI (today: exclude list + mapping text box).
+- Per-folder selection checkboxes in the UI — done.
 - Notifications (email/webhook) on completion or failure.
 - Export of the ledger / migration report as CSV.
 - Prometheus metrics endpoint.

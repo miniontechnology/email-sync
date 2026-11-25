@@ -6,7 +6,7 @@ Targets are expressed in a server-neutral form:
 The destination connector resolves targets to real folder names (and creates them if needed).
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from emailsync.options import Options
 
@@ -110,6 +110,95 @@ def map_source_folder(folder: Folder, options: Options) -> str | None:
         # Courier/Cyrus style "INBOX.Work" -> "Work"; keeps hierarchy portable between servers.
         parts = parts[1:]
     return "/".join(parts)
+
+
+def folder_rows(folders: list[Folder], options: Options, gmail: bool) -> list[dict]:
+    """Build the editable source-folder view without changing the migration options."""
+    neutral_options = replace(
+        options, exclude_folders=[], folder_map={}, include_spam=True, include_trash=True
+    )
+    rows = []
+    keys = set()
+    excluded = set(options.exclude_folders)
+
+    for folder in folders:
+        if not folder.selectable:
+            continue
+
+        role = folder.role
+        if gmail:
+            if role in ("all", "flagged"):
+                continue
+            if role == "important":
+                key = "\\Important"
+                kind = "important"
+                default_target = "Important"
+                included = options.gmail_important_as_folder
+            elif role == "junk":
+                key = folder.name
+                kind = "spam"
+                default_target = GMAIL_SYSTEM_LABELS["\\spam"]
+                included = options.include_spam
+            elif role == "trash":
+                key = folder.name
+                kind = "trash"
+                default_target = GMAIL_SYSTEM_LABELS["\\trash"]
+                included = options.include_trash
+            else:
+                label = gmail_folder_label(folder) or folder.name
+                key = label
+                kind = "normal"
+                default_target = GMAIL_SYSTEM_LABELS.get(label.lower(), label)
+                included = key not in excluded
+        else:
+            if role in ("all", "flagged", "important"):
+                continue
+            key = folder.name
+            kind = "spam" if role == "junk" else "trash" if role == "trash" else "normal"
+            default_target = map_source_folder(folder, neutral_options) or ""
+            if kind == "spam":
+                included = options.include_spam
+            elif kind == "trash":
+                included = options.include_trash
+            else:
+                included = key not in excluded
+
+        rows.append(
+            {
+                "key": key,
+                "name": folder.name,
+                "kind": kind,
+                "default_target": default_target,
+                "included": included,
+                "dest": options.folder_map.get(key, ""),
+                "missing": False,
+            }
+        )
+        keys.add(key)
+
+    saved_keys = excluded | set(options.folder_map)
+    for key in saved_keys - keys:
+        rows.append(
+            {
+                "key": key,
+                "name": key,
+                "kind": "normal",
+                "default_target": "",
+                "included": key not in excluded,
+                "dest": options.folder_map.get(key, ""),
+                "missing": True,
+            }
+        )
+
+    role_order = {"@inbox": 0, "@sent": 1, "@drafts": 2}
+    rows.sort(
+        key=lambda row: (
+            row["missing"],
+            role_order.get(row["default_target"].lower(), 3),
+            row["name"].casefold(),
+        )
+    )
+    return rows
 
 
 def gmail_real_targets(labels, options: Options, ignore_exclusions: bool = False) -> tuple[list[str], bool]:

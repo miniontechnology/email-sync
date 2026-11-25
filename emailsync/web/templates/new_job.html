@@ -88,9 +88,25 @@
       <label class="field"><span>Sync interval (minutes)</span><input type="number" name="sync_interval_minutes" min="0" value="{{ values.get('sync_interval_minutes','0') }}"></label>
       <label class="field"><span>Pause if more than this many messages move to Trash</span><input type="number" name="max_deletions" min="0" value="{{ values.get('max_deletions','50') }}"></label>
       <label class="field"><span>Pause if more than this percent of a folder moves to Trash</span><input type="number" name="max_deletion_percent" min="0" max="100" value="{{ values.get('max_deletion_percent','10') }}"></label>
-      <label class="field full"><span>Folder mapping (one source =&gt; destination per line)</span><textarea name="folder_map" rows="4" placeholder="[Gmail]/Work => Work">{{ values.get('folder_map','') }}</textarea></label>
-      <label class="field full"><span>Exclude source folders (one per line)</span><textarea name="exclude_folders" rows="3">{{ values.get('exclude_folders','') }}</textarea></label>
     </div>
+    <div class="folder-picker-block" id="folder-picker">
+      <div class="folder-picker-heading">
+        <div><h3>Folders</h3><p class="muted">Choose the source folders to include and optionally rename their destinations.</p></div>
+        <button class="button secondary" type="button" id="load-folders">Load folders</button>
+      </div>
+      <p class="muted" id="folder-picker-gmail-note" {% if values.get('mail_source_type') != "gmail" %}hidden{% endif %}>Mail with no label goes to the archive target</p>
+      <div class="test-result" id="folder-picker-status" aria-live="polite"></div>
+      <div class="test-result" id="folder-picker-dest-status" aria-live="polite"></div>
+      <div id="folder-picker-result"></div>
+      <datalist id="dest-folder-options"></datalist>
+    </div>
+    <details class="folder-advanced">
+      <summary>Advanced: exclude list and folder mapping</summary>
+      <div class="options-grid">
+        <label class="field full"><span>Folder mapping (one source =&gt; destination per line)</span><textarea name="folder_map" rows="4" placeholder="[Gmail]/Work => Work">{{ values.get('folder_map','') }}</textarea></label>
+        <label class="field full"><span>Exclude source folders (one per line)</span><textarea name="exclude_folders" rows="3">{{ values.get('exclude_folders','') }}</textarea></label>
+      </div>
+    </details>
     <div class="checks-row">
       <label class="check-field"><input type="checkbox" name="include_spam" {% if values.get('include_spam') %}checked{% endif %}><span>Include spam</span></label>
       <label class="check-field"><input type="checkbox" name="include_trash" {% if values.get('include_trash') %}checked{% endif %}><span>Include trash</span></label>
