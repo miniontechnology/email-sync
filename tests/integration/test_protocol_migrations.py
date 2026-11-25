@@ -29,6 +29,10 @@ STALWART_USER = "alice@example.org"
 STALWART_PASSWORD = "Vx7-quartz-Falcon-river"
 
 
+def _job_failure_context(store, job_id):
+    return f"events={store.get_events(job_id)!r}; ledger_failed={store.ledger_failed(job_id)!r}"
+
+
 def _imap(endpoint):
     conn = IMAPClient(
         endpoint.host,
@@ -1000,14 +1004,14 @@ def test_file_contacts_to_stalwart_jmap_is_idempotent(tmp_path):
     job_id = store.create_job("JMAP contacts", {}, None)
 
     result = DavMigration(store, job_id, "contacts", config, RunControl()).run()
-    assert result.status == "completed", result.error
+    assert result.status == "completed", f"{result.error!r}; {_job_failure_context(store, job_id)}"
     assert store.get_tasks(job_id)[0]["copied"] == 2
     items = _query_jmap_items("contacts", "Default")
     expected_uids = {f"jmap-contact-{suffix}", second_uid}
     assert expected_uids <= {item.uid for item in items}
 
     result = DavMigration(store, job_id, "contacts", config, RunControl()).run()
-    assert result.status == "completed", result.error
+    assert result.status == "completed", f"{result.error!r}; {_job_failure_context(store, job_id)}"
     assert store.get_tasks(job_id)[0]["copied"] == 0
     assert expected_uids <= {item.uid for item in _query_jmap_items("contacts", "Default")}
 
@@ -1163,7 +1167,7 @@ def test_changed_contacts_update_stalwart_jmap(tmp_path, source_type):
     job_id = store.create_job("Update JMAP contact", {}, None)
 
     result = DavMigration(store, job_id, "contacts", config, RunControl()).run()
-    assert result.status == "completed", result.error
+    assert result.status == "completed", f"{result.error!r}; {_job_failure_context(store, job_id)}"
     before_items = [item for item in _query_jmap_items("contacts", "Default") if item.uid == uid]
     assert len(before_items) == 1
 
@@ -1173,7 +1177,7 @@ def test_changed_contacts_update_stalwart_jmap(tmp_path, source_type):
         response = httpx.put(source_url + filename, auth=("alice", "radicalepass"), content=changed)
         assert response.status_code in (200, 201, 204)
     result = DavMigration(store, job_id, "contacts", config, RunControl()).run()
-    assert result.status == "completed", result.error
+    assert result.status == "completed", f"{result.error!r}; {_job_failure_context(store, job_id)}"
     after_items = [item for item in _query_jmap_items("contacts", "Default") if item.uid == uid]
     _item, contact, _collection = _jmap_object("contacts", "Default", uid)
     assert store.get_tasks(job_id)[0]["updated"] == 1

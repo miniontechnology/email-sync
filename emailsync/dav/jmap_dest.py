@@ -34,6 +34,14 @@ SERVER_MANAGED = frozenset(
 )
 
 
+def _parsed_objects(value):
+    if isinstance(value, dict):
+        return [value]
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return []
+
+
 class JmapDavDestination:
     def __init__(self, endpoint, kind):
         if kind not in ("contacts", "calendars"):
@@ -197,15 +205,13 @@ class JmapDavDestination:
             ],
             using=self._using(),
         )
-        parsed = parsed_response[0][1].get("parsed", {}).get(blob_id)
-        if parsed is None or blob_id in (parsed_response[0][1].get("notParsable") or {}):
+        parsed_args = parsed_response[0][1]
+        parsed = (parsed_args.get("parsed") or {}).get(blob_id)
+        if blob_id in (parsed_args.get("notParsable") or {}):
             raise PermanentError("Destination could not parse this contact/event")
-        if self.kind == "contacts":
-            parsed_objects = [parsed] if isinstance(parsed, dict) else []
-        else:
-            parsed_objects = parsed if isinstance(parsed, list) else []
-            if not parsed_objects:
-                raise PermanentError("No VEVENT in item; JMAP calendars only import events")
+        parsed_objects = _parsed_objects(parsed)
+        if not parsed_objects:
+            raise PermanentError("Stalwart could not parse the item")
         collection_id = collection.get("id") or collection["href"]
         create = {}
         for index, value in enumerate(parsed_objects):
@@ -214,6 +220,8 @@ class JmapDavDestination:
                 collection_id: True
             }
             create[f"c{index}"] = object_data
+        if not create:
+            raise PermanentError("Stalwart could not parse the item")
         method_args = {"accountId": self.client.account_id, "create": create}
         if self.kind == "calendars":
             method_args["sendSchedulingMessages"] = False
@@ -260,16 +268,17 @@ class JmapDavDestination:
         )
         parsed_args = parsed_response[0][1]
         parsed = (parsed_args.get("parsed") or {}).get(blob_id)
-        if parsed is None or blob_id in (parsed_args.get("notParsable") or {}):
+        if blob_id in (parsed_args.get("notParsable") or {}):
             raise PermanentError("Destination could not parse this contact/event")
+        parsed_objects = _parsed_objects(parsed)
+        if not parsed_objects:
+            raise PermanentError("Stalwart could not parse the item")
         if self.kind == "contacts":
-            if not isinstance(parsed, dict):
+            if len(parsed_objects) != 1:
                 raise PermanentError("JMAP contacts update requires exactly one parsed contact")
-            parsed_objects = [parsed]
         else:
-            if not isinstance(parsed, list) or len(parsed) != 1:
+            if len(parsed_objects) != 1:
                 raise PermanentError("JMAP calendars update requires exactly one parsed event")
-            parsed_objects = parsed
 
         object_data = {key: value for key, value in parsed_objects[0].items() if key != "id"}
         object_data.pop("addressBookIds", None)

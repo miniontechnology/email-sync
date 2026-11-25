@@ -27,6 +27,6 @@ PY
 
 docker run --rm --network host \
   --volume "$ROOT:/work:ro" --workdir /work \
-  ghcr.io/stalwartlabs/cli \
+  ghcr.io/stalwartlabs/cli:1.0.14 \
   --url http://127.0.0.1:18080 --user admin --password adminpass \
   apply --file /work/stalwart-plan.ndjson

@@ -1,6 +1,6 @@
 services:
   stalwart:
-    image: stalwartlabs/stalwart:latest
+    image: stalwartlabs/stalwart:v1.2.0
     restart: unless-stopped
     environment:
       STALWART_RECOVERY_ADMIN: admin:adminpass
