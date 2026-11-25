@@ -1,6 +1,5 @@
 """Three-way reconciliation for opt-in two-way mail sync."""
 
-import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
@@ -666,7 +665,7 @@ class TwoWayReconciler:
             )
             return False
         if not deletions:
-            self.store.update_job(self.job_id, pending_deletions=None)
+            self.store.set_pending_deletions(self.job_id, "mail", [])
             self._log_copyback_summaries()
             return False
         total_by_folder = defaultdict(int)
@@ -679,12 +678,11 @@ class TwoWayReconciler:
             for folder, count in counts.items()
         )
         exceeds = len(deletions) > self.options.max_deletions or over_percent
-        job = self.store.get_job(self.job_id)
-        approved = set(job.get("approved_deletions") or ())
-        keys = {item["key"] for item in deletions}
-        if exceeds and not keys <= approved:
+        approved = self.store.get_approved(self.job_id, "mail")
+        planned = {(item["key"], item["side"]) for item in deletions}
+        if exceeds and not planned <= approved:
             pending = [{k: item[k] for k in ("key", "side", "folder")} for item in deletions]
-            self.store.update_job(self.job_id, pending_deletions=json.dumps(pending))
+            self.store.set_pending_deletions(self.job_id, "mail", pending)
             self._log_copyback_summaries()
             self.log(
                 f"{len(deletions)} messages would be moved to Trash; review and apply on the job page",
@@ -702,10 +700,6 @@ class TwoWayReconciler:
             except Exception as exc:
                 self.failed(str(exc))
                 self.log(f"Could not move {item['key']} to Trash; will retry: {exc}", "warning")
-        self.store.update_job(
-            self.job_id,
-            pending_deletions=None,
-            approved_deletions=None,
-        )
+        self.store.clear_deletions(self.job_id, "mail")
         self._log_copyback_summaries()
         return False

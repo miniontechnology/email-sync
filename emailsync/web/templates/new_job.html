@@ -102,7 +102,7 @@
       <label class="check-field"><input type="checkbox" name="remove_stale_labels" {% if values.get('remove_stale_labels') %}checked{% endif %}><span>Also remove from folders whose label was removed</span></label>
       <label class="check-field"><input type="checkbox" name="update_changed_items" {% if not values or values.get('update_changed_items') %}checked{% endif %}><span>Update contacts and events that changed on the source</span></label>
       <label class="check-field"><input type="checkbox" name="two_way" {% if values.get('two_way') %}checked{% endif %}><span>Two-way sync (keep both accounts in sync)</span></label>
-      <p class="muted">Two-way sync requires a recurring mail migration. Deletions are moved to Trash, never permanently deleted; large deletion runs pause for review. Contacts and calendars stay one-way for now.</p>
+      <p class="muted">Two-way sync applies to recurring mail migrations and to contacts/calendars when both endpoints use CardDAV/CalDAV. File/Takeout sources and JMAP destinations remain one-way. Large deletion runs pause for review; DAV deletions are saved and downloadable.</p>
     </div>
   </section>
   <div class="form-actions"><a class="button secondary" href="{{ '/jobs/' ~ job_id if editing else '/' }}">Cancel</a>{% if editing %}<button class="button secondary" type="submit">Save</button><button class="button primary" type="submit" name="then_run" value="1">Save and run</button>{% else %}<button class="button primary" type="submit">Create migration</button>{% endif %}</div>

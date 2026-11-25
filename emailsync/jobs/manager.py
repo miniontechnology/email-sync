@@ -246,22 +246,24 @@ class JobManager:
 
             old = self._load_config(job, resolve=False)
             config.options.dav_match_fingerprint = old.options.dav_match_fingerprint
-            mail_endpoints_changed = any(
-                _identity(config.endpoints["mail"].get(side)) != _identity(old.endpoints["mail"].get(side))
-                for side in ("source", "dest")
-            )
             errors = [*merge_saved_settings(config, old), *self._validate(config)]
             if errors:
                 raise ValueError(" ".join(errors))
 
-            changed_kinds = [
+            mail_endpoints_changed = any(
+                _identity(config.endpoints["mail"].get(side)) != _identity(old.endpoints["mail"].get(side))
+                for side in ("source", "dest")
+            )
+            endpoint_changed_kinds = [
                 kind
                 for kind, pair in config.endpoints.items()
                 if any(
                     _identity(pair.get(side)) != _identity(old.endpoints[kind].get(side))
                     for side in ("source", "dest")
                 )
-                and self.store.ledger_counts(job_id, kind)
+            ]
+            changed_kinds = [
+                kind for kind in endpoint_changed_kinds if self.store.ledger_counts(job_id, kind)
             ]
             if changed_kinds and not confirm_reset:
                 raise ResetConfirmationRequired(changed_kinds)
@@ -276,8 +278,20 @@ class JobManager:
                     "info",
                     f"Copy records for {kind} cleared because its source or destination changed",
                 )
+            for kind in ("contacts", "calendars"):
+                if kind in endpoint_changed_kinds and kind not in changed_kinds:
+                    self.store.dav_pairs_reset(job_id, kind)
             if mail_endpoints_changed or (old.options.two_way and not config.options.two_way):
                 self.store.pairs_reset(job_id)
+            if old.options.two_way and not config.options.two_way:
+                for kind in ("contacts", "calendars"):
+                    self.store.dav_pairs_reset(job_id, kind)
+            else:
+                old_two_way_kinds = set(old.two_way_kinds())
+                new_two_way_kinds = set(config.two_way_kinds())
+                for kind in ("contacts", "calendars"):
+                    if kind in old_two_way_kinds and kind not in new_two_way_kinds:
+                        self.store.dav_pairs_reset(job_id, kind)
             unused_upload_dirs = (
                 self._upload_dirs(old) - self._upload_dirs(config) - self._other_job_upload_dirs(job_id)
             )

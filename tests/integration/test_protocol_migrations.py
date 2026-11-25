@@ -465,7 +465,7 @@ def test_greenmail_stalwart_two_way_sync_and_trash_safety(tmp_path, destination_
     assert safety_key in {item["key"] for item in pending}
     store.update_job(
         job_id,
-        approved_deletions=json.dumps([safety_key]),
+        approved_deletions=json.dumps([{"kind": "mail", "key": safety_key, "side": "destination"}]),
         pending_deletions=None,
     )
     applied, _store, _job = _run_mail(
@@ -1071,7 +1071,7 @@ def test_carddav_preseeded_contact_is_skipped_by_jmap_destination(tmp_path):
         _home, collections = carddav.discover()
         assert collections
         default_book = collections[0]
-        assert carddav.put(default_book, f"{uid}.vcf", contact_data) is True
+        assert carddav.put(default_book, f"{uid}.vcf", contact_data)
     finally:
         carddav.close()
 
@@ -1232,3 +1232,164 @@ def test_changed_recurring_event_updates_stalwart_destination(tmp_path, destinat
     assert len(after_items) == len(before_items) == 1
     if destination_type == "jmap":
         _destroy_jmap_object("calendars", file_path.stem, uid, delete_collection=True)
+
+
+@pytest.mark.parametrize(
+    ("kind", "collection", "extension"),
+    (("contacts", "contacts", "vcf"), ("calendars", "calendar", "ics")),
+)
+def test_two_way_radicale_and_stalwart_dav_sync(tmp_path, kind, collection, extension):
+    prefix = f"two-way-{kind}-{uuid4().hex}-"
+    source_endpoint = Endpoint(
+        "carddav" if kind == "contacts" else "caldav",
+        url=f"http://127.0.0.1:15232/alice/{collection}/",
+        username="alice",
+        password="radicalepass",
+    )
+    destination_endpoint = Endpoint(
+        "carddav" if kind == "contacts" else "caldav",
+        url="http://127.0.0.1:18080",
+        username=STALWART_USER,
+        password=STALWART_PASSWORD,
+    )
+    _cleanup_dav_uid_prefix(source_endpoint, kind, prefix)
+    _cleanup_dav_uid_prefix(destination_endpoint, kind, prefix)
+
+    original_uid = f"{prefix}original"
+    source_deleted_uid = f"{prefix}source-deleted"
+    copied_back_uid = f"{prefix}copied-back"
+    original_filename = f"{original_uid}.{extension}"
+    source_deleted_filename = f"{source_deleted_uid}.{extension}"
+    copied_back_filename = f"{copied_back_uid}.{extension}"
+
+    def object_data(uid, summary):
+        if kind == "contacts":
+            return _contact_vcard(uid, summary)
+        return (
+            "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Email Sync Integration Tests//EN\r\n"
+            "BEGIN:VEVENT\r\n"
+            f"UID:{uid}\r\n"
+            "DTSTAMP:20261116T120000Z\r\n"
+            "DTSTART:20300107T090000Z\r\n"
+            "DTEND:20300107T100000Z\r\n"
+            "LAST-MODIFIED:20261116T120000Z\r\n"
+            f"SUMMARY:{summary}\r\n"
+            "END:VEVENT\r\nEND:VCALENDAR\r\n"
+        ).encode()
+
+    def mapped_collection(client):
+        if kind == "contacts":
+            return next(
+                (item for item in client.collections if item["displayname"].casefold() == "default"),
+                client.collections[0],
+            )
+        return next(
+            item for item in client.collections if item["displayname"].casefold() == collection.casefold()
+        )
+
+    source_url = _seed_radicale(kind, collection, original_filename, object_data(original_uid, "Original"))
+    _seed_radicale(kind, collection, source_deleted_filename, object_data(source_deleted_uid, "Delete me"))
+    config = _dav_config(kind, source_endpoint, destination_endpoint)
+    config.options.two_way = True
+    config.options.sync_interval_minutes = 15
+    store = db.Store(tmp_path / f"two-way-{kind}.db")
+    job_id = store.create_job(f"Two-way {kind}", {}, None)
+
+    try:
+        result = DavMigration(store, job_id, kind, config, RunControl()).run()
+        assert result.status == "completed", result.error
+        assert store.get_task_baseline(job_id, kind) is not None
+        pairs = store.dav_pairs_get_all(job_id, kind)
+        assert f"{collection}|{original_uid}" in pairs
+        assert f"{collection}|{source_deleted_uid}" in pairs
+
+        result = DavMigration(store, job_id, kind, config, RunControl()).run()
+        assert result.status == "completed", result.error
+        assert store.get_tasks(job_id)[0]["updated"] == 0
+
+        destination_client = DavDestination(destination_endpoint, kind).connect()
+        try:
+            target = mapped_collection(destination_client)
+            destination_original = next(
+                item for item in destination_client.items(target) if item.uid == original_uid
+            )
+            assert destination_client.update(
+                target,
+                destination_original.ref,
+                destination_original.etag,
+                object_data(original_uid, "Edited on Stalwart"),
+            )
+        finally:
+            destination_client.close()
+
+        result = DavMigration(store, job_id, kind, config, RunControl()).run()
+        assert result.status == "completed", result.error
+        source_response = httpx.get(source_url + original_filename, auth=("alice", "radicalepass"))
+        assert source_response.status_code == 200
+        assert b"Edited on Stalwart" in source_response.content
+
+        response = httpx.put(
+            source_url + original_filename,
+            auth=("alice", "radicalepass"),
+            content=object_data(original_uid, "Edited on Radicale"),
+        )
+        assert response.status_code in (200, 201, 204)
+        result = DavMigration(store, job_id, kind, config, RunControl()).run()
+        assert result.status == "completed", result.error
+        destination_items, _target = _dav_items(
+            destination_endpoint, kind, "Default" if kind == "contacts" else collection
+        )
+        destination_original = next(item for item in destination_items if item.uid == original_uid)
+        assert b"Edited on Radicale" in destination_original.data
+
+        destination_client = DavDestination(destination_endpoint, kind).connect()
+        try:
+            target = mapped_collection(destination_client)
+            assert destination_client.put(
+                target,
+                copied_back_filename,
+                object_data(copied_back_uid, "Created on Stalwart"),
+            )
+        finally:
+            destination_client.close()
+
+        result = DavMigration(store, job_id, kind, config, RunControl()).run()
+        assert result.status == "completed", result.error
+        copied_back = httpx.get(source_url + copied_back_filename, auth=("alice", "radicalepass"))
+        assert copied_back.status_code == 200
+        assert store.get_tasks(job_id)[0]["copied_back"] == 1
+
+        destination_client = DavDestination(destination_endpoint, kind).connect()
+        try:
+            target = mapped_collection(destination_client)
+            copied_back_item = next(
+                item for item in destination_client.items(target) if item.uid == copied_back_uid
+            )
+            assert destination_client.delete(copied_back_item.ref, copied_back_item.etag)
+        finally:
+            destination_client.close()
+
+        result = DavMigration(store, job_id, kind, config, RunControl()).run()
+        assert result.status == "completed", result.error
+        assert httpx.get(source_url + copied_back_filename, auth=("alice", "radicalepass")).status_code == 404
+        assert any(
+            row["key"].endswith(copied_back_uid) and row["side"] == "source"
+            for row in store.dav_deleted_list(job_id, kind)
+        )
+
+        response = httpx.delete(source_url + source_deleted_filename, auth=("alice", "radicalepass"))
+        assert response.status_code in (200, 202, 204)
+        result = DavMigration(store, job_id, kind, config, RunControl()).run()
+        assert result.status == "completed", result.error
+        destination_items, _target = _dav_items(
+            destination_endpoint, kind, "Default" if kind == "contacts" else collection
+        )
+        assert all(item.uid != source_deleted_uid for item in destination_items)
+        deleted = store.dav_deleted_list(job_id, kind)
+        assert any(
+            row["key"].endswith(source_deleted_uid) and row["side"] == "destination" for row in deleted
+        )
+        assert all(row["data"] for row in deleted)
+    finally:
+        _cleanup_dav_uid_prefix(source_endpoint, kind, prefix)
+        _cleanup_dav_uid_prefix(destination_endpoint, kind, prefix)

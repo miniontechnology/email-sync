@@ -124,6 +124,42 @@ class JobConfig:
     def enabled_kinds(self) -> list[str]:
         return [k for k in KINDS if self.endpoints[k]["source"] and self.endpoints[k]["dest"]]
 
+    def two_way_kinds(self) -> list[str]:
+        if not self.options.two_way:
+            return []
+        kinds = []
+        mail_source, mail_dest = self.endpoints["mail"]["source"], self.endpoints["mail"]["dest"]
+        if (
+            mail_source
+            and mail_dest
+            and mail_source.type in MAIL_SOURCE_TYPES
+            and mail_dest.type in MAIL_DEST_TYPES
+        ):
+            kinds.append("mail")
+        contacts_source, contacts_dest = (
+            self.endpoints["contacts"]["source"],
+            self.endpoints["contacts"]["dest"],
+        )
+        if (
+            contacts_source
+            and contacts_source.type == "carddav"
+            and contacts_dest
+            and contacts_dest.type == "carddav"
+        ):
+            kinds.append("contacts")
+        calendars_source, calendars_dest = (
+            self.endpoints["calendars"]["source"],
+            self.endpoints["calendars"]["dest"],
+        )
+        if (
+            calendars_source
+            and calendars_source.type == "caldav"
+            and calendars_dest
+            and calendars_dest.type == "caldav"
+        ):
+            kinds.append("calendars")
+        return kinds
+
     def split(self) -> tuple[dict, dict]:
         """Return (public config, secrets) so credentials can be stored encrypted."""
         public: dict[str, Any] = {"name": self.name, "options": self.options.to_dict(), "endpoints": {}}
@@ -150,14 +186,17 @@ class JobConfig:
             )
         if self.options.two_way:
             mail = self.endpoints["mail"]
-            if not mail["source"] or not mail["dest"]:
-                errors.append("Two-way sync requires mail to be enabled.")
             if self.options.sync_interval_minutes <= 0:
                 errors.append("Two-way sync requires a sync interval greater than zero.")
-            if mail["source"] and mail["source"].type not in MAIL_SOURCE_TYPES:
-                errors.append("Two-way sync requires an IMAP or Gmail mail source.")
-            if mail["dest"] and mail["dest"].type not in MAIL_DEST_TYPES:
-                errors.append("Two-way sync requires an IMAP or JMAP mail destination.")
+            if mail["source"] and mail["dest"]:
+                if mail["source"].type not in MAIL_SOURCE_TYPES:
+                    errors.append("Two-way sync requires an IMAP or Gmail mail source.")
+                if mail["dest"].type not in MAIL_DEST_TYPES:
+                    errors.append("Two-way sync requires an IMAP or JMAP mail destination.")
+            if not self.two_way_kinds():
+                errors.append(
+                    "Two-way sync needs mail, or contacts/calendars over CardDAV/CalDAV on both sides."
+                )
         allowed = {
             "mail": (MAIL_SOURCE_TYPES, MAIL_DEST_TYPES),
             "contacts": (CONTACTS_SOURCE_TYPES, ("carddav", "jmap")),

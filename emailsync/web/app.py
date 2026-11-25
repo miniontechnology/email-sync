@@ -1,18 +1,19 @@
 """FastAPI application and browser UI."""
 
-import json
+import io
 import re
 import secrets
 import shutil
 import time
 import uuid
+import zipfile
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlencode
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.datastructures import UploadFile as StarletteUploadFile
@@ -46,9 +47,11 @@ class PendingEdit:
     created: float
 
 
-def _format_job(job):
+def _format_job(job, store=None):
     config = job["config"]
     options = config.get("options") or {}
+    job_config = JobConfig.from_dict(config)
+    two_way_kinds = job_config.two_way_kinds()
     summaries = []
     for kind, pair in config.get("endpoints", {}).items():
         source, dest = pair.get("source"), pair.get("dest")
@@ -59,6 +62,13 @@ def _format_job(job):
         "summary": " · ".join(summaries) or "No configured migrations",
         "dry_run": bool(options.get("dry_run")),
         "editable": job["status"] not in ("running", "queued"),
+        "two_way_enabled": bool(options.get("two_way")),
+        "two_way_kinds": two_way_kinds,
+        "one_way_kinds": [kind for kind in job_config.enabled_kinds() if kind not in two_way_kinds],
+        "deleted_counts": store.dav_deleted_count(job["id"]) if store else {},
+        "pending_deletions": (
+            store.get_pending_deletions(job["id"]) if store else job.get("pending_deletions") or []
+        ),
     }
 
 
@@ -485,7 +495,7 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             request=request,
             name="job_detail.html",
             context={
-                "job": _format_job(job),
+                "job": _format_job(job, store),
                 "tasks": _progress(store.get_tasks(job_id)),
                 "scopes": store.get_scopes(job_id),
                 "events": store.get_events(job_id, 100),
@@ -503,7 +513,7 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             request=request,
             name="job_content.html",
             context={
-                "job": _format_job(job),
+                "job": _format_job(job, store),
                 "tasks": _progress(store.get_tasks(job_id)),
                 "scopes": store.get_scopes(job_id),
                 "events": store.get_events(job_id, 100),
@@ -522,20 +532,35 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             return HTMLResponse(str(exc), status_code=400)
         return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
+    @app.get("/jobs/{job_id}/deleted/{kind}")
+    async def download_deleted(job_id: int, kind: str):
+        if kind not in ("contacts", "calendars") or not store.get_job(job_id):
+            return HTMLResponse("Not found", status_code=404)
+        deleted = store.dav_deleted_list(job_id, kind)
+        if not deleted:
+            return HTMLResponse("No deleted items are available", status_code=404)
+        archive = io.BytesIO()
+        extension = ".vcf" if kind == "contacts" else ".ics"
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as output:
+            for item in deleted:
+                safe_key = re.sub(r"[^A-Za-z0-9._-]", "_", item["key"])[:180] or "item"
+                filename = f"{item['side']}-{safe_key}-{item['id']}{extension}"
+                output.writestr(filename, item["data"])
+        return Response(
+            archive.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{kind}-deleted.zip"'},
+        )
+
     @app.post("/jobs/{job_id}/deletions/apply")
     async def apply_deletions(job_id: int):
         job = store.get_job(job_id)
         if not job:
             return HTMLResponse("Job not found", status_code=404)
-        pending = job.get("pending_deletions") or []
+        pending = store.get_pending_deletions(job_id)
         if not pending:
             return HTMLResponse("No deletions are waiting for review", status_code=400)
-        approved = sorted({item["key"] for item in pending if item.get("key")})
-        store.update_job(
-            job_id,
-            approved_deletions=json.dumps(approved),
-            pending_deletions=None,
-        )
+        store.approve_pending_deletions(job_id)
         manager.resume(job_id)
         return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
@@ -544,35 +569,59 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
         job = store.get_job(job_id)
         if not job:
             return HTMLResponse("Job not found", status_code=404)
-        pending = job.get("pending_deletions") or []
+        pending = store.get_pending_deletions(job_id)
         if not pending:
             return HTMLResponse("No deletions are waiting for review", status_code=400)
-        pairs = store.pairs_get_all(job_id)
-        updates = []
-        remove = []
+        kinds = {item["kind"] for item in pending}
+        mail_pairs = store.pairs_get_all(job_id) if "mail" in kinds else {}
+        dav_pairs = {
+            kind: store.dav_pairs_get_all(job_id, kind) for kind in kinds if kind in ("contacts", "calendars")
+        }
+        mail_updates = []
+        mail_remove = []
+        dav_updates = {kind: [] for kind in dav_pairs}
         for item in pending:
             key = item.get("key")
-            pair = pairs.get(key)
-            if not key or not pair:
+            kind = item.get("kind", "mail")
+            if not key:
                 continue
-            if item.get("side") == "destination":
-                updates.append(
-                    {
-                        "key": key,
-                        "state": "ignored",
-                        "src_folders": [],
-                        "src_flags": [],
-                        "dst_folders": pair.get("dst_folders") or [],
-                        "dst_flags": pair.get("dst_flags") or [],
-                    }
-                )
-            else:
-                remove.append(key)
-        if updates:
-            store.pairs_put_many(job_id, updates)
-        if remove:
-            store.pairs_delete(job_id, remove)
-        store.update_job(job_id, pending_deletions=None, approved_deletions=None)
+            if kind == "mail":
+                pair = mail_pairs.get(key)
+                if not pair:
+                    continue
+                if item.get("side") == "destination":
+                    mail_updates.append(
+                        {
+                            "key": key,
+                            "state": "ignored",
+                            "src_folders": [],
+                            "src_flags": [],
+                            "dst_folders": pair.get("dst_folders") or [],
+                            "dst_flags": pair.get("dst_flags") or [],
+                        }
+                    )
+                else:
+                    mail_remove.append(key)
+            elif kind in dav_pairs:
+                pair = dav_pairs[kind].get(key)
+                if pair:
+                    dav_updates[kind].append(
+                        {
+                            "key": key,
+                            "state": "ignored",
+                            "src_hash": pair.get("src_hash"),
+                            "dst_hash": pair.get("dst_hash"),
+                        }
+                    )
+        if mail_updates:
+            store.pairs_put_many(job_id, mail_updates)
+        if mail_remove:
+            store.pairs_delete(job_id, mail_remove)
+        for kind, updates in dav_updates.items():
+            if updates:
+                store.dav_pairs_put_many(job_id, kind, updates)
+        for kind in kinds:
+            store.clear_deletions(job_id, kind)
         manager.resume(job_id)
         return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 

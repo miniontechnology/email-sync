@@ -1,15 +1,20 @@
 {% include "job_header.html" %}
 {% if job.last_error %}<div class="alert error"><strong>Last error</strong><p>{{ job.last_error }}</p>
 {% if reauth_account_id %}<a href="/accounts/{{ reauth_account_id }}">Open the saved account to sign in again</a>{% endif %}</div>{% endif %}
+{% if job.two_way_enabled %}
+<section class="panel"><p>Two-way sync applies to {{ job.two_way_kinds|join(", ") if job.two_way_kinds else "no configured kinds" }}. One-way only: {{ job.one_way_kinds|join(", ") if job.one_way_kinds else "none" }}.</p></section>
+{% endif %}
 {% if job.pending_deletions %}
+{% set mail_pending = job.pending_deletions|selectattr("kind", "equalto", "mail")|list %}
+{% set dav_pending = job.pending_deletions|rejectattr("kind", "equalto", "mail")|list %}
 <section class="panel alert warning">
-  <div class="section-heading"><div><h2>Deletions waiting for review</h2><p>{{ job.pending_deletions|length }} message(s) would be moved to Trash. Nothing has been deleted.</p></div></div>
-  <div class="table-wrap"><table><thead><tr><th>Side</th><th>Folder</th><th>Message</th></tr></thead><tbody>
-  {% for item in job.pending_deletions[:200] %}<tr><td>{{ item.side }}</td><td>{{ item.folder }}</td><td class="scope-name">{{ item.subject or item.key }}</td></tr>{% endfor %}
+  <div class="section-heading"><div><h2>Deletions waiting for review</h2><p>{% if mail_pending %}{{ mail_pending|length }} mail message(s) would be moved to Trash. {% endif %}{% if dav_pending %}{{ dav_pending|length }} contact/calendar item(s) would be deleted; a copy is kept and can be downloaded. {% endif %}Nothing has been deleted.</p></div></div>
+  <div class="table-wrap"><table><thead><tr><th>Kind</th><th>Side</th><th>Collection</th><th>Item</th><th>Action</th></tr></thead><tbody>
+  {% for item in job.pending_deletions[:200] %}<tr><td>{{ item.kind|upper }}</td><td>{{ item.side }}</td><td>{{ item.folder }}</td><td class="scope-name">{{ item.subject or item.key }}</td><td>{% if item.kind == "mail" %}Move to Trash{% else %}Delete (saved copy available){% endif %}</td></tr>{% endfor %}
   </tbody></table></div>
   <div class="form-actions">
-    <form action="/jobs/{{ job.id }}/deletions/apply" method="post" data-confirm="Move these messages to Trash and resume the job?"><button class="button primary" type="submit">Apply and resume</button></form>
-    <form action="/jobs/{{ job.id }}/deletions/discard" method="post" data-confirm="Keep these messages where they are now? They won't be deleted on the other side."><button class="button secondary" type="submit">Keep messages where they are</button></form>
+    <form action="/jobs/{{ job.id }}/deletions/apply" method="post" data-confirm="Apply these reviewed deletions and resume the job?"><button class="button primary" type="submit">Apply and resume</button></form>
+    <form action="/jobs/{{ job.id }}/deletions/discard" method="post" data-confirm="{% if dav_pending and not mail_pending %}Keep these items where they are now?{% else %}Keep these messages where they are now?{% endif %} They won't be deleted on the other side."><button class="button secondary" type="submit">{% if dav_pending and not mail_pending %}Keep items where they are{% else %}Keep messages where they are{% endif %}</button></form>
   </div>
 </section>
 {% endif %}
@@ -23,10 +28,17 @@
       <div><strong>{{ task.copied }}</strong><span>Copied</span></div><div><strong>{{ task.skipped }}</strong><span>Skipped</span></div>
       <div><strong>{{ task.updated }}</strong><span>Updated</span></div>
       <div><strong>{{ task.failed }}</strong><span>Failed</span></div>{% if task.bytes %}<div><strong>{{ task.rate }} KB/s</strong><span>Average rate</span></div>{% endif %}
+      {% if task.kind in ("contacts", "calendars") %}<div><strong>{{ task.copied_back }}</strong><span>Copied back</span></div><div><strong>{{ task.trashed }}</strong><span>Deleted</span></div>{% elif task.kind == "mail" and (task.copied_back or task.trashed) %}<div><strong>{{ task.copied_back }}</strong><span>Copied back</span></div><div><strong>{{ task.trashed }}</strong><span>Moved to Trash</span></div>{% endif %}
     </div>
   </section>
   {% endfor %}
 </div>
+{% if job.deleted_counts.get("contacts", 0) or job.deleted_counts.get("calendars", 0) %}
+<section class="panel"><div class="section-heading"><div><h2>Saved deleted items</h2>
+  {% if job.deleted_counts.get("contacts", 0) %}<p><a href="/jobs/{{ job.id }}/deleted/contacts">Download {{ job.deleted_counts.get("contacts") }} deleted contact(s)</a></p>{% endif %}
+  {% if job.deleted_counts.get("calendars", 0) %}<p><a href="/jobs/{{ job.id }}/deleted/calendars">Download {{ job.deleted_counts.get("calendars") }} deleted event(s)</a></p>{% endif %}
+</div></div></section>
+{% endif %}
 {% if scopes %}
 <section class="panel table-panel">
   <div class="section-heading"><div><h2>Folders and collections</h2><p>Progress by source scope.</p></div></div>

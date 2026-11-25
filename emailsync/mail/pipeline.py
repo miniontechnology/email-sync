@@ -744,7 +744,7 @@ class MailMigration:
                 elif job.get("twoway_baseline_at"):
                     if reconciler.reconcile():
                         self._two_way_paused = True
-                        pending = self.store.get_job(self.job_id).get("pending_deletions") or []
+                        pending = self.store.get_pending_deletions(self.job_id, "mail")
                         self._two_way_pause_message = f"{len(pending)} messages would be moved to Trash; review and apply on the job page"
                     self.index = DestIndex(scope=self.options.dedup_scope)
                     self._retry(lambda: self._coordinator_dest.index_all(self.index), self._coordinator_dest)

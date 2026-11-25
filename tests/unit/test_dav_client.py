@@ -1,6 +1,8 @@
 import httpx
+import pytest
 
 from emailsync.connectors.dav import DavClient, _auth_for, _safe_url
+from emailsync.errors import FatalError, PermanentError, TransientError
 from emailsync.options import Endpoint
 
 
@@ -39,5 +41,115 @@ def test_dav_client_update_uses_if_match_and_returns_false_for_stale_etag():
         assert client.update(href, b"stale card", '"old-etag"') is False
         assert [request.headers["If-Match"] for request in requests] == ['"old-etag"', '"old-etag"']
         assert [request.content for request in requests] == [b"updated card", b"stale card"]
+    finally:
+        client.close()
+
+
+def test_dav_client_put_returns_created_url_and_false_when_it_exists():
+    requests = []
+    statuses = iter((201, 204, 412))
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(next(statuses), request=request)
+
+    client = DavClient(Endpoint("carddav", url="https://dav.example.test"))
+    client.http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    try:
+        collection = {"href": "https://dav.example.test/addressbook/"}
+        assert client.put(collection, "person-1.vcf", b"card") == (
+            "https://dav.example.test/addressbook/person-1.vcf"
+        )
+        assert client.put(collection, "person-1.vcf", b"card") == (
+            "https://dav.example.test/addressbook/person-1.vcf"
+        )
+        assert client.put(collection, "person-1.vcf", b"card") is False
+        assert requests[0].headers["If-None-Match"] == "*"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [(403, PermanentError), (409, PermanentError), (503, TransientError), (507, FatalError)],
+)
+def test_dav_client_put_classifies_error_statuses(status, error):
+    def handler(request):
+        return httpx.Response(status, request=request)
+
+    client = DavClient(Endpoint("carddav", url="https://dav.example.test"))
+    client.http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    try:
+        with pytest.raises(error, match=f"HTTP {status}|{status}"):
+            client.put({"href": "https://dav.example.test/addressbook/"}, "person.vcf", b"card")
+    finally:
+        client.close()
+
+
+def test_dav_client_get_and_conditional_delete_handle_missing_and_stale_objects():
+    requests = []
+    responses = iter(
+        (
+            (200, {"ETag": '"etag-1"'}, b"vCard"),
+            (404, {}, b""),
+            (204, {}, b""),
+            (412, {}, b""),
+            (404, {}, b""),
+        )
+    )
+
+    def handler(request):
+        requests.append(request)
+        status, headers, content = next(responses)
+        return httpx.Response(status, headers=headers, content=content, request=request)
+
+    client = DavClient(Endpoint("carddav", url="https://dav.example.test"))
+    client.http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    href = "https://dav.example.test/addressbook/person-1.vcf"
+    try:
+        assert client.get(href) == ('"etag-1"', "vCard")
+        assert client.get(href) is None
+        assert client.delete(href, '"etag-1"') is True
+        assert client.delete(href, '"etag-1"') is False
+        assert client.delete(href, None) is True
+        assert requests[2].headers["If-Match"] == '"etag-1"'
+        assert requests[3].headers["If-Match"] == '"etag-1"'
+        assert "If-Match" not in requests[4].headers
+    finally:
+        client.close()
+
+
+def test_strict_listing_rejects_missing_multiget_objects():
+    collection = "https://dav.example.test/addressbook/"
+    requested = []
+
+    def handler(request):
+        if request.method == "PROPFIND":
+            body = (
+                '<d:multistatus xmlns:d="DAV:">'
+                "<d:response><d:href>/addressbook/</d:href></d:response>"
+                "<d:response><d:href>/addressbook/one.vcf</d:href>"
+                '<d:propstat><d:prop><d:getetag>"one"</d:getetag></d:prop></d:propstat></d:response>'
+                "<d:response><d:href>/addressbook/two.vcf</d:href>"
+                '<d:propstat><d:prop><d:getetag>"two"</d:getetag></d:prop></d:propstat></d:response>'
+                "</d:multistatus>"
+            )
+            return httpx.Response(207, text=body, request=request)
+        requested.extend(request.url.path for _ in [0])
+        body = (
+            '<d:multistatus xmlns:d="DAV:" xmlns:card="urn:ietf:params:xml:ns:carddav">'
+            "<d:response><d:href>/addressbook/one.vcf</d:href>"
+            '<d:propstat><d:prop><d:getetag>"one"</d:getetag>'
+            "<card:address-data>BEGIN:VCARD\\r\\nUID:one\\r\\nEND:VCARD</card:address-data>"
+            "</d:prop></d:propstat></d:response></d:multistatus>"
+        )
+        return httpx.Response(207, text=body, request=request)
+
+    client = DavClient(Endpoint("carddav", url="https://dav.example.test"))
+    client.http = httpx.Client(transport=httpx.MockTransport(handler), follow_redirects=False)
+    try:
+        with pytest.raises(TransientError, match="incomplete DAV listing: 1 of 2 objects missing"):
+            client.list_objects(collection, strict=True)
+        assert requested == ["/addressbook/"]
     finally:
         client.close()

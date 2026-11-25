@@ -7,6 +7,7 @@ from pathlib import Path
 from emailsync.connectors.dav import DavClient
 from emailsync.dav.vobjects import (
     contact_fingerprint,
+    content_hash,
     ensure_vcard_uid,
     event_fingerprint,
     split_ics,
@@ -28,6 +29,7 @@ class DavItem:
     fingerprint: str
     ref: str = ""
     etag: str | None = None
+    ambiguous: bool = False
 
 
 class DavSource:
@@ -61,16 +63,41 @@ class DavSource:
         _home, collections = self.client.discover()
         return [DavScope(name=item["displayname"], collection=item) for item in collections]
 
-    def items(self, scope: DavScope):
+    def items(self, scope: DavScope, strict: bool = False):
         if self.endpoint.type == "file":
             items = []
             for _filename, data in scope.collection.get("files", []):
                 items.extend(_decode_objects(data, self.kind))
             return items
         items = []
-        for _href, _etag, data in self.client.list_objects(scope.collection):
-            items.extend(_decode_objects(data, self.kind))
+        for href, etag, data in self.client.list_objects(scope.collection, strict=strict):
+            decoded = list(_decode_objects(data, self.kind))
+            for item in decoded:
+                item.ref = href
+                item.etag = etag
+                item.ambiguous = len(decoded) > 1
+            items.extend(decoded)
         return items
+
+    def put(self, collection, filename, data):
+        if self.client is None:
+            raise RuntimeError("DAV source is not connected")
+        return self.client.put(collection, filename, data)
+
+    def update(self, _collection, ref, etag, data):
+        if self.client is None:
+            raise RuntimeError("DAV source is not connected")
+        return self.client.update(ref, data, etag)
+
+    def delete(self, ref, etag):
+        if self.client is None:
+            raise RuntimeError("DAV source is not connected")
+        return self.client.delete(ref, etag)
+
+    def get(self, ref):
+        if self.client is None:
+            raise RuntimeError("DAV source is not connected")
+        return self.client.get(ref)
 
 
 def _file_collections(paths: list[str], kind: str):
@@ -108,3 +135,10 @@ def _decode_objects(data: str | bytes, kind: str):
         summary = str(component.get("summary", "")) if component else ""
         start = component.get("dtstart") if component else None
         yield DavItem(uid, calendar, event_fingerprint(summary, start))
+
+
+def hash_for_uid(data: str | bytes, kind: str, uid: str) -> str | None:
+    items = list(_decode_objects(data, kind))
+    if len(items) != 1 or items[0].uid != uid:
+        return None
+    return content_hash(items[0].data)
