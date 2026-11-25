@@ -27,7 +27,7 @@ from emailsync.dav.source import DavSource
 from emailsync.db import Store
 from emailsync.jobs.manager import JobManager, ResetConfirmationRequired, merge_saved_settings
 from emailsync.mail.dest import make_dest
-from emailsync.mail.folders import format_folder_map, parse_folder_map
+from emailsync.mail.folders import folder_rows, format_folder_map, parse_folder_map
 from emailsync.mail.source import make_source
 from emailsync.oauth import OAuthService, TokenManager
 from emailsync.options import Endpoint, JobConfig, Options
@@ -648,38 +648,40 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             return HTMLResponse(str(exc), status_code=400)
         return RedirectResponse(f"/jobs/{job_id}", status_code=303)
 
+    def _resolve_request_endpoint(body, endpoint_field, kind, side):
+        endpoint = Endpoint.from_dict(body.get(endpoint_field))
+        options = Options.from_dict(body.get("options"))
+        if endpoint is None:
+            return None, options
+        endpoints = {
+            configured_kind: {"source": None, "dest": None}
+            for configured_kind in ("mail", "contacts", "calendars")
+        }
+        if kind not in endpoints or side not in ("source", "dest"):
+            raise ValueError("Invalid migration endpoint.")
+        if body.get("job_id") is not None:
+            job = store.get_job(int(body["job_id"]))
+            if not job:
+                raise LookupError("Job not found.")
+            endpoints[kind][side] = endpoint
+            test_config = JobConfig("", endpoints, options)
+            merge_saved_settings(test_config, manager._load_config(job, resolve=False))
+            endpoint = test_config.endpoints[kind][side]
+        return resolve_endpoint(endpoint, load_accounts(store, secretbox), token_manager), options
+
     @app.post("/api/test")
     async def test_endpoint(request: Request):
         body = await request.json()
         kind = body.get("kind", "mail")
         side = body.get("side", "source")
-        endpoint = Endpoint.from_dict(body.get("endpoint"))
-        if not endpoint:
-            return JSONResponse({"ok": False, "detail": "Endpoint is not configured.", "folders": []}, 422)
-        options = Options.from_dict(body.get("options"))
-        if body.get("job_id") is not None:
-            try:
-                job = store.get_job(int(body["job_id"]))
-                if not job:
-                    return JSONResponse({"ok": False, "detail": "Job not found.", "folders": []}, 404)
-                endpoints = {
-                    configured_kind: {"source": None, "dest": None}
-                    for configured_kind in ("mail", "contacts", "calendars")
-                }
-                if kind not in endpoints or side not in ("source", "dest"):
-                    return JSONResponse(
-                        {"ok": False, "detail": "Invalid migration endpoint.", "folders": []}, 422
-                    )
-                endpoints[kind][side] = endpoint
-                test_config = JobConfig("", endpoints, options)
-                merge_saved_settings(test_config, manager._load_config(job, resolve=False))
-                endpoint = test_config.endpoints[kind][side]
-            except (TypeError, ValueError) as exc:
-                return JSONResponse({"ok": False, "detail": str(exc), "folders": []}, 400)
         try:
-            endpoint = resolve_endpoint(endpoint, load_accounts(store, secretbox), token_manager)
+            endpoint, options = _resolve_request_endpoint(body, "endpoint", kind, side)
+        except LookupError as exc:
+            return JSONResponse({"ok": False, "detail": str(exc), "folders": []}, 404)
         except Exception as exc:
             return JSONResponse({"ok": False, "detail": str(exc), "folders": []}, 400)
+        if endpoint is None:
+            return JSONResponse({"ok": False, "detail": "Endpoint is not configured.", "folders": []}, 422)
         folders = []
         try:
             if endpoint.type in ("imap", "gmail") and side == "source":
@@ -728,6 +730,66 @@ def create_app(settings: Settings | None = None, store=None, manager=None):
             return {"ok": True, "detail": "Connection successful.", "folders": folders}
         except Exception as exc:
             return {"ok": False, "detail": str(exc), "folders": []}
+
+    @app.post("/api/folders")
+    async def api_folders(request: Request):
+        body = await request.json()
+        raw_source = body.get("source")
+        gmail = bool(isinstance(raw_source, dict) and raw_source.get("type") == "gmail")
+        empty_response = {
+            "ok": False,
+            "detail": "",
+            "gmail": gmail,
+            "rows": [],
+            "dest_folders": [],
+            "dest_detail": "",
+        }
+        try:
+            source_endpoint, options = _resolve_request_endpoint(body, "source", "mail", "source")
+            if source_endpoint is None:
+                return {**empty_response, "detail": "Source endpoint is not configured."}
+            if source_endpoint.type not in ("imap", "gmail"):
+                return {**empty_response, "detail": "Source must be IMAP or Gmail."}
+            gmail = source_endpoint.type == "gmail"
+            source = make_source(source_endpoint, options)
+            try:
+                source.connect()
+                rows = folder_rows(source.folders(), options, gmail=gmail)
+            finally:
+                source.close()
+        except Exception as exc:
+            return {**empty_response, "detail": str(exc), "gmail": gmail}
+
+        dest_folders = []
+        dest_detail = ""
+        if body.get("dest"):
+            try:
+                dest_endpoint, _dest_options = _resolve_request_endpoint(body, "dest", "mail", "dest")
+                if dest_endpoint is None:
+                    dest_detail = "Destination endpoint is not configured."
+                elif dest_endpoint.type not in ("imap", "jmap"):
+                    dest_detail = "Destination must be IMAP or JMAP."
+                else:
+                    dest = make_dest(dest_endpoint, options)
+                    try:
+                        dest.connect()
+                        if dest_endpoint.type == "jmap":
+                            dest_folders = sorted(set(dest.id_to_path.values()), key=str.casefold)
+                        else:
+                            dest_folders = sorted(dest.folders, key=str.casefold)
+                    finally:
+                        dest.close()
+            except Exception as exc:
+                dest_detail = str(exc)
+
+        return {
+            "ok": True,
+            "detail": "Source folders loaded.",
+            "gmail": gmail,
+            "rows": rows,
+            "dest_folders": dest_folders,
+            "dest_detail": dest_detail,
+        }
 
     @app.get("/api/jobs")
     async def api_jobs():
